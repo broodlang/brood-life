@@ -1,0 +1,9 @@
+(defmodule hello
+  "A second module in the foobar project — `main` does
+`(:use hello)` to call `greeting`. Showcases the module/namespace system
+(ADR-065): `hello` defines `greeting` as `hello/greeting`; `(:use hello)`
+imports it so `main` can call it bare.")
+
+(defn greeting ()
+  "Return the project's greeting string."
+  "hello foobar")

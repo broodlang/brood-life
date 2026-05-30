@@ -1,0 +1,178 @@
+(defmodule life
+  "Conway's Game of Life on a wrapping torus, sown with random known patterns and
+animated in a native GUI window (the board is fit to the window at startup)."
+  (:use display))
+
+(def *w* 120)
+(def *h* 40)
+(def *frame-ns* 45000000)  ; target frame period: 45ms in nanoseconds (~22 FPS)
+(def *offsets* [[-1 -1] [-1 0] [-1 1] [0 -1] [0 1] [1 -1] [1 0] [1 1]])
+
+;; Known Life patterns as `[dx dy]` cells from a local origin, sown at random:
+;; block, blinker, glider, toad, beacon, beehive, LWSS (in this order).
+(def *shapes*
+  [[[0 0] [1 0] [0 1] [1 1]] [[0 0] [1 0] [2 0]]
+    [[1 0] [2 1] [0 2] [1 2] [2 2]]
+    [[1 0] [2 0] [3 0] [0 1] [1 1] [2 1]]
+    [[0 0] [1 0] [0 1] [1 1] [2 2] [3 2] [2 3] [3 3]]
+    [[1 0] [2 0] [0 1] [3 1] [1 2] [2 2]]
+    [[0 0] [3 0] [4 1] [0 2] [4 2] [1 3] [2 3] [3 3] [4 3]]])
+
+;; `pat` (a list of `[dx dy]`) shifted to origin `[x y]` and wrapped on the torus.
+(defn shift (pat x y)
+  (map (fn ([dx dy]) [(mod (+ x dx) *w*) (mod (+ y dy) *h*)]) pat))
+
+(defn neighbours (cell) (let ([x y] cell) (shift *offsets* x y)))
+
+;; Advance one generation; the board is a map keyed by live `[x y]` cells.
+(defn step (live)
+  (into {}
+    (filter (fn ([c n]) (or (= n 3) (and (= n 2) (contains? live c))))
+      (frequencies (mapcat neighbours (keys live))))))
+
+;; Sow `n` random shapes at random positions, threading the PRNG `s`.
+(defn seed--sow (n s acc)
+  (if (= n 0)
+    acc
+    (let ([shape s1] (sample s *shapes*)
+          [x s2] (rand-int s1 *w*)
+          [y s3] (rand-int s2 *h*))
+      (seed--sow (- n 1) s3 (concat acc (shift shape x y))))))
+
+;; A random board: known shapes scattered across the torus, count scaled to area.
+(defn seed (s)
+  (into {} (map (fn (c) [c true]) (seed--sow (max 4 (quot (* *w* *h*) 400)) s []))))
+
+;; A 3x5-cell block font so the status reads MUCH larger than the ▪ board cells
+;; on this fixed-cell grid (the only way to enlarge text without shrinking the
+;; grid). Keys are 1-char strings; only the chars the status uses are defined.
+(def *font-rows* 5)
+(def *font*
+  {"0" ["███" "█ █" "█ █" "█ █" "███"]
+   "1" [" █ " "██ " " █ " " █ " "███"]
+   "2" ["███" "  █" "███" "█  " "███"]
+   "3" ["███" "  █" "███" "  █" "███"]
+   "4" ["█ █" "█ █" "███" "  █" "  █"]
+   "5" ["███" "█  " "███" "  █" "███"]
+   "6" ["███" "█  " "███" "█ █" "███"]
+   "7" ["███" "  █" "  █" "  █" "  █"]
+   "8" ["███" "█ █" "███" "█ █" "███"]
+   "9" ["███" "█ █" "███" "  █" "███"]
+   "C" ["███" "█  " "█  " "█  " "███"]
+   "F" ["███" "█  " "███" "█  " "█  "]
+   "G" ["███" "█  " "█ █" "█ █" "███"]
+   "M" ["█ █" "███" "███" "█ █" "█ █"]
+   "P" ["███" "█ █" "███" "█  " "█  "]
+   "S" ["███" "█  " "███" "  █" "███"]
+   " " ["   " "   " "   " "   " "   "]})
+
+;; The `r`-th pixel row (0..4) of `s` rendered in the block font, glyphs gap-separated.
+(defn glyph-row (s r)
+  (apply str (map (fn (ch) (str (nth (get *font* ch (get *font* " ")) r) " ")) (string->list s))))
+
+;; A display frame: the ▪ board on rows 0..*h*-1, then the big block-font status
+;; spanning the *font-rows* rows below it. We emit ONE `text` op per *live* cell
+;; (the board is sparse — tens of cells, not *w*×*h*), leaning on the leading
+;; `clear` to wipe the previous frame. The old version scanned the whole grid and
+;; built a full-width string per row every frame — O(area), ~30x slower here and
+;; the reason the frame rate was pinned regardless of the pacing target.
+(defn render (live status)
+  (apply frame
+    (clear)
+    (concat (map (fn ([x y]) (text y x "▪")) (keys live))
+      (map (fn (r) (text (+ *h* r) 0 (glyph-row status r))) (range *font-rows*)))))
+
+;; The live "observer" status, shortened to the block-font's character set:
+;; G<gen> <fps>FPS <cells>C <spikes>SP <mem>M <gc>GC. Watch GC tick the instant
+;; FPS dips to spot a GC spike (mem stays flat — churn, not a leak).
+(defn status (gen cells per spikes)
+  (str "G"
+    gen
+    " "
+    (quot 1000 (max 1 (quot per 1000000)))
+    "FPS"
+    " "
+    cells
+    "C"
+    " "
+    spikes
+    "SP"
+    " "
+    (quot (mem-bytes) 1048576)
+    "M"
+    " "
+    (get (gc-stats) :collections)
+    "GC"))
+
+;; A worker process: on `[:step board]` it computes the next generation OFF the
+;; render thread and sends it back as `[:gen next]`; `:stop` ends it. Spawning the
+;; heavy `step` here keeps it off the frame's critical path (ADR-058 concurrency).
+(defn sim-worker (parent)
+  (receive (:stop nil)
+    ([:step b] (do (send parent [:gen (step b)]) (sim-worker parent)))))
+
+;; ms to block in `receive` for the next mailbox message: the time left until the
+;; frame deadline `due`, or a short re-check window (50ms) once it has passed — at
+;; that point we're only waiting on the worker's next `[:gen]`, which lands in a
+;; few ms and wakes the `receive` immediately; the ceiling just bounds a stalled
+;; worker so we never park forever.
+(defn frame-park (due)
+  (let (left (quot (- due (now-ns)) 1000000))
+    (if (> left 0) left 50)))
+
+;; Wait out the frame, staying responsive to input the WHOLE time, and return
+;; either `:quit` (a quit signal) or the next board (from the worker's `[:gen …]`).
+;; The ONLY fast path is "board in hand AND the deadline has passed" → emit it;
+;; every other case blocks in `receive`, which scans the mailbox for input on each
+;; pass — so the window stays closeable even when a frame runs *over* its time
+;; budget. (The old loop skipped the `receive` once `(now-ns) >= due`, so an
+;; over-budget frame — easy with a tiny font / big board — starved input and the
+;; window ignored the close button: the "can't close it" bug.) GUI input and the
+;; worker reply share this process's mailbox, so we select here. `:close` is the
+;; window's X (a frontend signal, distinct from the Escape *key* `:escape`); we quit
+;; on it plus `q` / Esc / Ctrl-C. Never returns nil and never busy-spins.
+(defn wait-frame (due nxt)
+  (if (and nxt (>= (now-ns) due))
+    nxt
+    (receive (:close :quit)
+      ("q" :quit)
+      (:escape :quit)
+      (:ctrl-c :quit)
+      ([:gen g] (wait-frame due g))
+      (_ (wait-frame due nxt))
+      (after (frame-park due) (wait-frame due nxt)))))
+
+;; Draw the current board, hand the worker the next generation to compute, then
+;; pace to `*frame-ns*` measured from THIS frame's start (`now`) — a per-frame
+;; deadline, never an absolute schedule, so a slow/GC frame is NOT chased by a
+;; catch-up speed burst (the old bug). `step` runs off-thread during the wait, so
+;; a heavy generation doesn't stretch the frame either. `prev` gives the true
+;; period for the fps/spike readout; a frame over 1.5x the target is a spike.
+(defn life--loop (w sim live gen prev spikes)
+  (let (now (now-ns)
+        per (- now prev)
+        spk (if (> per (quot (* *frame-ns* 3) 2)) (+ spikes 1) spikes))
+    (do
+      (send sim [:step live])
+      (gui-draw w (render live (status gen (count live) per spk)))
+      (let (nxt (wait-frame (+ now *frame-ns*) nil))
+        (if (= :quit nxt)
+          (do (send sim :stop) (gui-close w))
+          (life--loop w sim nxt (+ gen 1) now spk))))))
+
+;; Open a native window, fit the board to it (a small font means MANY cells, so a
+;; big board), spawn the sim worker, and animate a fresh random board until
+;; q / Esc / window close. `*w*`/`*h*` are re-bound to fill whatever `gui-size`
+;; reports for the chosen font.
+(defn run-life ()
+  (do
+    (gui-font! {:family :mono :height 6})
+    (let (me (self)
+          w (gui-open)
+          [cols rows] (gui-size w)
+          sim (spawn (sim-worker me)))
+      (do
+        (def *w* cols)
+        (def *h* (- rows *font-rows*))
+        (let (start (now-ns))
+          (life--loop w sim (seed start) 0 (- start *frame-ns*) 0))))))

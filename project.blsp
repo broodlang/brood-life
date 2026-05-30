@@ -1,0 +1,16 @@
+;; foobar — a Brood project.
+(project :name
+  "foobar"
+  :version
+  "0.1.0"
+  :main
+  (life run-life))
+
+;; To depend on other Brood packages, add a :dependencies vector to the form
+;; above (ADR-037). Dep names are bare symbols (no quoting):
+;;
+;;   :dependencies [[pretty :git "https://github.com/you/brood-pretty.git" :ref "v1.0.0"]
+;;                  [shared :path "../shared"]]
+;;
+;; Then any `nest` command resolves them. project.lock.blsp is committed;
+;; _deps/ (the cache) is gitignored.

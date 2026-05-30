@@ -1,0 +1,6 @@
+# Brood package cache — regenerable from project.lock.blsp (which is committed)
+_deps/
+
+# Editor / OS cruft
+*.swp
+.DS_Store
