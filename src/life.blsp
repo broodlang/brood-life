@@ -369,7 +369,7 @@ animated in a native GUI window (the board is fit to the window at startup)."
          sim
          (spawn (sim-loop me
                   stats
-                  (band-pool *par-workers*)
+                  []
                   board
                   0
                   (- start *frame-ns*)
