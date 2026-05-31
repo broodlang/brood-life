@@ -88,24 +88,36 @@ animated in a native GUI window (the board is fit to the window at startup)."
     acc
     (receive ([:band-done m] (collect-bands (- k 1) (into acc m))))))
 
-;; Parallel `step`: equal to `(step live)` but fanned across `*par-workers*` processes
-;; for boards past `*par-threshold*` (small boards step serially — the spawn + copy
-;; overhead isn't worth it). Each band is stepped in its own process that sends its
-;; slice back to us (`me`, captured here in the coordinator, per spawn semantics).
-(defn pstep (live)
-  (if (< (count live) *par-threshold*)
-    (step live)
-    (let (k *par-workers*
-          bh (max 1 (quot (+ *h* k -1) k))
-          subs (band-parts live k bh)
-          me (self))
-      (do
-        (dotimes (b k)
-          (let (sub (get subs b)
-                lo (* b bh)
-                hi (min *h* (* (+ b 1) bh)))
-            (spawn (send me [:band-done (band-step sub lo hi)]))))
-        (collect-bands k {})))))
+;; A PERSISTENT band-worker process: steps whatever halo'd sub-board it's handed for
+;; rows `[lo, hi)` and replies, then loops. Spawned once into a pool (band-pool) and
+;; reused every generation — so we pay the process spawn ONCE, not per frame, and the
+;; workers stay live (visible in the observer as the parallelism in action). `:stop`
+;; ends it.
+(defn band-worker ()
+  (receive
+    (:stop nil)
+    ([:band sub lo hi reply]
+      (do (send reply [:band-done (band-step sub lo hi)])
+          (band-worker)))))
+
+;; Spawn a pool of `k` persistent band-workers; returns a vector of their pids.
+(defn band-pool (k) (into [] (map (fn (_) (spawn (band-worker))) (range k))))
+
+;; Parallel `step`: equal to `(step live)` but fanned across the `pool` of band-worker
+;; processes — for boards past `*par-threshold*` (small boards step serially: the
+;; per-band copy overhead isn't worth it; an empty/absent pool also steps serially).
+;; Each worker gets its band + owned rows and sends its slice back to `me`; we merge.
+(defn pstep (live &optional (pool nil))
+  (let (k (count (or pool [])))
+    (if (or (= k 0) (< (count live) *par-threshold*))
+      (step live)
+      (let (bh (max 1 (quot (+ *h* k -1) k))
+            subs (band-parts live k bh)
+            me (self))
+        (do
+          (dotimes (b k)
+            (send (nth pool b) [:band (get subs b) (* b bh) (min *h* (* (+ b 1) bh)) me]))
+          (collect-bands k {}))))))
 
 ;; Sow `n` random shapes at random positions, threading the PRNG `s`.
 (defn seed--sow (n s acc)
@@ -198,13 +210,18 @@ animated in a native GUI window (the board is fit to the window at startup)."
         (filter (fn ([x y]) (and (< x vcols) (< y vrows))) (keys live)))
       [(status-bar status vrows vcols)])))
 
-;; A worker process: on `[:step board]` it computes the next generation OFF the
-;; render thread and sends it back as `[:gen next]`; `:stop` ends it. Spawning the
-;; heavy step here keeps it off the frame's critical path, and `pstep` fans the work
-;; itself across more processes for a big board (ADR-058 concurrency).
+;; The simulation process: owns a PERSISTENT pool of band-workers and, on each
+;; `[:step board]`, computes the next generation with `pstep` (fanned across the pool)
+;; OFF the render thread, sending it back as `[:gen next]`. `:stop` ends it and the
+;; whole pool (ADR-058 concurrency). So a run holds: the render loop + this sim
+;; process + *par-workers* band-workers (+ the observer) — not just two processes.
 (defn sim-worker (parent)
-  (receive (:stop nil)
-    ([:step b] (do (send parent [:gen (pstep b)]) (sim-worker parent)))))
+  (sim-loop parent (band-pool *par-workers*)))
+
+(defn sim-loop (parent pool)
+  (receive
+    (:stop (doseq (p pool) (send p :stop)))
+    ([:step b] (do (send parent [:gen (pstep b pool)]) (sim-loop parent pool)))))
 
 ;; ms to block in `receive` for the next mailbox message: the time left until the
 ;; frame deadline `due`, or a short re-check window (50ms) once it has passed — at
