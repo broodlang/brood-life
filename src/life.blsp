@@ -20,6 +20,8 @@ animated in a native GUI window (the board is fit to the window at startup)."
 (def *status-scale* 4)
 (def *status-face* {:bg :blue :fg :white :bold true})  ; the bottom buffer-bar style (display/bar)
 (def *grid-min* 5)  ; the sim torus never shrinks below *grid-min* x *grid-min*
+(def *seed-fill* 100)  ; ~1 starting shape per this many torus cells — LOWER ⇒ denser seed,
+; so the board ramps to a busy state (and useful perf numbers) faster (was 400)
 (def *inject-fast* 40)  ; constant-ish board: gens until the next pattern (quick revive)
 (def *inject-slow* 180)  ; lively board: gens until the next pattern (occasional variety)
 (def *stale-tol* 8)  ; population drift at/below max(this, 5%) over the interval ⇒ flat
@@ -142,7 +144,7 @@ animated in a native GUI window (the board is fit to the window at startup)."
 
 ;; A random board: known shapes scattered across the torus, count scaled to area.
 (defn seed (s)
-  (into {} (map (fn (c) [c true]) (seed--sow (max 4 (quot (* *w* *h*) 400)) s []))))
+  (into {} (map (fn (c) [c true]) (seed--sow (max 4 (quot (* *w* *h*) *seed-fill*)) s []))))
 
 ;; Sow a random KNOWN PATTERN — any of `*shapes*` (still-lifes/oscillators/spaceships)
 ;; or `*shooters*` (glider guns) — at a random torus position onto board `live`,
