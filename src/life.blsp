@@ -7,9 +7,22 @@ animated in a native GUI window (the board is fit to the window at startup)."
 
 (def *w* 120)
 (def *h* 40)
-(def *frame-ns* 45000000)  ; target frame period: 45ms in nanoseconds (~22 FPS)
-(def *status-scale* 3)     ; max per-op font scale for the bottom status strip (ADR-079)
+(def *target-fps* 60)      ; generations/frames per second the loop paces to
+(def *frame-ns* (quot 1000000000 *target-fps*))  ; per-frame period in ns (≈16.7ms at 60)
+(def *board-height* 5)     ; the board window's OWN cell font px (per-window) — small ⇒ dense board
+;; FIXED bottom-bar font scale: the status text is always drawn this many board-cells
+;; tall (≈*board-height*×*status-scale* px), never auto-fitted to the content/width —
+;; so the bar height and glyph size stay rock-steady frame to frame (a long line just
+;; truncates rather than shrinking the whole bar). 4 fits the ~52-char status across
+;; the default 840px window; raise for bigger text, lower to fit more on a narrow one.
+(def *status-scale* 4)
+(def *status-face* {:bg :blue :fg :white :bold true})  ; the bottom buffer-bar style (display/bar)
 (def *grid-min* 5)         ; the sim torus never shrinks below *grid-min* x *grid-min*
+(def *inject-fast* 60)     ; constant-ish board: gens until the next shooter (quick revive)
+(def *inject-slow* 300)    ; lively board: gens until the next shooter (occasional variety)
+(def *stale-tol* 8)        ; population drift at/below max(this, 5%) over the interval ⇒ flat
+(def *par-workers* 8)      ; row-bands to fan `step` across when the board is big (≤ nproc)
+(def *par-threshold* 800)  ; below this many live cells, serial step beats the fan-out overhead
 (def *offsets* [[-1 -1] [-1 0] [-1 1] [0 -1] [0 1] [1 -1] [1 0] [1 1]])
 
 ;; Known Life patterns as `[dx dy]` cells from a local origin, sown at random:
@@ -28,11 +41,71 @@ animated in a native GUI window (the board is fit to the window at startup)."
 
 (defn neighbours ([x y]) (shift *offsets* x y))
 
-;; Advance one generation; the board is a map keyed by live `[x y]` cells.
+;; Advance one generation; the board is a map keyed by live `[x y]` cells. We tally
+;; each live cell's 8 neighbours by folding straight into the count map — NOT
+;; `(frequencies (mapcat neighbours …))`, which first materialises an 8N-element list
+;; only to consume it (measurably slower). A cell lives next gen if it has 3 live
+;; neighbours (birth) or 2 and is already live (survival).
 (defn step (live)
   (into {}
     (filter (fn ([c n]) (or (= n 3) (and (= n 2) (contains? live c))))
-      (frequencies (mapcat neighbours (keys live))))))
+      (reduce (fn (acc cell)
+                (reduce (fn (a nb) (assoc a nb (+ 1 (get a nb 0)))) acc (neighbours cell)))
+        {} (keys live)))))
+
+;; ---- parallel step (fan `step` across cores, ADR-058) -----------------------
+;; `step` is embarrassingly parallel: split the torus into `*par-workers*` horizontal
+;; ROW-bands, step each band on its own green process, and stitch the results. The
+;; serial worker used one core no matter how big the board got; this uses many.
+
+;; Split `live` into `k` row-band sub-boards (`bh` = rows per band), returned as a map
+;; band-index → sub-board. Each cell lands in its own band AND in the 1-row halo of any
+;; band it borders (with torus wrap via `mod k`), so every band carries all the
+;; neighbours it needs to step its OWN rows. (Accumulate into a MAP keyed by band index
+;; — brood's `assoc` is map-only, there is no vector index-assoc.)
+(defn band-add (acc p cell) (assoc acc p (assoc (get acc p) cell true)))
+(defn band-parts (live k bh)
+  (reduce (fn (acc cell)
+            (let ([x y] cell
+                  b (min (- k 1) (quot y bh))
+                  lo (* b bh)
+                  hi (min *h* (* (+ b 1) bh))
+                  a1 (band-add acc b cell)
+                  a2 (if (= y lo) (band-add a1 (mod (- b 1) k) cell) a1))
+              (if (= y (- hi 1)) (band-add a2 (mod (+ b 1) k) cell) a2)))
+    (into {} (map (fn (i) [i {}]) (range k))) (keys live)))
+
+;; Step a halo'd sub-board but KEEP only cells in the band's owned rows `[lo, hi)`:
+;; their neighbour counts are exact (the halo supplies every adjacent row), while
+;; halo-row outputs would be wrong, so they're dropped (the neighbouring band owns
+;; those and computes them correctly).
+(defn band-step (sub lo hi)
+  (into {} (filter (fn (kv) (let ([[x y] _] kv) (and (>= y lo) (< y hi)))) (step sub))))
+
+;; Receive `k` band results and merge them — disjoint by row, so a plain `into`.
+(defn collect-bands (k acc)
+  (if (= k 0)
+    acc
+    (receive ([:band-done m] (collect-bands (- k 1) (into acc m))))))
+
+;; Parallel `step`: equal to `(step live)` but fanned across `*par-workers*` processes
+;; for boards past `*par-threshold*` (small boards step serially — the spawn + copy
+;; overhead isn't worth it). Each band is stepped in its own process that sends its
+;; slice back to us (`me`, captured here in the coordinator, per spawn semantics).
+(defn pstep (live)
+  (if (< (count live) *par-threshold*)
+    (step live)
+    (let (k *par-workers*
+          bh (max 1 (quot (+ *h* k -1) k))
+          subs (band-parts live k bh)
+          me (self))
+      (do
+        (dotimes (b k)
+          (let (sub (get subs b)
+                lo (* b bh)
+                hi (min *h* (* (+ b 1) bh)))
+            (spawn (send me [:band-done (band-step sub lo hi)]))))
+        (collect-bands k {})))))
 
 ;; Sow `n` random shapes at random positions, threading the PRNG `s`.
 (defn seed--sow (n s acc)
@@ -47,39 +120,72 @@ animated in a native GUI window (the board is fit to the window at startup)."
 (defn seed (s)
   (into {} (map (fn (c) [c true]) (seed--sow (max 4 (quot (* *w* *h*) 400)) s []))))
 
-;; The live "observer" status line for the bottom strip:
-;; G<gen> <fps>FPS <cells>C <spikes>SP <mem>M <gc>GC. Watch GC tick the instant
-;; FPS dips to spot a GC spike (mem stays flat — churn, not a leak).
-(defn status (gen cells per spikes)
-  (str "G" gen
-    " " (quot 1000 (max 1 (quot per 1000000))) "FPS"
-    " " cells "C"
-    " " spikes "SP"
-    " " (quot (mem-bytes) 1048576) "M"
-    " " (get (gc-stats) :collections) "GC"))
+;; Known glider GUNS ("shooters"). Unlike the still-lifes/oscillators in *shapes*, a
+;; gun emits a glider every period FOREVER, so dropping one onto a settled board
+;; re-energises it (population starts trending up again). Base pattern: the Gosper
+;; glider gun (36×9, period 30), as `[dx dy]` cells from its top-left origin.
+(def *gosper-gun*
+  [[0 4] [0 5] [1 4] [1 5]
+   [10 4] [10 5] [10 6] [11 3] [11 7] [12 2] [12 8] [13 2] [13 8]
+   [14 5] [15 3] [15 7] [16 4] [16 5] [16 6] [17 5]
+   [20 2] [20 3] [20 4] [21 2] [21 3] [21 4] [22 1] [22 5]
+   [24 0] [24 1] [24 5] [24 6]
+   [34 2] [34 3] [35 2] [35 3]])
 
-;; Render `status` as ONE scaled `text` op topped at screen row `top` and centred
-;; across the `vcols`-wide window. The GUI Face's per-op `:scale` (ADR-079) draws
-;; the line `sc`× larger — each char occupying an `sc`×`sc` block of base cells —
-;; so no hand-rolled block font is needed. Positions stay in base-cell units (the
-;; grid is uniform), so the op is `sc` rows tall and `sc·len` cells wide. The scale
-;; auto-fits: up to *status-scale*, backed off (floor 1) so the line never overruns
-;; a narrow window — `vcols / len` is the widest scale that fits. The terminal
-;; frontend ignores `:scale` and renders it 1×.
-(defn status-op (status top vcols)
-  (let (len (string-length status)
-        sc (max 1 (min *status-scale* (quot vcols (max 1 len))))
-        col (max 0 (quot (- vcols (* sc len)) 2)))
-    (text top col status {:scale sc})))
+;; `pat` mirrored across its own vertical / horizontal mid-line. A reflection of a gun
+;; is itself a valid gun (Life's rules are reflection-symmetric), so the one Gosper
+;; definition yields more shooters — firing along different diagonals — for free.
+(defn flip-x (pat)
+  (let (mx (apply max (map (fn ([x y]) x) pat)))
+    (map (fn ([x y]) [(- mx x) y]) pat)))
+(defn flip-y (pat)
+  (let (my (apply max (map (fn ([x y]) y) pat)))
+    (map (fn ([x y]) [x (- my y)]) pat)))
+
+;; The shooter set: the Gosper gun in all four reflections (each a working gun).
+(def *shooters*
+  [*gosper-gun*
+   (flip-x *gosper-gun*)
+   (flip-y *gosper-gun*)
+   (flip-x (flip-y *gosper-gun*))])
+
+;; Sow a random shooter at a random torus position onto board `live`, threading the
+;; PRNG `s`; returns `[live' s']`. Used by life--loop to revive a stagnant board.
+(defn inject-shooter (live s)
+  (let ([gun s1] (sample s *shooters*)
+        [x s2] (rand-int s1 *w*)
+        [y s3] (rand-int s2 *h*))
+    [(into live (map (fn (c) [c true]) (shift gun x y))) s3]))
+
+;; The live "observer" status line for the bottom strip — spelled-out labels with a
+;; gap between fields so it reads at a glance:
+;; `gen 5 · 22 fps · 30 cells · 0 spikes · 12 MB · 3 gc`. Watch `gc` tick the instant
+;; `fps` dips to spot a GC spike (`MB` stays flat — churn, not a leak). The space
+;; before each unit and the ` · ` between fields keep the digits from running together.
+(defn status (gen cells per spikes)
+  (str "gen " gen
+    " · " (quot 1000 (max 1 (quot per 1000000))) " fps"
+    " · " cells " cells"
+    " · " spikes " spikes"
+    " · " (quot (mem-bytes) 1048576) " MB"
+    " · " (get (gc-stats) :collections) " gc"))
+
+;; Render `status` as a full-width buffer bar (std `display/bar`) topped at screen row
+;; `top` — `*status-face*` fills the whole `vcols`-wide line with the text centred and
+;; drawn at the FIXED `*status-scale*` via the GUI Face's per-op `:scale` (ADR-079), so
+;; the bar is always `*status-scale*` rows tall and the glyphs never resize (no
+;; auto-fit — a status too long for the window is truncated by `bar`, not shrunk). The
+;; terminal frontend ignores `:scale`/`:bg` and renders it 1×.
+(defn status-bar (status top vcols)
+  (bar top vcols status {:face *status-face* :align :center :scale *status-scale*}))
 
 ;; A display frame, the window split into two stacked "buffers":
 ;;   • TOP — the GOL board, ONE `text` op per *live* cell (sparse: tens of ops,
 ;;     not *w*×*h*), clipped to the board viewport `vcols`×`vrows`. Cells beyond it
 ;;     — e.g. the torus floored at *grid-min* while the window is tinier — stay
 ;;     alive in memory, just not drawn this frame.
-;;   • a `─` rule across row `vrows`.
-;;   • BOTTOM — the status, drawn *status-scale*× larger via the Face `:scale`
-;;     (status-op), starting just under the rule.
+;;   • BOTTOM — a full-width status BAR across rows `vrows`… (its filled background
+;;     is the separator — no rule needed), drawn *status-scale*× larger (status-bar).
 ;; The leading `clear` wipes the previous frame, so we paint only what's lit. The
 ;; old single-pane version scanned the whole grid and built a full-width string per
 ;; row every frame — O(area), ~30x slower and the reason the frame rate was pinned
@@ -90,15 +196,15 @@ animated in a native GUI window (the board is fit to the window at startup)."
     (concat
       (map (fn ([x y]) (text y x "▪"))
         (filter (fn ([x y]) (and (< x vcols) (< y vrows))) (keys live)))
-      [(text vrows 0 (string-repeat "─" vcols))
-       (status-op status (+ vrows 1) vcols)])))
+      [(status-bar status vrows vcols)])))
 
 ;; A worker process: on `[:step board]` it computes the next generation OFF the
 ;; render thread and sends it back as `[:gen next]`; `:stop` ends it. Spawning the
-;; heavy `step` here keeps it off the frame's critical path (ADR-058 concurrency).
+;; heavy step here keeps it off the frame's critical path, and `pstep` fans the work
+;; itself across more processes for a big board (ADR-058 concurrency).
 (defn sim-worker (parent)
   (receive (:stop nil)
-    ([:step b] (do (send parent [:gen (step b)]) (sim-worker parent)))))
+    ([:step b] (do (send parent [:gen (pstep b)]) (sim-worker parent)))))
 
 ;; ms to block in `receive` for the next mailbox message: the time left until the
 ;; frame deadline `due`, or a short re-check window (50ms) once it has passed — at
@@ -133,7 +239,7 @@ animated in a native GUI window (the board is fit to the window at startup)."
 
 ;; Re-fit the sim torus to window `w` and return the visible board viewport
 ;; `[vcols vrows]` for `render` to clip to. The board is the window less the bottom
-;; status strip (`*status-scale*` rows + a 1-cell rule). `*w*`/`*h*` —
+;; status bar (`*status-scale*` rows). `*w*`/`*h*` —
 ;; the torus `step` wraps on — track that area but are FLOORED at *grid-min*×
 ;; *grid-min*: shrinking the window below the board then can't collapse the torus
 ;; and wrap every cell onto itself ("lose all our blocks"); those cells stay live in
@@ -142,7 +248,7 @@ animated in a native GUI window (the board is fit to the window at startup)."
 ;; size the same way each frame (std/ui.blsp).
 (defn grid-fit (w)
   (let ([cols rows] (gui-size w)
-        vrows (max 1 (- rows (+ *status-scale* 1))))
+        vrows (max 1 (- rows *status-scale*)))
     (do
       (def *w* (max *grid-min* cols))
       (def *h* (max *grid-min* vrows))
@@ -155,7 +261,15 @@ animated in a native GUI window (the board is fit to the window at startup)."
 ;; a heavy generation doesn't stretch the frame either. `prev` gives the true
 ;; period for the fps/spike readout; a frame over 1.5x the target is a spike.
 ;; `grid-fit` re-reads the window each frame so the board tracks a live resize.
-(defn life--loop (w sim live gen prev spikes)
+;;
+;; Shooters on an ADAPTIVE schedule: when the interval elapses it sows ONE random
+;; shooter (inject-shooter), then picks the next interval from how the board behaved
+;; — *inject-fast* if it went constant-ish (drift within max(*stale-tol*, 5%):
+;; still-lifes/oscillators, revive quickly), *inject-slow* if it's lively (occasional
+;; variety, so we don't just sit on one gun) — each randomised to [base, 2·base) so
+;; the timing varies. `s` threads the PRNG; `pop0` is the population at the last
+;; injection, `wait` the scheduled interval, `since` the generations elapsed.
+(defn life--loop (w sim live gen prev spikes s pop0 wait since)
   (let (now (now-ns)
         per (- now prev)
         spk (if (> per (quot (* *frame-ns* 3) 2)) (+ spikes 1) spikes)
@@ -166,22 +280,34 @@ animated in a native GUI window (the board is fit to the window at startup)."
       (let (nxt (wait-frame (+ now *frame-ns*) nil))
         (if (= :quit nxt)
           (do (send sim :stop) (gui-close w))
-          (life--loop w sim nxt (+ gen 1) now spk))))))
+          (if (< since wait)
+            (life--loop w sim nxt (+ gen 1) now spk s pop0 wait (+ since 1))
+            (let (cur (count nxt)
+                  flat? (<= (abs (- cur pop0)) (max *stale-tol* (quot cur 20)))
+                  [nxt2 s2] (inject-shooter nxt s)
+                  base (if flat? *inject-fast* *inject-slow*)
+                  [jit s3] (rand-int s2 base))
+              (life--loop w sim nxt2 (+ gen 1) now spk s3 (count nxt2) (+ base jit) 0))))))))
 
 ;; Open a native window, fit the board to its left pane (a small font means MANY
 ;; cells, so a big board), spawn the sim worker, and animate a fresh random board
 ;; until q / Esc / window close. `grid-fit` sizes `*w*`/`*h*` before we seed.
 (defn run-life ()
   (do
-    (observer/observe)
     ;; Open the process observer in its OWN native GUI window. `(observe)` spawns a
     ;; process that owns that window and returns immediately, so both windows — the
-    ;; observer and the Life board below — are open at once, neither blocking.
-    ;; (Caveat: `gui-font!` is global, so the observer inherits the tiny height-6
-    ;; cell font — see docs/gui-font-gaps.md; bump the height if you want it legible.)
+    ;; observer and the Life board below — are open at once, neither blocking. We set
+    ;; NO global font, so the observer keeps nest's default cell font; only the board
+    ;; window is shrunk below (per-window `gui-font!`), so densifying the board leaves
+    ;; the observer — and, via *status-scale*, the bottom strip — untouched.
+    (observer/observe)
     (let (me (self)
           w (gui-open)
+          _ (gui-font! w {:family :mono :height *board-height*})  ; smaller blocks, board window ONLY
           sim (spawn (sim-worker me))
-          _ (grid-fit w)             ; sizes *w*/*h* before we seed
-          start (now-ns))
-      (life--loop w sim (seed start) 0 (- start *frame-ns*) 0))))
+          _ (grid-fit w)             ; re-reads gui-size (now MANY more cells) → bigger board
+          start (now-ns)
+          board (seed start))
+      ;; Thread `start` as the loop PRNG (shooter picks / intervals); the first shooter
+      ;; lands after a slow interval, then the cadence adapts to the board.
+      (life--loop w sim board 0 (- start *frame-ns*) 0 start (count board) *inject-slow* 0))))

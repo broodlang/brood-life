@@ -4,3 +4,4 @@ _deps/
 # Editor / OS cruft
 *.swp
 .DS_Store
+.brood_crash_dump
