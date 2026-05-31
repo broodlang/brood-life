@@ -8,3 +8,6 @@ _deps/
 
 # Runtime perf log (regenerated each run by perflog)
 life.log
+
+# nest release default output (binary is named after the project)
+/foobar
