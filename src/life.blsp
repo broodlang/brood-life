@@ -22,8 +22,8 @@ animated in a native GUI window (the board is fit to the window at startup)."
 (def *grid-min* 5)  ; the sim torus never shrinks below *grid-min* x *grid-min*
 (def *seed-fill* 100)  ; ~1 starting shape per this many torus cells — LOWER ⇒ denser seed,
 ; so the board ramps to a busy state (and useful perf numbers) faster (was 400)
-(def *inject-fast* 40)  ; constant-ish board: gens until the next pattern (quick revive)
-(def *inject-slow* 180)  ; lively board: gens until the next pattern (occasional variety)
+(def *inject-fast* 20)  ; constant-ish board: gens until the next pattern (quick revive)
+(def *inject-slow* 90)  ; lively board: gens until the next pattern (occasional variety)
 (def *stale-tol* 8)  ; population drift at/below max(this, 5%) over the interval ⇒ flat
 (def *par-workers* 8)  ; row-bands to fan `step` across when the board is big (≤ nproc)
 (def *par-threshold* 300)  ; below this many live cells, serial step beats the fan-out overhead
