@@ -238,12 +238,12 @@ animated in a native GUI window (the board is fit to the window at startup)."
 ;; The `mem-bytes`/`gc-stats` calls and the file write stay off the sim/render threads.
 ;; `:stop` ends it and stops the logger (flushing nothing — the buffer is already on disk).
 (defn stats-loop (renderer logger)
-  (receive (:stop (log-stop logger))
+  (receive (:stop (perflog/log-stop logger))
     ([:meas gen cells per spikes] (do
                                     (when (= 0 (mod gen *status-every*))
                                       (send renderer [:status (status gen cells per spikes)]))
                                     (when (= 0 (mod gen *log-every*))
-                                      (log-line logger (log-fmt gen cells per spikes)))
+                                      (perflog/log-line logger (log-fmt gen cells per spikes)))
                                     (stats-loop renderer logger)))))
 
 ;; SIM pacing: after emitting a board, wait for the renderer's `[:drawn]` ack — so the
@@ -356,7 +356,7 @@ animated in a native GUI window (the board is fit to the window at startup)."
          me
          (self)  ; this root process is the renderer
          stats
-         (spawn (stats-loop me (log-start *log-path*)))
+         (spawn (stats-loop me (perflog/log-start *log-path*)))
          sim
          (spawn (sim-loop me
                   stats
