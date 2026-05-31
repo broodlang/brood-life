@@ -31,7 +31,7 @@
     (is (not (= (keys (seed 1)) (keys (seed 9)))))))
 
 ;; Shooters: the anti-stagnation guns. A gun keeps emitting gliders, so `inject-shooter`
-;; sowing one onto a settled board makes the population trend up again (life--loop
+;; sowing one onto a settled board makes the population trend up again (the sim
 ;; calls it on stagnation). A one-cell typo in *gosper-gun* would silently break it.
 (defn stepn (b n) (reduce (fn (acc _) (step acc)) b (range n)))
 
@@ -80,19 +80,18 @@
     (let (g (board [[1 0] [2 1] [0 2] [1 2] [2 2]]))
       (assert= (pstep g) (step g)))))
 
-;; The frame loop's input handling — the "window won't close" bug was here: an
-;; over-budget frame (deadline already passed) must STILL drain input, not skip it.
-;; `wait-frame` reads this process's own mailbox, so we can drive it directly with a
-;; deadline in the past (the over-budget case) without opening a window.
-(describe "wait-frame stays responsive even past the frame deadline"
-  (test "a queued :close (the window's X) quits, deadline already passed"
-    (do (send (self) :close)
-        (assert= (wait-frame (- (now-ns) 1000000) nil) :quit)))
-  (test "q / Esc / Ctrl-C also quit past the deadline"
-    (do (send (self) :escape)  (assert= (wait-frame (- (now-ns) 1000000) nil) :quit))
-    (do (send (self) "q")      (assert= (wait-frame (- (now-ns) 1000000) nil) :quit))
-    (do (send (self) :ctrl-c)  (assert= (wait-frame (- (now-ns) 1000000) nil) :quit)))
-  (test "unrelated input is drained; the worker's next board is returned"
-    (do (send (self) [:mouse :press :left 0 0])   ; ignored
-        (send (self) [:gen (board [[0 0]])])       ; the next generation
-        (assert= (wait-frame (- (now-ns) 1000000) nil) (board [[0 0]])))))
+;; The renderer (render-loop) routes its mailbox on `quit-signal?`: the window's X
+;; (`:close`) and the q / Esc / Ctrl-C keys quit; board/status/other messages don't.
+;; The loop itself owns a GUI window so it's exercised live, not in the suite — but
+;; the quit *decision* is a pure predicate, so we test that directly.
+(describe "renderer quit signals"
+  (test ":close / q / Esc / Ctrl-C are quit signals"
+    (do (is (quit-signal? :close))
+        (is (quit-signal? "q"))
+        (is (quit-signal? :escape))
+        (is (quit-signal? :ctrl-c))))
+  (test "board / status / other messages are not quit signals"
+    (do (is (not (quit-signal? [:board (board [[0 0]])])))
+        (is (not (quit-signal? [:status "gen 0"])))
+        (is (not (quit-signal? [:mouse :press :left 0 0])))
+        (is (not (quit-signal? :drawn))))))

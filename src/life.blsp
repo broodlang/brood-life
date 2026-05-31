@@ -24,6 +24,7 @@ animated in a native GUI window (the board is fit to the window at startup)."
 (def *par-workers* 8)      ; row-bands to fan `step` across when the board is big (≤ nproc)
 (def *par-threshold* 300)  ; below this many live cells, serial step beats the fan-out overhead
                            ; (raise if the fan-out costs more than it saves on a small board)
+(def *status-every* 15)    ; stats push the bar every N gens (~4 Hz at 60 fps) — readable, not a blur
 (def *offsets* [[-1 -1] [-1 0] [-1 1] [0 -1] [0 1] [1 -1] [1 0] [1 1]])
 
 ;; Known Life patterns as `[dx dy]` cells from a local origin, sown at random:
@@ -163,7 +164,7 @@ animated in a native GUI window (the board is fit to the window at startup)."
    (flip-x (flip-y *gosper-gun*))])
 
 ;; Sow a random shooter at a random torus position onto board `live`, threading the
-;; PRNG `s`; returns `[live' s']`. Used by life--loop to revive a stagnant board.
+;; PRNG `s`; returns `[live' s']`. Used by the sim to revive a stagnant board.
 (defn inject-shooter (live s)
   (let ([gun s1] (sample s *shooters*)
         [x s2] (rand-int s1 *w*)
@@ -211,49 +212,91 @@ animated in a native GUI window (the board is fit to the window at startup)."
         (filter (fn ([x y]) (and (< x vcols) (< y vrows))) (keys live)))
       [(status-bar status vrows vcols)])))
 
-;; The simulation process: owns a PERSISTENT pool of band-workers and, on each
-;; `[:step board]`, computes the next generation with `pstep` (fanned across the pool)
-;; OFF the render thread, sending it back as `[:gen next]`. `:stop` ends it and the
-;; whole pool (ADR-058 concurrency). So a run holds: the render loop + this sim
-;; process + *par-workers* band-workers (+ the observer) — not just two processes.
-(defn sim-worker (parent)
-  (sim-loop parent (band-pool *par-workers*)))
+;; ---- the actors: SIM (model + clock) → STATS → RENDERER (compositor) ------------
+;; `life--loop` used to do all three jobs; now each source is its own process that
+;; PUSHES updates to a thin renderer (ADR-058 concurrency).
 
-(defn sim-loop (parent pool)
+;; STATS: formats the status line OFF the hot paths and at its OWN cadence — it sees
+;; every generation's raw `[:meas …]` but only re-renders + pushes `[:status …]` every
+;; *status-every* gens, so the fps/mem/gc readout updates a few times a second
+;; (legible) instead of blurring at 60 Hz, and the `mem-bytes`/`gc-stats` calls stay
+;; off the sim and render threads.
+(defn stats-loop (renderer)
   (receive
-    (:stop (doseq (p pool) (send p :stop)))
-    ([:step b] (do (send parent [:gen (pstep b pool)]) (sim-loop parent pool)))))
+    (:stop nil)
+    ([:meas gen cells per spikes]
+      (do (when (= 0 (mod gen *status-every*))
+            (send renderer [:status (status gen cells per spikes)]))
+          (stats-loop renderer)))))
 
-;; ms to block in `receive` for the next mailbox message: the time left until the
-;; frame deadline `due`, or a short re-check window (50ms) once it has passed — at
-;; that point we're only waiting on the worker's next `[:gen]`, which lands in a
-;; few ms and wakes the `receive` immediately; the ceiling just bounds a stalled
-;; worker so we never park forever.
-(defn frame-park (due)
-  (let (left (quot (- due (now-ns)) 1000000))
-    (if (> left 0) left 50)))
+;; SIM pacing: after emitting a board, wait for the renderer's `[:drawn]` ack — so the
+;; sim never runs more than one frame ahead of it (bounds the mailbox) — then out the
+;; rest of the frame budget to `deadline`, staying responsive to `:stop`. → :go | :stop.
+(defn sim-pace (deadline)
+  (receive
+    (:stop :stop)
+    ([:drawn]
+      (let (left (quot (- deadline (now-ns)) 1000000))
+        (if (> left 0) (receive (:stop :stop) (after left :go)) :go)))))
 
-;; Wait out the frame, staying responsive to input the WHOLE time, and return
-;; either `:quit` (a quit signal) or the next board (from the worker's `[:gen …]`).
-;; The ONLY fast path is "board in hand AND the deadline has passed" → emit it;
-;; every other case blocks in `receive`, which scans the mailbox for input on each
-;; pass — so the window stays closeable even when a frame runs *over* its time
-;; budget. (The old loop skipped the `receive` once `(now-ns) >= due`, so an
-;; over-budget frame — easy with a tiny font / big board — starved input and the
-;; window ignored the close button: the "can't close it" bug.) GUI input and the
-;; worker reply share this process's mailbox, so we select here. `:close` is the
-;; window's X (a frontend signal, distinct from the Escape *key* `:escape`); we quit
-;; on it plus `q` / Esc / Ctrl-C. Never returns nil and never busy-spins.
-(defn wait-frame (due nxt)
-  (if (and nxt (>= (now-ns) due))
-    nxt
-    (receive (:close :quit)
-      ("q" :quit)
-      (:escape :quit)
-      (:ctrl-c :quit)
-      ([:gen g] (wait-frame due g))
-      (_ (wait-frame due nxt))
-      (after (frame-park due) (wait-frame due nxt)))))
+;; SIM: the model + the clock. Owns the band-worker `pool`. Each frame it pushes the
+;; current board to the renderer and a raw measurement to stats, computes the NEXT
+;; generation with `pstep` (which overlaps with the renderer drawing this one), runs
+;; the adaptive shooter schedule, then paces. `:stop` ends it and the whole pool.
+;;
+;; Shooters on an ADAPTIVE schedule: when the interval elapses it sows ONE random
+;; shooter (inject-shooter), then picks the next interval from how the board behaved —
+;; *inject-fast* if it went constant-ish (drift within max(*stale-tol*, 5%)),
+;; *inject-slow* if it's lively — each randomised to [base, 2·base). `s` threads the
+;; PRNG; `pop0` is the population at the last injection, `wait` the scheduled interval,
+;; `since` the generations elapsed. `prev` gives the true period for the fps/spike read.
+(defn sim-loop (renderer stats pool live gen prev spikes s pop0 wait since)
+  (let (now (now-ns)
+        per (- now prev)
+        spk (if (> per (quot (* *frame-ns* 3) 2)) (+ spikes 1) spikes))
+    (do
+      (send renderer [:board live])
+      (send stats [:meas gen (count live) per spk])
+      (let (nxt (pstep live pool))         ; overlaps the renderer drawing `live`
+        (if (= :stop (sim-pace (+ now *frame-ns*)))
+          (doseq (p pool) (send p :stop))
+          (if (< since wait)
+            (sim-loop renderer stats pool nxt (+ gen 1) now spk s pop0 wait (+ since 1))
+            (let (cur (count nxt)
+                  flat? (<= (abs (- cur pop0)) (max *stale-tol* (quot cur 20)))
+                  [nxt2 s2] (inject-shooter nxt s)
+                  base (if flat? *inject-fast* *inject-slow*)
+                  [jit s3] (rand-int s2 base))
+              (sim-loop renderer stats pool nxt2 (+ gen 1) now spk s3
+                (count nxt2) (+ base jit) 0))))))))
+
+;; A quit signal in the renderer's mailbox: the window's X (`:close`, a frontend
+;; signal distinct from the Escape *key*), or the `q` / Esc / Ctrl-C keys.
+(defn quit-signal? (m)
+  (or (= m :close) (= m "q") (= m :escape) (= m :ctrl-c)))
+
+;; RENDERER (this program's root process): owns the window and is a thin COMPOSITOR.
+;; It caches the latest board + status and redraws on each `[:board …]` (the 60 Hz
+;; driver), acking `[:drawn]` so the sim never outruns it; `[:status …]` just updates
+;; the cached string, picked up by the next board redraw. GUI input lands in this SAME
+;; mailbox, so a quit signal stops the sim + stats and closes. Because the renderer
+;; ONLY ever acts on a received message, input is drained no matter how long a frame
+;; takes (the old "can't close an over-budget window" bug can't recur). `grid-fit`
+;; re-reads the window each redraw, so the board tracks a live resize.
+(defn render-quit (sim stats w)
+  (do (send sim :stop) (send stats :stop) (gui-close w)))
+
+(defn render-loop (w sim stats live status)
+  (receive
+    ([:board nl]
+      (let ([vcols vrows] (grid-fit w))
+        (do (gui-draw w (render nl status vcols vrows))
+            (send sim [:drawn])
+            (render-loop w sim stats nl status))))
+    ([:status s] (render-loop w sim stats live s))
+    (m (if (quit-signal? m)
+         (render-quit sim stats w)
+         (render-loop w sim stats live status)))))
 
 ;; Re-fit the sim torus to window `w` and return the visible board viewport
 ;; `[vcols vrows]` for `render` to clip to. The board is the window less the bottom
@@ -272,60 +315,23 @@ animated in a native GUI window (the board is fit to the window at startup)."
       (def *h* (max *grid-min* vrows))
       [cols vrows])))
 
-;; Draw the current board, hand the worker the next generation to compute, then
-;; pace to `*frame-ns*` measured from THIS frame's start (`now`) — a per-frame
-;; deadline, never an absolute schedule, so a slow/GC frame is NOT chased by a
-;; catch-up speed burst (the old bug). `step` runs off-thread during the wait, so
-;; a heavy generation doesn't stretch the frame either. `prev` gives the true
-;; period for the fps/spike readout; a frame over 1.5x the target is a spike.
-;; `grid-fit` re-reads the window each frame so the board tracks a live resize.
-;;
-;; Shooters on an ADAPTIVE schedule: when the interval elapses it sows ONE random
-;; shooter (inject-shooter), then picks the next interval from how the board behaved
-;; — *inject-fast* if it went constant-ish (drift within max(*stale-tol*, 5%):
-;; still-lifes/oscillators, revive quickly), *inject-slow* if it's lively (occasional
-;; variety, so we don't just sit on one gun) — each randomised to [base, 2·base) so
-;; the timing varies. `s` threads the PRNG; `pop0` is the population at the last
-;; injection, `wait` the scheduled interval, `since` the generations elapsed.
-(defn life--loop (w sim live gen prev spikes s pop0 wait since)
-  (let (now (now-ns)
-        per (- now prev)
-        spk (if (> per (quot (* *frame-ns* 3) 2)) (+ spikes 1) spikes)
-        [vcols vrows] (grid-fit w))
-    (do
-      (send sim [:step live])
-      (gui-draw w (render live (status gen (count live) per spk) vcols vrows))
-      (let (nxt (wait-frame (+ now *frame-ns*) nil))
-        (if (= :quit nxt)
-          (do (send sim :stop) (gui-close w))
-          (if (< since wait)
-            (life--loop w sim nxt (+ gen 1) now spk s pop0 wait (+ since 1))
-            (let (cur (count nxt)
-                  flat? (<= (abs (- cur pop0)) (max *stale-tol* (quot cur 20)))
-                  [nxt2 s2] (inject-shooter nxt s)
-                  base (if flat? *inject-fast* *inject-slow*)
-                  [jit s3] (rand-int s2 base))
-              (life--loop w sim nxt2 (+ gen 1) now spk s3 (count nxt2) (+ base jit) 0))))))))
-
-;; Open a native window, fit the board to its left pane (a small font means MANY
-;; cells, so a big board), spawn the sim worker, and animate a fresh random board
-;; until q / Esc / window close. `grid-fit` sizes `*w*`/`*h*` before we seed.
+;; Wire up and run the three actors. This root process becomes the RENDERER (it owns
+;; the window). The observer opens in its OWN window first (it keeps nest's default
+;; font; only the board window is shrunk via per-window `gui-font!`). We `grid-fit`
+;; once to size `*w*`/`*h*` before seeding, then spawn stats + sim (the sim spawns the
+;; band pool) and hand them this process's pid so they can push `[:status]`/`[:board]`
+;; in. `start` seeds the board and threads the sim's PRNG (shooter picks / intervals);
+;; the first shooter lands after a slow interval, then the cadence adapts.
 (defn run-life ()
   (do
-    ;; Open the process observer in its OWN native GUI window. `(observe)` spawns a
-    ;; process that owns that window and returns immediately, so both windows — the
-    ;; observer and the Life board below — are open at once, neither blocking. We set
-    ;; NO global font, so the observer keeps nest's default cell font; only the board
-    ;; window is shrunk below (per-window `gui-font!`), so densifying the board leaves
-    ;; the observer — and, via *status-scale*, the bottom strip — untouched.
     (observer/observe)
-    (let (me (self)
-          w (gui-open)
+    (let (w (gui-open)
           _ (gui-font! w {:family :mono :height *board-height*})  ; smaller blocks, board window ONLY
-          sim (spawn (sim-worker me))
-          _ (grid-fit w)             ; re-reads gui-size (now MANY more cells) → bigger board
+          _ (grid-fit w)                  ; sizes *w*/*h* before we seed
           start (now-ns)
-          board (seed start))
-      ;; Thread `start` as the loop PRNG (shooter picks / intervals); the first shooter
-      ;; lands after a slow interval, then the cadence adapts to the board.
-      (life--loop w sim board 0 (- start *frame-ns*) 0 start (count board) *inject-slow* 0))))
+          board (seed start)
+          me (self)                       ; this root process is the renderer
+          stats (spawn (stats-loop me))
+          sim (spawn (sim-loop me stats (band-pool *par-workers*)
+                       board 0 (- start *frame-ns*) 0 start (count board) *inject-slow* 0)))
+      (render-loop w sim stats board ""))))
