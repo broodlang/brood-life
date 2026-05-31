@@ -1,6 +1,0 @@
-;; Tests for the hello module. `(:use hello)` brings `greeting` into scope;
-;; `(:use test)` the describe/test/assert= macros.
-(defmodule hello-test (:use hello) (:use test))
-
-(describe "hello"
-  (test "greeting" (assert= (greeting) "hello foobar")))

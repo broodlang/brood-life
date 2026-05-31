@@ -1,8 +1,0 @@
-(defmodule main
-  "The foobar project's entry-point module — wired up as
-the `nest run` entry by default (module `main`, fn `main`)."
-  (:use hello))
-
-(defn main ()
-  "Entry point: print the project's greeting."
-  (println (greeting)))
