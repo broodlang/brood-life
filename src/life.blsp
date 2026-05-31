@@ -45,25 +45,39 @@ animated in a native GUI window (the board is fit to the window at startup)."
 
 (defn neighbours ([x y]) (shift *offsets* x y))
 
+;; Tally one live cell's contribution to the neighbour-count map `a`: +1 at key `k`.
+(defn step--bump (a k) (assoc a k (+ 1 (get a k 0))))
+
 ;; Advance one generation; the board is a map keyed by live `[x y]` cells. We tally
-;; each live cell's 8 neighbours by folding straight into the count map — NOT
-;; `(frequencies (mapcat neighbours …))`, which first materialises an 8N-element list
-;; only to consume it (measurably slower). A cell lives next gen if it has 3 live
-;; neighbours (birth) or 2 and is already live (survival). The inner fold computes each
-;; wrapped neighbour key INLINE rather than calling `(neighbours cell)` (which would
-;; build a fresh 8-element list plus a `map` closure per cell). `neighbours` is kept —
-;; it reads clearly and the test exercises it.
+;; each live cell's 8 neighbours straight into a count map, then keep the cells with 3
+;; (birth) or 2-while-already-live (survival). NOT `(frequencies (mapcat neighbours …))`
+;; — materialising the 8N-element list and the per-cell `map` closure benchmarked ~1.4×
+;; slower than counting in place.
+;;
+;; Hot path (this is ~all the sim's CPU, parallelised by `pstep`): for each live cell we
+;; precompute its FOUR wrapped neighbour coordinates once — `xl`/`xr`/`yu`/`yd` — then
+;; bump the 8 neighbours UNROLLED. That's 4 `mod`s per cell instead of 16 (each of the 8
+;; neighbours sharing the precomputed columns/rows) and no inner `reduce`/lambda/
+;; destructure per offset — measured ~1.7× faster than folding over `*offsets*`. (`mod`
+;; beat a hand-rolled compare-and-wrap; inlining `step--bump` was slower — the extra
+;; `let` bindings cost more than the calls they save.)
 (defn step (live)
   (into {}
     (filter (fn ([c n]) (or (= n 3) (and (= n 2) (contains? live c))))
       (reduce (fn (acc cell)
-                (let ([x y] cell)
-                  (reduce (fn (a off)
-                            (let ([dx dy] off
-                                  nb [(mod (+ x dx) *w*) (mod (+ y dy) *h*)])
-                              (assoc a nb (+ 1 (get a nb 0)))))
-                    acc
-                    *offsets*)))
+                (let ([x y] cell
+                      xl (mod (+ x -1) *w*)
+                      xr (mod (+ x 1) *w*)
+                      yu (mod (+ y -1) *h*)
+                      yd (mod (+ y 1) *h*)
+                      a1 (step--bump acc [xl yu])
+                      a2 (step--bump a1 [x yu])
+                      a3 (step--bump a2 [xr yu])
+                      a4 (step--bump a3 [xl y])
+                      a5 (step--bump a4 [xr y])
+                      a6 (step--bump a5 [xl yd])
+                      a7 (step--bump a6 [x yd]))
+                  (step--bump a7 [xr yd])))
         {}
         (keys live)))))
 
