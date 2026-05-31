@@ -22,7 +22,8 @@ animated in a native GUI window (the board is fit to the window at startup)."
 (def *inject-slow* 300)    ; lively board: gens until the next shooter (occasional variety)
 (def *stale-tol* 8)        ; population drift at/below max(this, 5%) over the interval ⇒ flat
 (def *par-workers* 8)      ; row-bands to fan `step` across when the board is big (≤ nproc)
-(def *par-threshold* 800)  ; below this many live cells, serial step beats the fan-out overhead
+(def *par-threshold* 300)  ; below this many live cells, serial step beats the fan-out overhead
+                           ; (raise if the fan-out costs more than it saves on a small board)
 (def *offsets* [[-1 -1] [-1 0] [-1 1] [0 -1] [0 1] [1 -1] [1 0] [1 1]])
 
 ;; Known Life patterns as `[dx dy]` cells from a local origin, sown at random:
