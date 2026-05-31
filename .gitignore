@@ -5,3 +5,6 @@ _deps/
 *.swp
 .DS_Store
 .brood_crash_dump
+
+# Runtime perf log (regenerated each run by perflog)
+life.log

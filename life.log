@@ -1,4 +1,0 @@
-gen 0	cells 132	fps 33	ms 30	spikes 1	mb 41	gc 0
-gen 60	cells 108	fps 62	ms 16	spikes 2	mb 48	gc 0
-gen 120	cells 150	fps 55	ms 18	spikes 2	mb 50	gc 0
-gen 180	cells 173	fps 55	ms 18	spikes 2	mb 65	gc 0
