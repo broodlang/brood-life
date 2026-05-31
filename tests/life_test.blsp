@@ -30,14 +30,15 @@
   (test "different seeds give different boards"
     (is (not (= (keys (seed 1)) (keys (seed 9)))))))
 
-;; Shooters: the anti-stagnation guns. A gun keeps emitting gliders, so `inject-shooter`
+;; Shooters: the anti-stagnation guns. A gun keeps emitting gliders, so `inject-pattern`
 ;; sowing one onto a settled board makes the population trend up again (the sim
 ;; calls it on stagnation). A one-cell typo in *gosper-gun* would silently break it.
 (defn stepn (b n) (reduce (fn (acc _) (step acc)) b (range n)))
 
 (describe "shooters re-energise a stagnant board"
   (test "the Gosper gun fires: it emits gliders, so the population grows"
-    (let (g (board *gosper-gun*))           ; at origin, fits 120x40 without wrapping
+    (let (g (board *gosper-gun*))
+      ; at origin, fits 120x40 without wrapping
       (do
         (assert= (count g) 36)
         (is (> (count (stepn g 60)) (count g))))))
@@ -49,13 +50,16 @@
       (is (every? (fn (s) (every? (fn ([x y]) (and (>= x 0) (<= x 35) (>= y 0) (<= y 8))) s))
             *shooters*))))
 
-  (test "inject-shooter sows a gun onto a flat board, deterministically"
-    (let (settled (board [[0 0] [1 0] [0 1] [1 1]])   ; a still-life block: population flat
-          [revived _] (inject-shooter settled 7)
-          [again _] (inject-shooter settled 7))
+  (test "inject-pattern sows a known pattern onto a flat board, deterministically"
+    (let (settled (board [[0 0] [1 0] [0 1] [1 1]])
+           ; a still-life block: population flat
+           [revived _]
+           (inject-pattern settled 7)
+           [again _]
+           (inject-pattern settled 7))
       (do
-        (is (> (count revived) (count settled)))      ; a shooter was sown in
-        (assert= (keys revived) (keys again))))))      ; same seed -> same sow
+        (is (> (count revived) (count settled)))  ; a pattern was sown in
+        (assert= (keys revived) (keys again))))))  ; same seed -> same sow
 
 ;; Parallel step (pstep): the torus is split into row-bands stepped on separate
 ;; processes, then stitched. The fan-out needs a live scheduler, but its CORRECTNESS
@@ -66,15 +70,24 @@
 (defn band-merge (live k)
   (let (bh (max 1 (quot (+ *h* k -1) k)) subs (band-parts live k bh))
     (reduce (fn (acc b) (into acc (band-step (get subs b) (* b bh) (min *h* (* (+ b 1) bh)))))
-      {} (range k))))
+      {}
+      (range k))))
 
 (describe "parallel step matches serial step"
   (test "row-band decomposition reassembles into exactly (step board)"
-    (let (g (board [[1 0] [2 1] [0 2] [1 2] [2 2]    ; a glider
-                    [10 0] [10 39] [11 39] [0 20]]))  ; cells on the torus seam (h=40)
+    (let (g (board
+              [[1 0] [2 1]
+                [0 2]
+                [1 2]
+                [2 2]  ; a glider
+                [10 0]
+                [10 39]
+                [11 39]
+                [0 20]]))
+      ; cells on the torus seam (h=40)
       (do
-        (assert= (band-merge g 8) (step g))           ; 8 bands
-        (assert= (band-merge g 3) (step g))           ; band height not dividing h=40
+        (assert= (band-merge g 8) (step g))  ; 8 bands
+        (assert= (band-merge g 3) (step g))  ; band height not dividing h=40
         (assert= (band-merge (stepn g 5) 8) (step (stepn g 5))))))
   (test "pstep falls back to serial step below the threshold"
     (let (g (board [[1 0] [2 1] [0 2] [1 2] [2 2]]))
@@ -86,12 +99,14 @@
 ;; the quit *decision* is a pure predicate, so we test that directly.
 (describe "renderer quit signals"
   (test ":close / q / Esc / Ctrl-C are quit signals"
-    (do (is (quit-signal? :close))
-        (is (quit-signal? "q"))
-        (is (quit-signal? :escape))
-        (is (quit-signal? :ctrl-c))))
+    (do
+      (is (quit-signal? :close))
+      (is (quit-signal? "q"))
+      (is (quit-signal? :escape))
+      (is (quit-signal? :ctrl-c))))
   (test "board / status / other messages are not quit signals"
-    (do (is (not (quit-signal? [:board (board [[0 0]])])))
-        (is (not (quit-signal? [:status "gen 0"])))
-        (is (not (quit-signal? [:mouse :press :left 0 0])))
-        (is (not (quit-signal? :drawn))))))
+    (do
+      (is (not (quit-signal? [:board (board [[0 0]])])))
+      (is (not (quit-signal? [:status "gen 0"])))
+      (is (not (quit-signal? [:mouse :press :left 0 0])))
+      (is (not (quit-signal? :drawn))))))

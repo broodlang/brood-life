@@ -3,13 +3,14 @@
 animated in a native GUI window (the board is fit to the window at startup)."
   (:use display))
 
-(require 'observer)
+(require 'shapes)  ; still-life / oscillator / spaceship patterns (*shapes*)
+(require 'guns)  ; glider-gun patterns (*shooters*) — both sown by inject-pattern
 
 (def *w* 120)
 (def *h* 40)
-(def *target-fps* 60)      ; generations/frames per second the loop paces to
+(def *target-fps* 60)  ; generations/frames per second the loop paces to
 (def *frame-ns* (quot 1000000000 *target-fps*))  ; per-frame period in ns (≈16.7ms at 60)
-(def *board-height* 5)     ; the board window's OWN cell font px (per-window) — small ⇒ dense board
+(def *board-height* 5)  ; the board window's OWN cell font px (per-window) — small ⇒ dense board
 ;; FIXED bottom-bar font scale: the status text is always drawn this many board-cells
 ;; tall (≈*board-height*×*status-scale* px), never auto-fitted to the content/width —
 ;; so the bar height and glyph size stay rock-steady frame to frame (a long line just
@@ -17,25 +18,21 @@ animated in a native GUI window (the board is fit to the window at startup)."
 ;; the default 840px window; raise for bigger text, lower to fit more on a narrow one.
 (def *status-scale* 4)
 (def *status-face* {:bg :blue :fg :white :bold true})  ; the bottom buffer-bar style (display/bar)
-(def *grid-min* 5)         ; the sim torus never shrinks below *grid-min* x *grid-min*
-(def *inject-fast* 60)     ; constant-ish board: gens until the next shooter (quick revive)
-(def *inject-slow* 300)    ; lively board: gens until the next shooter (occasional variety)
-(def *stale-tol* 8)        ; population drift at/below max(this, 5%) over the interval ⇒ flat
-(def *par-workers* 8)      ; row-bands to fan `step` across when the board is big (≤ nproc)
+(def *grid-min* 5)  ; the sim torus never shrinks below *grid-min* x *grid-min*
+(def *inject-fast* 40)  ; constant-ish board: gens until the next pattern (quick revive)
+(def *inject-slow* 180)  ; lively board: gens until the next pattern (occasional variety)
+(def *stale-tol* 8)  ; population drift at/below max(this, 5%) over the interval ⇒ flat
+(def *par-workers* 8)  ; row-bands to fan `step` across when the board is big (≤ nproc)
 (def *par-threshold* 300)  ; below this many live cells, serial step beats the fan-out overhead
-                           ; (raise if the fan-out costs more than it saves on a small board)
-(def *status-every* 15)    ; stats push the bar every N gens (~4 Hz at 60 fps) — readable, not a blur
+; (raise if the fan-out costs more than it saves on a small board)
+(def *status-every* 15)  ; stats push the bar every N gens (~4 Hz at 60 fps) — readable, not a blur
 (def *offsets* [[-1 -1] [-1 0] [-1 1] [0 -1] [0 1] [1 -1] [1 0] [1 1]])
 
-;; Known Life patterns as `[dx dy]` cells from a local origin, sown at random:
-;; block, blinker, glider, toad, beacon, beehive, LWSS (in this order).
-(def *shapes*
-  [[[0 0] [1 0] [0 1] [1 1]] [[0 0] [1 0] [2 0]]
-    [[1 0] [2 1] [0 2] [1 2] [2 2]]
-    [[1 0] [2 0] [3 0] [0 1] [1 1] [2 1]]
-    [[0 0] [1 0] [0 1] [1 1] [2 2] [3 2] [2 3] [3 3]]
-    [[1 0] [2 0] [0 1] [3 1] [1 2] [2 2]]
-    [[0 0] [3 0] [4 1] [0 2] [4 2] [1 3] [2 3] [3 3] [4 3]]])
+;; Everything sowable mid-run: the still-lifes / oscillators / spaceships of `*shapes*`
+;; plus the glider guns of `*shooters*` (both required above). `inject-pattern` samples
+;; this uniformly, so any known shape can drop onto the board for variety, and a gun
+;; lands often enough to keep re-energising a settling board.
+(def *patterns* (concat *shapes* *shooters*))
 
 ;; `pat` (a list of `[dx dy]`) shifted to origin `[x y]` and wrapped on the torus.
 (defn shift (pat x y)
@@ -47,18 +44,31 @@ animated in a native GUI window (the board is fit to the window at startup)."
 ;; each live cell's 8 neighbours by folding straight into the count map — NOT
 ;; `(frequencies (mapcat neighbours …))`, which first materialises an 8N-element list
 ;; only to consume it (measurably slower). A cell lives next gen if it has 3 live
-;; neighbours (birth) or 2 and is already live (survival).
+;; neighbours (birth) or 2 and is already live (survival). The inner fold computes each
+;; wrapped neighbour key INLINE rather than calling `(neighbours cell)` (which would
+;; build a fresh 8-element list plus a `map` closure per cell). `neighbours` is kept —
+;; it reads clearly and the test exercises it.
 (defn step (live)
   (into {}
     (filter (fn ([c n]) (or (= n 3) (and (= n 2) (contains? live c))))
       (reduce (fn (acc cell)
-                (reduce (fn (a nb) (assoc a nb (+ 1 (get a nb 0)))) acc (neighbours cell)))
-        {} (keys live)))))
+                (let ([x y] cell)
+                  (reduce (fn (a off)
+                            (let ([dx dy] off
+                                  nb [(mod (+ x dx) *w*) (mod (+ y dy) *h*)])
+                              (assoc a nb (+ 1 (get a nb 0)))))
+                    acc
+                    *offsets*)))
+        {}
+        (keys live)))))
 
 ;; ---- parallel step (fan `step` across cores, ADR-058) -----------------------
 ;; `step` is embarrassingly parallel: split the torus into `*par-workers*` horizontal
 ;; ROW-bands, step each band on its own green process, and stitch the results. The
-;; serial worker used one core no matter how big the board got; this uses many.
+;; serial worker used one core no matter how big the board got; this uses many. This
+;; is the live sim's stepper — the board is kept LIVELY by the shooters, so most cells
+;; are active most of the time and a full parallel recompute beats trying to skip
+;; "stable" cells (there are rarely many).
 
 ;; Split `live` into `k` row-band sub-boards (`bh` = rows per band), returned as a map
 ;; band-index → sub-board. Each cell lands in its own band AND in the 1-row halo of any
@@ -75,7 +85,8 @@ animated in a native GUI window (the board is fit to the window at startup)."
                   a1 (band-add acc b cell)
                   a2 (if (= y lo) (band-add a1 (mod (- b 1) k) cell) a1))
               (if (= y (- hi 1)) (band-add a2 (mod (+ b 1) k) cell) a2)))
-    (into {} (map (fn (i) [i {}]) (range k))) (keys live)))
+    (into {} (map (fn (i) [i {}]) (range k)))
+    (keys live)))
 
 ;; Step a halo'd sub-board but KEEP only cells in the band's owned rows `[lo, hi)`:
 ;; their neighbour counts are exact (the halo supplies every adjacent row), while
@@ -93,14 +104,10 @@ animated in a native GUI window (the board is fit to the window at startup)."
 ;; A PERSISTENT band-worker process: steps whatever halo'd sub-board it's handed for
 ;; rows `[lo, hi)` and replies, then loops. Spawned once into a pool (band-pool) and
 ;; reused every generation — so we pay the process spawn ONCE, not per frame, and the
-;; workers stay live (visible in the observer as the parallelism in action). `:stop`
-;; ends it.
+;; workers stay live. `:stop` ends it.
 (defn band-worker ()
-  (receive
-    (:stop nil)
-    ([:band sub lo hi reply]
-      (do (send reply [:band-done (band-step sub lo hi)])
-          (band-worker)))))
+  (receive (:stop nil)
+    ([:band sub lo hi reply] (do (send reply [:band-done (band-step sub lo hi)]) (band-worker)))))
 
 ;; Spawn a pool of `k` persistent band-workers; returns a vector of their pids.
 (defn band-pool (k) (into [] (map (fn (_) (spawn (band-worker))) (range k))))
@@ -134,42 +141,17 @@ animated in a native GUI window (the board is fit to the window at startup)."
 (defn seed (s)
   (into {} (map (fn (c) [c true]) (seed--sow (max 4 (quot (* *w* *h*) 400)) s []))))
 
-;; Known glider GUNS ("shooters"). Unlike the still-lifes/oscillators in *shapes*, a
-;; gun emits a glider every period FOREVER, so dropping one onto a settled board
-;; re-energises it (population starts trending up again). Base pattern: the Gosper
-;; glider gun (36×9, period 30), as `[dx dy]` cells from its top-left origin.
-(def *gosper-gun*
-  [[0 4] [0 5] [1 4] [1 5]
-   [10 4] [10 5] [10 6] [11 3] [11 7] [12 2] [12 8] [13 2] [13 8]
-   [14 5] [15 3] [15 7] [16 4] [16 5] [16 6] [17 5]
-   [20 2] [20 3] [20 4] [21 2] [21 3] [21 4] [22 1] [22 5]
-   [24 0] [24 1] [24 5] [24 6]
-   [34 2] [34 3] [35 2] [35 3]])
-
-;; `pat` mirrored across its own vertical / horizontal mid-line. A reflection of a gun
-;; is itself a valid gun (Life's rules are reflection-symmetric), so the one Gosper
-;; definition yields more shooters — firing along different diagonals — for free.
-(defn flip-x (pat)
-  (let (mx (apply max (map (fn ([x y]) x) pat)))
-    (map (fn ([x y]) [(- mx x) y]) pat)))
-(defn flip-y (pat)
-  (let (my (apply max (map (fn ([x y]) y) pat)))
-    (map (fn ([x y]) [x (- my y)]) pat)))
-
-;; The shooter set: the Gosper gun in all four reflections (each a working gun).
-(def *shooters*
-  [*gosper-gun*
-   (flip-x *gosper-gun*)
-   (flip-y *gosper-gun*)
-   (flip-x (flip-y *gosper-gun*))])
-
-;; Sow a random shooter at a random torus position onto board `live`, threading the
-;; PRNG `s`; returns `[live' s']`. Used by the sim to revive a stagnant board.
-(defn inject-shooter (live s)
-  (let ([gun s1] (sample s *shooters*)
+;; Sow a random KNOWN PATTERN — any of `*shapes*` (still-lifes/oscillators/spaceships)
+;; or `*shooters*` (glider guns) — at a random torus position onto board `live`,
+;; threading the PRNG `s`; returns `[live' s']`. The sim calls it on a schedule both
+;; for visual variety and to revive a stagnant board (a gun lands eventually and
+;; re-energises it). Pattern GEOMETRY lives in the `shapes` / `guns` modules; placement
+;; is `life`'s job (it needs the torus `*w*`/`*h*` and `shift`).
+(defn inject-pattern (live s)
+  (let ([pat s1] (sample s *patterns*)
         [x s2] (rand-int s1 *w*)
         [y s3] (rand-int s2 *h*))
-    [(into live (map (fn (c) [c true]) (shift gun x y))) s3]))
+    [(into live (map (fn (c) [c true]) (shift pat x y))) s3]))
 
 ;; The live "observer" status line for the bottom strip — spelled-out labels with a
 ;; gap between fields so it reads at a glance:
@@ -177,12 +159,23 @@ animated in a native GUI window (the board is fit to the window at startup)."
 ;; `fps` dips to spot a GC spike (`MB` stays flat — churn, not a leak). The space
 ;; before each unit and the ` · ` between fields keep the digits from running together.
 (defn status (gen cells per spikes)
-  (str "gen " gen
-    " · " (quot 1000 (max 1 (quot per 1000000))) " fps"
-    " · " cells " cells"
-    " · " spikes " spikes"
-    " · " (quot (mem-bytes) 1048576) " MB"
-    " · " (get (gc-stats) :collections) " gc"))
+  (str "gen "
+    gen
+    " · "
+    (quot 1000 (max 1 (quot per 1000000)))
+    " fps"
+    " · "
+    cells
+    " cells"
+    " · "
+    spikes
+    " spikes"
+    " · "
+    (quot (mem-bytes) 1048576)
+    " MB"
+    " · "
+    (get (gc-stats) :collections)
+    " gc"))
 
 ;; Render `status` as a full-width buffer bar (std `display/bar`) topped at screen row
 ;; `top` — `*status-face*` fills the whole `vcols`-wide line with the text centred and
@@ -207,9 +200,8 @@ animated in a native GUI window (the board is fit to the window at startup)."
 (defn render (live status vcols vrows)
   (apply frame
     (clear)
-    (concat
-      (map (fn ([x y]) (text y x "▪"))
-        (filter (fn ([x y]) (and (< x vcols) (< y vrows))) (keys live)))
+    (concat (map (fn ([x y]) (text y x "▪"))
+              (filter (fn ([x y]) (and (< x vcols) (< y vrows))) (keys live)))
       [(status-bar status vrows vcols)])))
 
 ;; ---- the actors: SIM (model + clock) → STATS → RENDERER (compositor) ------------
@@ -222,30 +214,27 @@ animated in a native GUI window (the board is fit to the window at startup)."
 ;; (legible) instead of blurring at 60 Hz, and the `mem-bytes`/`gc-stats` calls stay
 ;; off the sim and render threads.
 (defn stats-loop (renderer)
-  (receive
-    (:stop nil)
-    ([:meas gen cells per spikes]
-      (do (when (= 0 (mod gen *status-every*))
-            (send renderer [:status (status gen cells per spikes)]))
-          (stats-loop renderer)))))
+  (receive (:stop nil)
+    ([:meas gen cells per spikes] (do
+                                    (when (= 0 (mod gen *status-every*))
+                                      (send renderer [:status (status gen cells per spikes)]))
+                                    (stats-loop renderer)))))
 
 ;; SIM pacing: after emitting a board, wait for the renderer's `[:drawn]` ack — so the
 ;; sim never runs more than one frame ahead of it (bounds the mailbox) — then out the
 ;; rest of the frame budget to `deadline`, staying responsive to `:stop`. → :go | :stop.
 (defn sim-pace (deadline)
-  (receive
-    (:stop :stop)
-    ([:drawn]
-      (let (left (quot (- deadline (now-ns)) 1000000))
-        (if (> left 0) (receive (:stop :stop) (after left :go)) :go)))))
+  (receive (:stop :stop)
+    ([:drawn] (let (left (quot (- deadline (now-ns)) 1000000))
+                (if (> left 0) (receive (:stop :stop) (after left :go)) :go)))))
 
 ;; SIM: the model + the clock. Owns the band-worker `pool`. Each frame it pushes the
 ;; current board to the renderer and a raw measurement to stats, computes the NEXT
 ;; generation with `pstep` (which overlaps with the renderer drawing this one), runs
-;; the adaptive shooter schedule, then paces. `:stop` ends it and the whole pool.
+;; the adaptive pattern schedule, then paces. `:stop` ends it and the whole pool.
 ;;
-;; Shooters on an ADAPTIVE schedule: when the interval elapses it sows ONE random
-;; shooter (inject-shooter), then picks the next interval from how the board behaved —
+;; Patterns on an ADAPTIVE schedule: when the interval elapses it sows ONE random
+;; pattern (inject-pattern), then picks the next interval from how the board behaved —
 ;; *inject-fast* if it went constant-ish (drift within max(*stale-tol*, 5%)),
 ;; *inject-slow* if it's lively — each randomised to [base, 2·base). `s` threads the
 ;; PRNG; `pop0` is the population at the last injection, `wait` the scheduled interval,
@@ -257,18 +246,28 @@ animated in a native GUI window (the board is fit to the window at startup)."
     (do
       (send renderer [:board live])
       (send stats [:meas gen (count live) per spk])
-      (let (nxt (pstep live pool))         ; overlaps the renderer drawing `live`
+      (let (nxt (pstep live pool))
+        ; overlaps the renderer drawing `live`
         (if (= :stop (sim-pace (+ now *frame-ns*)))
           (doseq (p pool) (send p :stop))
           (if (< since wait)
             (sim-loop renderer stats pool nxt (+ gen 1) now spk s pop0 wait (+ since 1))
             (let (cur (count nxt)
                   flat? (<= (abs (- cur pop0)) (max *stale-tol* (quot cur 20)))
-                  [nxt2 s2] (inject-shooter nxt s)
+                  [nxt2 s2] (inject-pattern nxt s)
                   base (if flat? *inject-fast* *inject-slow*)
                   [jit s3] (rand-int s2 base))
-              (sim-loop renderer stats pool nxt2 (+ gen 1) now spk s3
-                (count nxt2) (+ base jit) 0))))))))
+              (sim-loop renderer
+                stats
+                pool
+                nxt2
+                (+ gen 1)
+                now
+                spk
+                s3
+                (count nxt2)
+                (+ base jit)
+                0))))))))
 
 ;; A quit signal in the renderer's mailbox: the window's X (`:close`, a frontend
 ;; signal distinct from the Escape *key*), or the `q` / Esc / Ctrl-C keys.
@@ -287,16 +286,13 @@ animated in a native GUI window (the board is fit to the window at startup)."
   (do (send sim :stop) (send stats :stop) (gui-close w)))
 
 (defn render-loop (w sim stats live status)
-  (receive
-    ([:board nl]
-      (let ([vcols vrows] (grid-fit w))
-        (do (gui-draw w (render nl status vcols vrows))
-            (send sim [:drawn])
-            (render-loop w sim stats nl status))))
+  (receive ([:board nl] (let ([vcols vrows] (grid-fit w))
+                          (do
+                            (gui-draw w (render nl status vcols vrows))
+                            (send sim [:drawn])
+                            (render-loop w sim stats nl status))))
     ([:status s] (render-loop w sim stats live s))
-    (m (if (quit-signal? m)
-         (render-quit sim stats w)
-         (render-loop w sim stats live status)))))
+    (m (if (quit-signal? m) (render-quit sim stats w) (render-loop w sim stats live status)))))
 
 ;; Re-fit the sim torus to window `w` and return the visible board viewport
 ;; `[vcols vrows]` for `render` to clip to. The board is the window less the bottom
@@ -316,22 +312,35 @@ animated in a native GUI window (the board is fit to the window at startup)."
       [cols vrows])))
 
 ;; Wire up and run the three actors. This root process becomes the RENDERER (it owns
-;; the window). The observer opens in its OWN window first (it keeps nest's default
-;; font; only the board window is shrunk via per-window `gui-font!`). We `grid-fit`
+;; the window); only the board window is shrunk via per-window `gui-font!`. We `grid-fit`
 ;; once to size `*w*`/`*h*` before seeding, then spawn stats + sim (the sim spawns the
 ;; band pool) and hand them this process's pid so they can push `[:status]`/`[:board]`
-;; in. `start` seeds the board and threads the sim's PRNG (shooter picks / intervals);
-;; the first shooter lands after a slow interval, then the cadence adapts.
+;; in. `start` seeds the board and threads the sim's PRNG (pattern picks / intervals);
+;; the first pattern lands after a slow interval, then the cadence adapts.
 (defn run-life ()
-  (do
-    (observer/observe)
-    (let (w (gui-open)
-          _ (gui-font! w {:family :mono :height *board-height*})  ; smaller blocks, board window ONLY
-          _ (grid-fit w)                  ; sizes *w*/*h* before we seed
-          start (now-ns)
-          board (seed start)
-          me (self)                       ; this root process is the renderer
-          stats (spawn (stats-loop me))
-          sim (spawn (sim-loop me stats (band-pool *par-workers*)
-                       board 0 (- start *frame-ns*) 0 start (count board) *inject-slow* 0)))
-      (render-loop w sim stats board ""))))
+  (let (w (gui-open)
+         _
+         (gui-font! w {:family :mono :height *board-height*})  ; smaller blocks, board window ONLY
+         _
+         (grid-fit w)  ; sizes *w*/*h* before we seed
+         start
+         (now-ns)
+         board
+         (seed start)
+         me
+         (self)  ; this root process is the renderer
+         stats
+         (spawn (stats-loop me))
+         sim
+         (spawn (sim-loop me
+                  stats
+                  (band-pool *par-workers*)
+                  board
+                  0
+                  (- start *frame-ns*)
+                  0
+                  start
+                  (count board)
+                  *inject-slow*
+                  0)))
+    (render-loop w sim stats board "")))

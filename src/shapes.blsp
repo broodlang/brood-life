@@ -1,0 +1,14 @@
+(defmodule shapes
+  "Known Life patterns — still-lifes, oscillators, and spaceships — as `[dx dy]` cells
+from a local origin, sown at random by life (at seed time and via inject-pattern).
+Pure pattern GEOMETRY; torus placement (`*w*`/`*h*`, `shift`) stays in `life`, like
+the glider guns in `guns`.")
+
+;; block, blinker, glider, toad, beacon, beehive, LWSS (in this order).
+(def *shapes*
+  [[[0 0] [1 0] [0 1] [1 1]] [[0 0] [1 0] [2 0]]
+    [[1 0] [2 1] [0 2] [1 2] [2 2]]
+    [[1 0] [2 0] [3 0] [0 1] [1 1] [2 1]]
+    [[0 0] [1 0] [0 1] [1 1] [2 2] [3 2] [2 3] [3 3]]
+    [[1 0] [2 0] [0 1] [3 1] [1 2] [2 2]]
+    [[0 0] [3 0] [4 1] [0 2] [4 2] [1 3] [2 3] [3 3] [4 3]]])
