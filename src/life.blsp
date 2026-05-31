@@ -163,6 +163,12 @@ animated in a native GUI window (the board is fit to the window at startup)."
 ;; `gen 5 · 22 fps · 30 cells · 0 spikes · 12 MB · 3 gc`. Watch `gc` tick the instant
 ;; `fps` dips to spot a GC spike (`MB` stays flat — churn, not a leak). The space
 ;; before each unit and the ` · ` between fields keep the digits from running together.
+;; GC collection count — `gc-stats` is a DEV-ONLY builtin, gated out of the lean
+;; `nest release` runtime (ADR-038), so calling it there is an unbound-symbol crash.
+;; Guard with `bound?`: report the count under `nest run`, a "-" in a shipped binary.
+(defn gc-count ()
+  (if (bound? 'gc-stats) (get (gc-stats) :collections) "-"))
+
 (defn status (gen cells per spikes)
   (str "gen "
     gen
@@ -179,7 +185,7 @@ animated in a native GUI window (the board is fit to the window at startup)."
     (quot (mem-bytes) 1048576)
     " MB"
     " · "
-    (get (gc-stats) :collections)
+    (gc-count)
     " gc"))
 
 ;; Render `status` as a full-width buffer bar (std `display/bar`) topped at screen row
@@ -231,7 +237,7 @@ animated in a native GUI window (the board is fit to the window at startup)."
     "\tmb "
     (quot (mem-bytes) 1048576)
     "\tgc "
-    (get (gc-stats) :collections)))
+    (gc-count)))
 
 ;; STATS: formats the status line OFF the hot paths and at its OWN cadence — it sees
 ;; every generation's raw `[:meas …]` but only re-renders + pushes `[:status …]` every
