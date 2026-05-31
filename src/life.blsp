@@ -5,6 +5,7 @@ animated in a native GUI window (the board is fit to the window at startup)."
 
 (require 'shapes)  ; still-life / oscillator / spaceship patterns (*shapes*)
 (require 'guns)  ; glider-gun patterns (*shooters*) — both sown by inject-pattern
+(require 'perflog)  ; tiny file logger — the stats process writes a perf line to life.log
 
 (def *w* 120)
 (def *h* 40)
@@ -26,6 +27,8 @@ animated in a native GUI window (the board is fit to the window at startup)."
 (def *par-threshold* 300)  ; below this many live cells, serial step beats the fan-out overhead
 ; (raise if the fan-out costs more than it saves on a small board)
 (def *status-every* 15)  ; stats push the bar every N gens (~4 Hz at 60 fps) — readable, not a blur
+(def *log-every* 60)  ; stats write a perf line to life.log every N gens (~1 Hz at 60 fps)
+(def *log-path* "life.log")  ; where the perf log is written (cwd; truncated each run)
 (def *offsets* [[-1 -1] [-1 0] [-1 1] [0 -1] [0 1] [1 -1] [1 0] [1 1]])
 
 ;; Everything sowable mid-run: the still-lifes / oscillators / spaceships of `*shapes*`
@@ -208,17 +211,40 @@ animated in a native GUI window (the board is fit to the window at startup)."
 ;; `life--loop` used to do all three jobs; now each source is its own process that
 ;; PUSHES updates to a thin renderer (ADR-058 concurrency).
 
+;; A compact, tab-separated perf line for the debug log (one column per field, so it
+;; greps/plots cleanly). `cells` and `fps` are the headline the user watches; `ms`/gen,
+;; `spikes`, `mb` and `gc` round it out so a frame-rate dip can be tied to rising
+;; population vs GC churn (`mb` flat while `gc` climbs ⇒ churn, not a leak).
+(defn log-fmt (gen cells per spikes)
+  (str "gen "
+    gen
+    "\tcells "
+    cells
+    "\tfps "
+    (quot 1000 (max 1 (quot per 1000000)))
+    "\tms "
+    (quot per 1000000)
+    "\tspikes "
+    spikes
+    "\tmb "
+    (quot (mem-bytes) 1048576)
+    "\tgc "
+    (get (gc-stats) :collections)))
+
 ;; STATS: formats the status line OFF the hot paths and at its OWN cadence — it sees
 ;; every generation's raw `[:meas …]` but only re-renders + pushes `[:status …]` every
-;; *status-every* gens, so the fps/mem/gc readout updates a few times a second
-;; (legible) instead of blurring at 60 Hz, and the `mem-bytes`/`gc-stats` calls stay
-;; off the sim and render threads.
-(defn stats-loop (renderer)
-  (receive (:stop nil)
+;; *status-every* gens (so the readout updates a few times a second, legibly, instead
+;; of blurring at 60 Hz) and writes a perf line to the `logger` every *log-every* gens.
+;; The `mem-bytes`/`gc-stats` calls and the file write stay off the sim/render threads.
+;; `:stop` ends it and stops the logger (flushing nothing — the buffer is already on disk).
+(defn stats-loop (renderer logger)
+  (receive (:stop (log-stop logger))
     ([:meas gen cells per spikes] (do
                                     (when (= 0 (mod gen *status-every*))
                                       (send renderer [:status (status gen cells per spikes)]))
-                                    (stats-loop renderer)))))
+                                    (when (= 0 (mod gen *log-every*))
+                                      (log-line logger (log-fmt gen cells per spikes)))
+                                    (stats-loop renderer logger)))))
 
 ;; SIM pacing: after emitting a board, wait for the renderer's `[:drawn]` ack — so the
 ;; sim never runs more than one frame ahead of it (bounds the mailbox) — then out the
@@ -330,7 +356,7 @@ animated in a native GUI window (the board is fit to the window at startup)."
          me
          (self)  ; this root process is the renderer
          stats
-         (spawn (stats-loop me))
+         (spawn (stats-loop me (log-start *log-path*)))
          sim
          (spawn (sim-loop me
                   stats

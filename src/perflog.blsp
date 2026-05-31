@@ -1,0 +1,25 @@
+(defmodule perflog
+  "A tiny line logger as a process. Brood's `spit` overwrites and there's no append /
+file-handle API yet, so the logger holds the whole buffer in memory and re-writes it on
+each line — that's how it 'appends'. Fine for LOW-RATE debug logging (a few lines/sec):
+the write runs in the logger's OWN process, off the caller's hot path, and the file is
+truncated on start so each run gets a fresh log. Send `[:line s]` to add a line, `:stop`
+to finish. (If Brood gains an append/handle API, swap the re-spit for a real append.)")
+
+;; The logger loop: `path` is the file, `buf` the text written so far. `[:line s]`
+;; appends `s` + newline and re-writes the whole buffer to `path`; `:stop` ends it.
+(defn perflog--loop (path buf)
+  (receive (:stop nil)
+    ([:line s] (let (buf2 (str buf s "\n")) (do (spit path buf2) (perflog--loop path buf2))))))
+
+;; Start a logger writing to `path` (truncating any existing file); returns its pid.
+(defn log-start (path)
+  (do
+    (spit path "")
+    (spawn (perflog--loop path ""))))
+
+;; Append line `s` (no trailing newline needed) to logger `pid`.
+(defn log-line (pid s) (send pid [:line s]))
+
+;; Stop logger `pid` — the final buffer is already on disk.
+(defn log-stop (pid) (send pid :stop))
