@@ -9,7 +9,7 @@ animated in a native GUI window (the board is fit to the window at startup)."
 
 (def *w* 120)
 (def *h* 40)
-(def *target-fps* 10)  ; generations/frames per second the loop paces to (capped here)
+(def *target-fps* 30)  ; generations/frames per second the loop paces to (capped here)
 (def *frame-ns* (quot 1000000000 *target-fps*))  ; per-frame period in ns (≈16.7ms at 60)
 (def *board-height* 5)  ; the board window's OWN cell font px (per-window) — small ⇒ dense board
 ;; FIXED bottom-bar font scale: the status text is always drawn this many board-cells
@@ -28,8 +28,8 @@ animated in a native GUI window (the board is fit to the window at startup)."
 (def *par-workers* 8)  ; row-bands to fan `step` across when the board is big (≤ nproc)
 (def *par-threshold* 300)  ; below this many live cells, serial step beats the fan-out overhead
 ; (raise if the fan-out costs more than it saves on a small board)
-(def *status-every* 5)  ; stats push the bar every N gens (~2 Hz at 10 fps) — readable, not a blur
-(def *log-every* 10)  ; stats write a perf line to life.log every N gens (~1 Hz at 10 fps)
+(def *status-every* 10)  ; stats push the bar every N gens (~3 Hz at 30 fps) — readable, not a blur
+(def *log-every* 30)  ; stats write a perf line to life.log every N gens (~1 Hz at 30 fps)
 (def *log-path* "life.log")  ; where the perf log is written (cwd; truncated each run)
 (def *offsets* [[-1 -1] [-1 0] [-1 1] [0 -1] [0 1] [1 -1] [1 0] [1 1]])
 
