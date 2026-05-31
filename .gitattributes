@@ -1,0 +1,4 @@
+# Brood source (.blsp) is a Lisp; until it's its own Linguist language,
+# highlight it as Clojure on GitHub — the closest common grammar — but keep
+# it out of the language stats (it's Brood, not Clojure).
+*.blsp linguist-language=Clojure linguist-detectable=false
