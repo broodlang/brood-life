@@ -1,11 +1,12 @@
 (defmodule life
   "Conway's Game of Life on a wrapping torus, sown with random known patterns and
 animated in a native GUI window (the board is fit to the window at startup)."
-  (:use display))
+  (:use editor/display))
 
 (require 'shapes)  ; still-life / oscillator / spaceship patterns (*shapes*)
 (require 'guns)  ; glider-gun patterns (*shooters*) — both sown by inject-pattern
 (require 'perflog)  ; tiny file logger — the stats process writes a perf line to life.log
+(require 'observer)  ; std process observer — the `o` key opens it in its own window
 
 (def *w* 120)
 (def *h* 40)
@@ -313,7 +314,9 @@ animated in a native GUI window (the board is fit to the window at startup)."
 ;; It caches the latest board + status and redraws on each `[:board …]` (the 60 Hz
 ;; driver), acking `[:drawn]` so the sim never outruns it; `[:status …]` just updates
 ;; the cached string, picked up by the next board redraw. GUI input lands in this SAME
-;; mailbox, so a quit signal stops the sim + stats and closes. Because the renderer
+;; mailbox, so a quit signal stops the sim + stats and closes, and releasing `o`/`O`
+;; opens the std process observer in its own window (one at a time — see render-loop)
+;; in a spawned process, so the sim keeps running. Because the renderer
 ;; ONLY ever acts on a received message, input is drained no matter how long a frame
 ;; takes (the old "can't close an over-budget window" bug can't recur). `grid-fit`
 ;; re-reads the window each redraw, so the board tracks a live resize.
@@ -327,6 +330,16 @@ animated in a native GUI window (the board is fit to the window at startup)."
                             (send sim [:drawn])
                             (render-loop w sim stats nl status))))
     ([:status s] (render-loop w sim stats live s))
+    ;; `o`/`O` opens the observer on key *release*, NOT press: a held key's OS
+    ;; auto-repeat floods press events (esp. on Wayland, where winit's repeat flag
+    ;; leaks — ADR-086), so triggering on the bare `"o"` press would fire many times
+    ;; per tap. The `[:key-up …]` release fires exactly once per physical tap.
+    ;; `(observer/observe)` is single-instance per runtime: a second press while the
+    ;; window is open just raises it to the front (no duplicate), and after it's
+    ;; closed the next press opens a fresh one.
+    ([:key-up k] (if (or (= k "o") (= k "O"))
+                   (do (observer/observe) (render-loop w sim stats live status))
+                   (render-loop w sim stats live status)))
     (m (if (quit-signal? m) (render-quit sim stats w) (render-loop w sim stats live status)))))
 
 ;; Re-fit the sim torus to window `w` and return the visible board viewport

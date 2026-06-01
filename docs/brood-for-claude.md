@@ -69,6 +69,10 @@ Common macros (expanded once at the compile pass — runtime-free): `defn`,
 (binding (*log-level* :debug) (do-thing))           ; scoped rebind
 ```
 
+A `fn`/`defn` body of several forms is an **implicit `do`**: each is evaluated
+for effect and the **last form's value is returned** — no explicit `(do …)`
+wrapper needed (`((fn () 1 2 3))` → `3`). Same for `let`/`when`/`loop` bodies.
+
 `fn` is multi-clause two ways (don't mix them in one `defn`):
 
 ```lisp
@@ -255,6 +259,19 @@ Prefer the higher-order combinators:
 (fold (fn (m k) (assoc m k (* k k))) {} (range 10))
 ```
 
+**`assoc` / `update` / `get` work on a vector by integer index, not just maps.**
+`(assoc v i x)` returns a fresh vector with index `i` replaced (in range only —
+it never appends; `conj` does that); `(update v i f)` and `(get v i)` likewise.
+`(subvec v start end)` slices to a **vector** (unlike `take`/`drop`, which return
+lists); `(remove-nth coll i)` drops one element, keeping the type. So an
+immutable single-element vector edit is just `(assoc buf i x)`, never a manual
+rebuild.
+
+**In a `catch`, use `(error-message e)`.** A caught value has no single shape:
+`throw` hands back its argument verbatim (often a bare string from `error`),
+while a kernel error is a `{:kind :message …}` map. `error-message` normalises
+any of them to a human string — don't branch on `string?`/`map?` yourself.
+
 For longer pipelines, **transducers** fuse intermediate collections (one pass,
 no throwaway lists):
 
@@ -322,8 +339,13 @@ closure and returns, the body never runs (a silent no-op that looks like "spawn
 didn't work"). Same for `(spawn name expr)`.
 
 Each process has its own heap; messages are **deep-copied** on `send`. `(self)`
-is the current process's pid. Functions can't be sent (per-heap closures) —
-send data and call `def`'d names on the receiving side. `receive` takes
+is the current process's pid. **Closures can be sent** — a `send`-ed function
+carries its code and its captured locals (deep-copied with it); only its *free
+global* references are late-bound on the receiver. So builtins/prelude names
+always resolve, and any `def`/`defn` the receiving image also has resolves
+there — but a free global that exists only on the sender raises `unbound
+symbol` on the receiver (ship the `defn` first, or refer to names defined on
+both sides). Same model as Erlang's `spawn`/fun-passing. `receive` takes
 pattern clauses just like `match`, plus an optional `(after ms body...)`
 clause for timeouts.
 
@@ -349,7 +371,48 @@ and registers the new pid. The name is auto-reaped on death.
         (supervise worker-fn)))))
 ```
 
-## Stateful servers — the `hatch` framework (`(require 'hatch)`)
+## Distributed nodes — named processes & cross-node addressing
+
+Two runtimes become a distributed pair over a local Unix socket (or TCP) with
+**no extra machinery** — the same `send`/`receive`/closures, just addressed across
+a node link (ADR-073). The whole model in one example:
+
+```lisp
+;; --- on node "alice" ---------------------------------------------------------
+(node-start "alice")                  ; this runtime is now :alice@host (a keyword)
+(register :inbox (self))              ; bind a LOCAL name -> this pid
+(let (bob (connect "bob"))            ; dial peer "bob"; returns its :bob@host name
+  (monitor-node bob)                  ; get [:nodedown :bob@host] when the link drops
+  (send {:name :inbox :node bob} [:hi (node-name)]))   ; reach bob's :inbox
+
+;; --- on node "bob" -----------------------------------------------------------
+(node-start "bob")
+(register :inbox (self))
+(receive ([:hi from] (println "hi from " from)))       ; => hi from :alice@host
+```
+
+The three pieces and how they relate:
+
+- **`(register name pid)`** binds `name` → `pid` in *this node's* local registry;
+  **`(whereis name)`** resolves it — **locally only** (`(whereis :inbox)` on alice
+  never sees bob's `:inbox`). Both ends usually `register` the same local name.
+- **`{:name :inbox :node :bob@host}`** is the cross-node address — a send-map naming
+  a registered process *on a specific node*. `(send {:name … :node …} msg)` is the
+  remote analogue of `(send (whereis name) msg)`: it's how you reach a peer's
+  registered process.
+- **`node-start` / `connect` / `node-name` return keywords** (`:bob@host`), not
+  strings — use them directly as the `:node` value; `(str …)` only for display.
+
+`(nodes)` lists currently-connected peers. `(monitor-node name)` fires
+`[:nodedown name]` on a clean socket close *or* a heartbeat timeout, so a peer that
+quits or crashes is detected without any app-level goodbye message.
+`(disconnect name)` is the deliberate counterpart: it drops the link to `name`
+**now, without exiting your process** (Erlang's `disconnect_node`), firing
+`[:nodedown]` on both sides and pruning `(nodes)`. Use it to leave a node/cluster
+cleanly — no need for an ad-hoc `[:bye]` broadcast. Returns `true` if a link
+existed.
+
+## Stateful servers — the `hatch` framework (`(:use hatch)`)
 
 Raw `spawn`/`receive` is the substrate; for a process that **holds state and
 answers messages** (a gen_server / actor), use `hatch`. State is immutable —
@@ -364,7 +427,8 @@ kinds:
   Use this for "just read a field" cases to avoid the `[x s]` boilerplate.
 
 ```lisp
-(require 'hatch)
+(defmodule my-counter "…" (:use hatch))   ; (:use hatch), not (require 'hatch),
+                                           ; to write defprocess/cast/gen-call bare
 
 (defprocess counter (n)                 ; n is the state
   (cast  :inc       (+ n 1))            ; new state = n+1
@@ -407,6 +471,53 @@ pattern most demos want):
 Each worker is a green process on the scheduler's pool; `send` deep-copies the
 result across heaps. The `collect` loop is tail-recursive, so it's O(1) stack
 even for thousands of workers.
+
+## Interactive apps — the display seam & `ui-run`
+
+An interactive app (terminal *or* native window) is one render-op protocol with
+several frontends (ADR-046). You write **one** pure `view` and `update`; the same
+code paints to a terminal or a GUI window unchanged.
+
+- **Frame** = a vector of render ops, built with `std/display` constructors:
+  `(frame (clear) (text row col s face?) (cursor row col))`. A *face* is a style
+  map, `{:fg :red :bold true}` (`(:use display)` for the constructors).
+- **Frontend** = a map of five fns `{:enter :leave :size :draw :poll}`. `(:use ui)`
+  gives you `*term-display*` (the terminal) and `(gui-display)` (a native window,
+  needs a `--features gui` build); `display-broadcast` fans one frame to several.
+- **The loop** = `(ui-run model view update display)` — a TEA loop: render
+  `(view model cols rows)` → poll input → fold it with `(update model input cols
+  rows)` → recurse, until the model is `:done`, then tear the frontend down. Set
+  `:tick-ms` in the model for the refresh beat (input is `:tick` on timeout).
+
+```lisp
+(defmodule main "a counter app" (:use ui) (:use display))
+
+(defn view (m cols rows)
+  (frame (clear) (text 0 0 (str "count: " (get m :count)))))
+
+(defn update (m input cols rows)
+  (cond (= input :up)   (assoc m :count (inc (get m :count)))
+        (= input :down) (assoc m :count (dec (get m :count)))
+        (= input :ctrl-c) (assoc m :done true)   ; Esc/Ctrl-C → quit
+        else m))
+
+(defn main () (ui-run {:count 0 :done false :tick-ms 1000} view update *term-display*))
+;; for a window instead: (ui-run … (gui-display))   ; --features gui
+```
+
+**Input vocabulary** (what `:poll` / a raw `(receive)` delivers): a printable key
+is a **1-char string** (`"a"`); the rest are keywords — `:up :down :left :right
+:enter :backspace :escape :ctrl-c` …; the mouse is `[:mouse action button row col]`
+(`action` is `:press` / `:release` / `:drag` / `:scroll-up` / `:scroll-down` —
+`:drag` is motion with a button held, delivered once per cell crossed, so a divider
+drag is bounded; `button` is `:left` / `:right` / `:middle`, nil for scroll);
+a resize is `[:resize cols rows]`. **A GUI window's close button (the X) is its own
+`:close` message** — *not* `:escape`, so an app that binds Esc to cancel/normal-mode
+can still be closed by the X. **`ui-run` quits on `:close` automatically**, so every
+`ui-run` app is closeable for free; you never wire it into `update`. In a hand-rolled
+`(receive)` loop (not on `ui-run`), match it yourself — `(:close :quit)` — or use the
+`ui/quit-request?` predicate. (`nest new --template gui` / `--template editor`
+scaffold complete `ui-run` apps; `--template tui-loop` a plain stdout animation.)
 
 ## Hot reload (`nest run --watch FILE`)
 
@@ -508,7 +619,9 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   `(count m)` / `(into [] m)` all walk the map as its `[k v]` pairs — no need
   for `(zip (keys m) (vals m))`. Iteration order is hash-driven (ADR-040), so
   compare via `frequencies` when order would otherwise matter.
-- **set** (`(require 'set)`): a set is a **map of `element → true`**, so
+- **set** (`(:use set)` in your `defmodule` header — `(require 'set)` alone
+  leaves the names qualified, `set/union`): a set is a **map of `element →
+  true`**, so
   membership is `(contains? s x)`, elements `(keys s)`, size `(count s)`, and it's
   seqable like any map. The module adds `(set coll)` (dedups), `conj`/`disj`,
   `union`/`intersection`/`difference`/`subset?`. `(set [[0 0] [1 2]])` is the
@@ -542,7 +655,9 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
 - **I/O**: `print` `println` `slurp` `spit` `load` `eval-string` `read-string`.
   `print`/`println` **flush stdout every call** — there's no separate flush, so
   an animation frame paints immediately. For raw terminal control without the
-  full display protocol, `(require 'ansi)` gives `(ansi-clear)`/`(ansi-home)`/
+  full display protocol, `(:use ansi)` in your `defmodule` header (a bare
+  `(require 'ansi)` leaves them qualified, `ansi/ansi-clear`) gives
+  `(ansi-clear)`/`(ansi-home)`/
   `(ansi-cursor r c)`/`(ansi-hide-cursor)` — **zero-arg functions you call**, each
   *returning* an escape string. Call them: `(print (ansi-clear))`, **never**
   `(print ansi-clear)` (a bare symbol prints `#<fn …>` and emits no escape). The
@@ -581,14 +696,25 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   the self-call the *last* thing the function does. The advisory checker
   (`nest check`, the LSP, `nest mcp`) **warns** when a function calls itself in
   non-tail position, e.g. `(* n (fact (- n 1)))`.
-- **Exactly one of every name, project-wide.** The module system is flat
-  (ADR-019): a global is a single binding across the *whole* project, not
-  per-file. Defining `main` (or any name) in two source files is a bug — the
-  last one loaded silently wins. `nest run` / `nest test` warn on cross-file
-  duplicates, but it's on you to keep names unique. This is a naming *rule*,
-  not just a module fact.
+- **Each module is a namespace (ADR-065).** A file's `(defmodule name …)`
+  compiles the rest of the file into namespace `name`: every `def`/`defn`/
+  `defmacro` defines `name/foo`, and a bare reference resolves first in the
+  current namespace, then through the header's `(:use …)` imports, then root
+  (the prelude). So the *same* short name in two modules is fine — `a/parse`
+  and `b/parse` are distinct globals, and `nest run`/`nest test` no longer
+  false-flag them. From *outside* a module (e.g. the REPL or `nest mcp` eval),
+  reach a `defn` by its qualified name: `(life/step …)`, found via `apropos`.
+  **The one exception is earmuffed `*foo*` names** — by convention they're
+  *ambient* (dynamic/config vars) and stay bare/root, never namespaced, so a
+  `(def *width* …)` is reachable as `*width*` everywhere and must be unique.
+- **Importing a module**: inside `defmodule`, add a `(:use mod)` clause to refer
+  `mod`'s public names **bare** (`(:use mod :refer [a b])` for a subset). A
+  plain top-level `(require 'mod)` only *loads* `mod` — its names stay
+  qualified (`mod/foo`). `(:require …)` is **not** a `defmodule` clause; only
+  `:use` is (anything else in the header is silently ignored).
 - **Not Clojure**: no `defprotocol`, no transients, no `loop` / `recur`
-  (just plain recursion), no namespaced names (the module system is flat).
+  (just plain recursion). Namespaces *do* exist now (ADR-065) but are
+  `mod/name`-flat, not Clojure's `require :as` aliasing.
 - **Not Scheme / CL**: no `setq`, no `cond`-with-`t`-catch-all (use `else`
   or `:else`).
 - **`sort` on heterogeneous / non-numeric items uses *structural* order.**
@@ -603,10 +729,12 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
 
 ## Module skeleton (what `nest new` scaffolds)
 
-`nest new <name>` scaffolds this default `main`+`hello` pair. `nest new <name>
---template tui-loop` instead scaffolds a tail-recursive animation loop (pairs
-with `nest run --for`), and `--template hatch` a stateful gen_server-style
-process — starter shapes you'd otherwise hand-write.
+`nest new <name>` scaffolds this default `main`+`hello` pair. Other `--template`
+options scaffold starter shapes you'd otherwise hand-write: `tui-loop` (a
+tail-recursive animation loop, pairs with `nest run --for`), `hatch` (a stateful
+gen_server-style process), `http-server` (a minimal web app), `editor` (a tiny
+text editor on `ui-run`), and `gui` (a windowed `ui-run` app — see *Interactive
+apps* above; needs a `--features gui` build).
 
 ```lisp
 ;; src/hello.blsp
@@ -617,9 +745,11 @@ process — starter shapes you'd otherwise hand-write.
 
 ```lisp
 ;; src/main.blsp
-(defmodule main "The project's entry-point module (nest run -> main/main).")
-
-(require 'hello)
+;; `(:use hello)` brings `hello`'s public names (here `greeting`) into scope
+;; bare; without it you'd call `(hello/greeting)`. A plain `(require 'hello)`
+;; only loads the file — it does not refer the names.
+(defmodule main "The project's entry-point module (nest run -> main/main)."
+  (:use hello))
 
 (defn main ()
   "Entry point: print the project's greeting."
@@ -628,7 +758,8 @@ process — starter shapes you'd otherwise hand-write.
 
 ```lisp
 ;; tests/hello_test.blsp
-(require 'test)
+;; `(:use hello)` brings `greeting` into scope; `(:use test)` the test macros.
+(defmodule hello-test (:use hello) (:use test))
 
 (describe "hello"
   (test "greeting works"   (assert= (greeting) "hello world"))
@@ -648,7 +779,9 @@ counterexample it fails with the value + seed:
 
 `nest test` runs each test in its own green process. `nest run` invokes the
 `main/main` entry by default (override in `project.blsp` via `:main`; e.g.
-`:main 'app` runs `app/main`, `:main '(app start)` runs `app/start`). Add
+`:main app` runs `app/main`, `:main (app start)` runs `app/start`). The manifest
+is **unevaluated data**, so write these as bare symbols — *not* `:main 'app`
+(a leading quote misparses). Add
 `--for DURATION` (e.g. `nest run --for 2s`) to run a loop/TUI for a bounded
 time and exit cleanly.
 
