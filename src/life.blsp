@@ -59,13 +59,11 @@ default (fast — instant drawing); the footer stays a fixed height while only t
 ;; bar, drawn *btn-inset* scale-steps SMALLER than the bar — so the bar shows as a margin
 ;; around AND a shelf below each key (spacing + a beveled, inset look). `footer-layout`
 ;; computes their cell columns + scale ONCE, and both the renderer and the click hit-test
-;; use it. The RENDERER owns these values for instant labels and messages the SIM on every
-;; change (throttled to *fps-throttle-ns* while dragging).
+;; use it. The RENDERER owns these values for instant labels and messages the owner (the
+;; CLOCK for the fps cap, the SIM for the spawn interval) on every change.
 (def *btn-inset* 1)  ; how many scale-steps smaller the keys are than the bar (1 ⇒ a shelf below)
 (def *btn-face* {:bg :white :fg :black :bold true})  ; a light raised KEY on the reverse bar
-(def *fps-throttle-ns* 50000000)  ; ≥50 ms between [:set-fps] messages while dragging
-(def *status-every* 10)  ; stats push the bar every N gens (~3 Hz at 30 fps) — readable, not a blur
-(def *log-every* 30)  ; stats write a perf line to life.log every N gens (~1 Hz at 30 fps)
+(def *log-every* 30)  ; the SIM writes a perf line to life.log every N gens (~1 Hz at 30 fps)
 (def *log-path* "life.log")  ; where the perf log is written (cwd; truncated each run)
 
 ;; Everything sowable mid-run: the still-lifes / oscillators / spaceships of `*shapes*`
@@ -219,46 +217,37 @@ tie a frame-rate dip to rising population or memory churn)."
     "\tmb "
     (quot (mem-bytes) 1048576)))
 
-;; The `mem-bytes` call and the file write stay off the sim/render threads. `:stop` ends
-;; it and stops the logger (flushing nothing — the buffer is already on disk).
-(defn stats-loop (renderer logger)
-  "STATS: formats the status line OFF the hot paths and at its OWN cadence — it sees
-every generation's `[:meas …]` but only pushes `[:status …]` every `*status-every*` gens
-and writes a perf line to the `logger` every `*log-every*` gens."
-  (receive (:stop (perflog/log-stop logger))
-    ([:meas gen cells per spikes] (do
-                                    (when (= 0 (mod gen *status-every*))
-                                      (send renderer [:status (status gen cells per spikes)]))
-                                    (when (= 0 (mod gen *log-every*))
-                                      (perflog/log-line logger (log-fmt gen cells per spikes)))
-                                    (stats-loop renderer logger)))))
+;; The CLOCK is the ONLY process that sleeps: it emits paced [:tick]s. The SIM owns the
+;; board and NEVER sleeps, so a paste from the renderer is applied + drawn AT ONCE, never
+;; blocked behind the cap. The RENDERER owns the window + input.
 
-(defn sim-serve (renderer board s held cap inject armed due acked)
-  "Hold the sim between steps WITHOUT a blocking sleep: stay responsive until `due` ns (the
-next step's deadline at the current cap). A press/drag draws its pattern onto `board` and
-REDRAWS it at once — so a spawn appears immediately even at a 1 fps cap, not on the next
-tick — then awaits that frame's ack; release clears the held cell; `[:set-fps]`/`[:set-inject]`
-retune the sim-owned controls. It drains `[:drawn]` acks and won't return until the last
-board it sent is acked (`acked`), which bounds the mailbox like the old per-frame wait.
-Returns `:stop`, or `[board s held cap inject armed]` at the deadline."
-  (let (left (- due (now-ns)))
-    (if (and acked (<= left 0))
-      [board s held cap inject armed]
-      (receive (:stop :stop)
-        ([:drawn] (sim-serve renderer board s held cap inject armed due true))
-        ([:press kind x y] (let ([b2 s2] (apply-clicks board [[x y kind]] s))
-                             (do
-                               (send renderer [:board b2])
-                               (sim-serve renderer b2 s2 [x y kind] cap inject true due false))))
-        ([:drag kind x y] (let ([b2 s2] (apply-clicks board [[x y kind]] s))
-                            (do
-                              (send renderer [:board b2])
-                              (sim-serve renderer b2 s2 [x y kind] cap inject armed due false))))
-        ([:release] (sim-serve renderer board s nil cap inject armed due acked))
-        ([:set-fps n] (sim-serve renderer board s held n inject armed due acked))
-        ([:set-inject n] (sim-serve renderer board s held cap n armed due acked))
-        (after (if acked (max 1 (quot (max 1 left) 1000000)) 2000)
-          [board s held cap inject armed])))))
+(defn clock-ack (cap)
+  "Wait for the SIM's `[:ticked]` (so the clock never outruns a rendered tick), absorbing
+live `[:set-fps]` cap changes; `:stop` ends it. A safety timeout keeps it going if one is lost."
+  (receive ([:ticked] cap)
+    ([:set-fps n] (clock-ack n))
+    (:stop :stop)
+    (after 5000 cap)))
+
+(defn clock-loop (sim cap)
+  "CLOCK: the pacer, and the ONLY process that sleeps. Emit `[:tick self]` to the SIM, wait
+for its `[:ticked]` (bounding the rate to how fast the SIM draws), then sleep the cap's
+period — 0 (no sleep) when UNCAPPED. `[:set-fps]` retunes the cap live; `:stop` ends it."
+  (do
+    (send sim [:tick (self)])
+    (let (cap2 (clock-ack cap))
+      (if (= cap2 :stop)
+        :stopped
+        (do
+          (when (> cap2 0) (sleep (max 1 (quot 1000 cap2))))
+          (clock-loop sim cap2))))))
+
+(defn sim-draw (renderer board st)
+  "Send `board` + status string `st` to the renderer and wait for its `[:drawn]` ack (bounds
+the renderer's mailbox to one frame). Returns `:ok`, or `:stop` if torn down while waiting."
+  (do
+    (send renderer [:board board st])
+    (receive ([:drawn] :ok) (:stop :stop) (after 2000 :ok))))
 
 (defn apply-clicks (board clicks s)
   "Drop a random pattern at each click cell `[x y kind]`, threading the PRNG `s`: a `:gun`
@@ -272,101 +261,133 @@ cell samples a glider gun (`*shooters*`, right button), any other kind samples a
     [board s]
     clicks))
 
-(defn sim-loop (renderer stats live gen prev spikes s held hn cap inject last-inj)
-  "SIM: the model + the clock, OWNER of the live `cap`/`inject` (retuned only by the
-renderer's messages, so input never contends with the tick). Each tick it fits + draws the
-board + a measurement, then SERVES input until the next tick is due — drawing any spawn the
-instant it's clicked, even at a low cap — folds in the held-cell key-repeat and the
-wall-clock auto-inject, steps one generation, and recurses. `:stop` ends it."
-  (let (live (bitboard/fit live *w* *h*)
+(defn sim-tick (renderer clk board s gen prev spikes held hn inject last-inj st logger)
+  "Advance ONE generation for a `[:tick clk]`: fit to the window (`*w*`/`*h*`, set by the
+renderer), fold in the held-cell auto-repeat + the wall-clock auto-inject, step, DRAW it,
+ack the clock `clk`, and recurse. The held-cell repeat fires every *spawn-every* gens past
+*hold-delay* (the initial press/drag already drew at once)."
+  (let (board (bitboard/fit board *w* *h*)
         now (now-ns)
         per (- now prev)
-        spk (if (> per (quot (* *frame-ns* 3) 2)) (+ spikes 1) spikes))
+        spk (if (> per (quot (* *frame-ns* 3) 2)) (+ spikes 1) spikes)
+        hn2 (if held (+ hn 1) 0)
+        repeat? (and held (>= hn2 *hold-delay*) (= 0 (mod (- hn2 *hold-delay*) *spawn-every*)))
+        [b1 s1] (if repeat? (apply-clicks board [held] s) [board s])
+        inj? (and (> inject 0) (>= (- now last-inj) (* inject 1000000000)))
+        [b2 s2] (if inj? (inject-pattern b1 s1) [b1 s1])
+        last-inj2 (if inj? now last-inj)
+        nxt (bitboard/step b2)
+        cells (bitboard/live-count nxt)
+        st2 (status gen cells per spk))
     (do
-      (send renderer [:board live])
-      (send stats [:meas gen (bitboard/live-count live) per spk])
-      ;; serve input (drawing clicks immediately) until the next step is due — `due` is now
-      ;; for an uncapped sim (step as soon as the draw is acked) else now + the cap's budget.
-      (let (due (+ now (if (> cap 0) (quot 1000000000 cap) 0))
-            served (sim-serve renderer live s held cap inject false due false))
-        (if (= :stop served)
-          :stopped
-          (let ([cur s2 held2 cap2 inject2 armed2] served
-                ;; held-cell auto-repeat: a fresh PRESS (`armed2`) re-arms (hn←0); a
-                ;; stationary hold counts up and re-drops every *spawn-every* gens past the
-                ;; warm-up (discrete presses/drags already drew immediately in sim-serve).
-                hn2 (if armed2 0 (if held2 (+ hn 1) 0))
-                repeat? (and held2
-                          (>= hn2 *hold-delay*)
-                          (= 0 (mod (- hn2 *hold-delay*) *spawn-every*)))
-                [cur1 s3] (if repeat? (apply-clicks cur [held2] s2) [cur s2])
-                ;; auto-inject on a WALL-CLOCK schedule (robust to the cap — a gen count
-                ;; would divide by the fps and flood when uncapped). 0 = never.
-                inj? (and (> inject2 0) (>= (- now last-inj) (* inject2 1000000000)))
-                [cur2 s4] (if inj? (inject-pattern cur1 s3) [cur1 s3])
-                last-inj2 (if inj? now last-inj)
-                nxt (bitboard/step cur2))
-            (sim-loop renderer stats nxt (+ gen 1) now spk s4 held2 hn2 cap2 inject2 last-inj2)))))))
+      (when (= 0 (mod gen *log-every*)) (perflog/log-line logger (log-fmt gen cells per spk)))
+      (if (= :stop (sim-draw renderer nxt st2))
+        (perflog/log-stop logger)
+        (do
+          (send clk [:ticked])
+          (sim-loop renderer nxt s2 (+ gen 1) now spk held hn2 inject last-inj2 st2 logger))))))
+
+(defn sim-paste (renderer board s gen prev spikes held hn inject last-inj st logger kind x y newhn)
+  "Apply ONE pasted pattern and DRAW it immediately — the responsiveness win: a paste is
+never queued behind the cap, because the SIM never sleeps. Carries on with the new board +
+held cell (`newhn` re-arms the auto-repeat on a press, keeps it on a drag)."
+  (let ([b2 s2] (apply-clicks board [[x y kind]] s))
+    (if (= :stop (sim-draw renderer b2 st))
+      (perflog/log-stop logger)
+      (sim-loop renderer b2 s2 gen prev spikes [x y kind] newhn inject last-inj st logger))))
+
+(defn sim-loop (renderer board s gen prev spikes held hn inject last-inj st logger)
+  "SIM: owns the board; NEVER sleeps — it just reacts to its mailbox. A `[:tick clk]` from
+the CLOCK advances + draws a generation (acking `clk`); a `[:press]`/`[:drag]` pastes + draws
+AT ONCE (so a paste never waits for the cap); `[:release]` clears the held cell;
+`[:set-inject]` retunes auto-spawn. `:stop` stops the logger and ends it."
+  (receive (:stop (perflog/log-stop logger))
+    ([:tick clk] (sim-tick renderer clk board s gen prev spikes held hn inject last-inj st logger))
+    ([:press kind x y] (sim-paste renderer
+                         board
+                         s
+                         gen
+                         prev
+                         spikes
+                         held
+                         hn
+                         inject
+                         last-inj
+                         st
+                         logger
+                         kind
+                         x
+                         y
+                         0))
+    ([:drag kind x y] (sim-paste renderer
+                        board
+                        s
+                        gen
+                        prev
+                        spikes
+                        held
+                        hn
+                        inject
+                        last-inj
+                        st
+                        logger
+                        kind
+                        x
+                        y
+                        hn))
+    ([:release] (sim-loop renderer board s gen prev spikes nil hn inject last-inj st logger))
+    ([:set-inject n] (sim-loop renderer board s gen prev spikes held hn n last-inj st logger))))
 
 (defn quit-signal? (m)
   "Is `m` a quit signal? — the window's X (`:close`, a frontend signal distinct from the
 Escape *key*), or the `q` / Esc / Ctrl-C keys."
   (or (= m :close) (= m "q") (= m :escape) (= m :ctrl-c)))
 
-(defn render-quit (sim stats w)
-  "Tear down: stop the sim and stats actors, then close window `w`."
-  (do (send sim :stop) (send stats :stop) (gui-close w)))
+(defn render-quit (sim clock w)
+  "Tear down: stop the sim and the clock, then close window `w`."
+  (do (send sim :stop) (send clock :stop) (gui-close w)))
 
-(defn draw! (w live info ui)
-  "Composite + paint one frame: the cached board with the bottom bar = the two buttons
-(from the renderer-LOCAL `ui`) + the stats `info`. Geometry is read from `live` only (so
-the bar can't disagree with the board on resize). No `gui-size` here — that's `grid-fit`."
-  (gui-draw w (render live ui info)))
+(defn draw! (w board info ui)
+  "Paint one frame: the board (each cell scaled by *board-zoom*) + the bar (the renderer's
+buttons from `ui` + the sim's `info` string). Geometry is read from the board only."
+  (gui-draw w (render board ui info)))
 
-;; The renderer owns the window and is a thin COMPOSITOR. It threads its cached board
-;; (`live`), the stats `info` string, and `ui` — the LOCAL control state {:cap :inject :drag
-;; :dcol :moved :sent}. It redraws on `[:board …]` (acking `[:drawn]`), on `[:status …]`, on
-;; `[:resize]`, AND immediately after any footer interaction — so control feedback never
-;; waits on the sim's frame rate (the bug where a low cap froze the whole UI). Input that
-;; changes a control is sent to the sim as a message (throttled while dragging); the sim,
-;; not this loop, owns the authoritative value. `grid-fit` only updates *w*/*h* for the sim.
-(defn render-loop (w sim stats live info ui)
-  (receive
-    ([:board nl]
-      (do
-        (grid-fit w)  ; track the live window/zoom size into *w*/*h*
-        ;; Draw the board at the CURRENT size, not the sim's (which fit it a frame or two
-        ;; ago): refit it here so the board always fills the window and the bar — drawn from
-        ;; the SAME board's dims — never lags behind a resize. (No-op when already sized.)
-        (let (nl2 (bitboard/fit nl *w* *h*))
-          (do
-            (draw! w nl2 info ui)
-            (send sim [:drawn])
-            (render-loop w sim stats nl2 info ui)))))
-    ([:status s] (do (draw! w live s ui) (render-loop w sim stats live s ui)))
-    ;; Resize from the EVENT's cell grid (cols rows) — the authoritative new size, like the
-    ;; brood-edit loop — NOT a re-query that could lag it; refit the cached board to it and
-    ;; redraw now, so it fills immediately even before the sim's next frame lands.
+;; The RENDERER owns the window + input. On `[:board nl st]` it caches the board + the sim's
+;; status string, REFITS the board to the current `*w*`/`*h*` (so resize fills at once,
+;; brood-edit-style), draws, and acks `[:drawn]`. Input updates the LOCAL control mirror
+;; (`ui`) and redraws AT ONCE (feedback never waits on the tick), then messages the owner —
+;; the CLOCK for the fps cap, the SIM for everything else. This loop never sleeps.
+(defn render-loop (w sim clock board info ui)
+  (receive ([:board nl st] (let (nl2 (bitboard/fit nl *w* *h*))
+                             (do
+                               (draw! w nl2 st ui)
+                               (send sim [:drawn])
+                               (render-loop w sim clock nl2 st ui))))
+    ;; Resize from the EVENT's cell grid — refit the cached board to it and redraw now.
     ([:resize cols rows] (let (z *board-zoom*
                                vrows (max 1 (- rows *status-scale*)))
                            (do
                              (def *w* (max *grid-min* (quot cols z)))
                              (def *h* (max *grid-min* (quot vrows z)))
-                             (let (nl (bitboard/fit live *w* *h*))
-                               (do (draw! w nl info ui) (render-loop w sim stats nl info ui))))))
-    ;; One mouse dispatcher; `on-mouse` returns `[ui' redraw?]` and does any sim sends.
-    ([:mouse action button row col mods] (let ([ui2 rd] (on-mouse sim w action button row col ui))
+                             (let (nl (bitboard/fit board *w* *h*))
+                               (do (draw! w nl info ui) (render-loop w sim clock nl info ui))))))
+    ([:mouse action button row col mods] (let ([ui2 rd] (on-mouse sim
+                                                          clock
+                                                          w
+                                                          action
+                                                          button
+                                                          row
+                                                          col
+                                                          ui))
                                            (do
-                                             (when rd (draw! w live info ui2))
-                                             (render-loop w sim stats live info ui2))))
-    ;; Keys (`-`/`=` fps, `[`/`]` spawn) route the same way via `on-key`: update the local
-    ;; copy, send the sim a message, redraw. A quit signal tears everything down.
+                                             (when rd (draw! w board info ui2))
+                                             (render-loop w sim clock board info ui2))))
     (m (if (quit-signal? m)
-         (render-quit sim stats w)
-         (let ([ui2 rd] (on-key sim m ui))
+         (render-quit sim clock w)
+         (let ([ui2 rd] (on-key sim clock m ui))
            (do
-             (when rd (draw! w live info ui2))
-             (render-loop w sim stats live info ui2)))))))
+             (when rd (draw! w board info ui2))
+             (render-loop w sim clock board info ui2)))))))
 
 ;; `*w*`/`*h*` — the torus `step` wraps on — are the window's BOARD area in board-cells:
 ;; the screen grid (less the bottom *status-scale* bar rows) divided by *board-zoom*, since
@@ -384,11 +405,13 @@ the bar, divided by *board-zoom*). Returns `[cols rows]` (the raw screen grid)."
       (def *h* (max *grid-min* (quot vrows z)))
       [cols rows])))
 
-(defn zoom (w dir)
-  "Step the board magnification by `dir` (+ zooms IN: bigger cells, fewer of them), clamped
-to [*zoom-min*, *zoom-max*]. Only the BOARD scales — the window font/grid and the status bar
-are untouched (seamless). The next `grid-fit` refits the torus, clipping any cells off-board."
-  (def *board-zoom* (max *zoom-min* (min *zoom-max* (+ *board-zoom* dir)))))
+(defn zoom! (w dir)
+  "Step the board magnification by `dir` (+ zooms IN), clamped to [*zoom-min*, *zoom-max*],
+and recompute `*w*`/`*h*` so the board refits at once. Only the BOARD scales — the window
+font/grid and the status bar are untouched (seamless)."
+  (do
+    (def *board-zoom* (max *zoom-min* (min *zoom-max* (+ *board-zoom* dir))))
+    (grid-fit w)))
 
 ;; ---- PURE control math (no globals, no I/O): given a value, return the next one --------
 (defn fps-nudge (cap d)
@@ -425,9 +448,8 @@ high, so the bar begins at screen row `*h*×*board-zoom*`."
   (and (>= x a) (< x b)))
 
 (defn footer-press (sim ui col)
-  "A press in the footer: hit-test the cell `col` against the keys' cell ranges (from
-`footer-layout`). Spawn toggles (send the sim the new interval); the fps key arms a drag
-(tracked in `ui`, no send yet)."
+  "A press in the footer: hit-test the cell `col` against the keys' cell ranges. Spawn
+toggles (tell the SIM the new interval); the fps key arms a drag (tracked in `ui`)."
   (let (l (footer-layout))
     (cond
       (in-range? col (get l :spawn)) (let (j (inject-toggle (get ui :inject)))
@@ -435,39 +457,33 @@ high, so the bar begins at screen row `*h*×*board-zoom*`."
       (in-range? col (get l :fps)) [(assoc ui :drag :fps :dcol col :moved false) true]
       :else [ui false])))
 
-(defn fps-drag (sim ui col)
-  "Continue an fps drag: update the LOCAL cap by the cells moved (instant label feedback),
-and send the sim a `[:set-fps]` only every *fps-throttle-ns* so a drag can't flood it."
-  (let (cap (fps-nudge (get ui :cap) (- col (get ui :dcol)))
-        ui2 (assoc ui :cap cap :dcol col :moved true)
-        now (now-ns))
-    (if (>= (- now (get ui :sent)) *fps-throttle-ns*)
-      (do (send sim [:set-fps cap]) [(assoc ui2 :sent now) true])
-      [ui2 true])))
+(defn fps-drag (clock ui col)
+  "Continue an fps drag: update the LOCAL cap by the cells moved (instant label) and tell the
+CLOCK the new cap (it absorbs the changes, so no throttle is needed)."
+  (let (cap (fps-nudge (get ui :cap) (- col (get ui :dcol))))
+    (do (send clock [:set-fps cap]) [(assoc ui :cap cap :dcol col :moved true) true])))
 
-(defn footer-release (sim ui)
-  "Mouse up: always tell the sim the board press ended. If an fps drag was active, settle
-it — a release with no movement is a CLICK (cycle a preset), otherwise flush the final
-dragged value (the debounce tail) — and clear the drag."
+(defn footer-release (sim clock ui)
+  "Mouse up: tell the SIM the board press ended. If an fps drag was active, settle it — a
+release with no movement is a CLICK (cycle a preset, told to the CLOCK) — and clear the drag."
   (do
     (send sim [:release])
     (if (= (get ui :drag) :fps)
       (let (cap (if (get ui :moved) (get ui :cap) (fps-cycle (get ui :cap))))
-        (do (send sim [:set-fps cap]) [(assoc ui :cap cap :drag nil) true]))
+        (do (send clock [:set-fps cap]) [(assoc ui :cap cap :drag nil) true]))
       [ui false])))
 
-(defn on-mouse (sim w action button row col ui)
-  "Route one mouse event to `[ui' redraw?]`, doing any sim sends. Scroll zooms; release
-settles a drag; an in-progress fps drag scrubs; a footer press hits a button; anything else
-is on the board and draws via the sim (left = shapes, right = guns)."
+(defn on-mouse (sim clock w action button row col ui)
+  "Route one mouse event to `[ui' redraw?]`. Scroll zooms; release settles a drag; an
+in-progress fps drag scrubs (→ CLOCK); a footer press hits a button; anything else is on the
+board and pastes via the SIM (left = shapes, right = guns), drawn immediately by the sim."
   (cond
-    (= action :scroll-up) (do (zoom w *zoom-step*) [ui true])
-    (= action :scroll-down) (do (zoom w (- 0 *zoom-step*)) [ui true])
-    (= action :release) (footer-release sim ui)
-    (= (get ui :drag) :fps) (if (= action :drag) (fps-drag sim ui col) [ui false])
+    (= action :scroll-up) (do (zoom! w *zoom-step*) [ui true])
+    (= action :scroll-down) (do (zoom! w (- 0 *zoom-step*)) [ui true])
+    (= action :release) (footer-release sim clock ui)
+    (= (get ui :drag) :fps) (if (= action :drag) (fps-drag clock ui col) [ui false])
     (in-footer? row) (if (= action :press) (footer-press sim ui col) [ui false])
-    ;; on the board: map the screen cell to a BOARD cell (÷ *board-zoom*, since each board
-    ;; cell is drawn that many screen cells wide/high) before forwarding it to the sim.
+    ;; on the board: map the screen cell to a BOARD cell (÷ *board-zoom*) before forwarding.
     :else (do
             (send sim
               [(if (= action :press) :press :drag) (if (= button :right) :gun :shape)
@@ -475,14 +491,14 @@ is on the board and draws via the sim (left = shapes, right = guns)."
                 (quot row *board-zoom*)])
             [ui false])))
 
-(defn on-key (sim m ui)
-  "Route a control key to `[ui' redraw?]`: `-`/`=` nudge the fps cap, `[`/`]` the auto-spawn
-interval. Like the buttons, this updates the LOCAL copy and messages the sim."
+(defn on-key (sim clock m ui)
+  "Route a control key to `[ui' redraw?]`: `-`/`=` nudge the fps cap (→ CLOCK), `[`/`]` the
+auto-spawn interval (→ SIM). Updates the LOCAL mirror so the label changes at once."
   (cond
     (= m "-") (let (c (fps-nudge (get ui :cap) (- 0 *fps-step*)))
-                (do (send sim [:set-fps c]) [(assoc ui :cap c) true]))
+                (do (send clock [:set-fps c]) [(assoc ui :cap c) true]))
     (= m "=") (let (c (fps-nudge (get ui :cap) *fps-step*))
-                (do (send sim [:set-fps c]) [(assoc ui :cap c) true]))
+                (do (send clock [:set-fps c]) [(assoc ui :cap c) true]))
     (= m "[") (let (j (inject-nudge (get ui :inject) 1))
                 (do (send sim [:set-inject j]) [(assoc ui :inject j) true]))
     (= m "]") (let (j (inject-nudge (get ui :inject) -1))
@@ -490,36 +506,34 @@ interval. Like the buttons, this updates the LOCAL copy and messages the sim."
     :else [ui false]))
 
 (defn run-life ()
-  "Wire up and run the three actors. This root process becomes the RENDERER (it owns the
-window). The window cell font is set ONCE to *board-height* and never changes — zoom is the
-per-op `:scale` of *board-zoom*, so the bar never reflows. We `grid-fit` once to size
-`*w*`/`*h*`, start EMPTY (click to drop shapes), then spawn stats + sim."
+  "Wire up the three actors and become the RENDERER. The CLOCK paces (the only sleeper); the
+SIM owns the board and never sleeps (so pastes are instant); this process draws + handles
+input. The window cell font is set ONCE; zoom is the per-op `:scale` of *board-zoom*, so the
+bar never reflows. Spawn the SIM first (the CLOCK needs its pid)."
   (let (w (gui-open "Brood Life")  ; the OS title-bar text (gui-title! could change it later)
         _ (gui-font! w {:family :mono :height *board-height*})  ; the FIXED window font (board only)
         _ (grid-fit w)  ; sizes *w*/*h* before we build the board
         start (now-ns)
         board (bitboard/make *w* *h*)  ; START EMPTY — clicks add random shapes
         me (self)  ; this root process is the renderer
-        stats (spawn (stats-loop me (perflog/log-start *log-path*)))
-        ;; the sim owns the live cap (*target-fps*) + auto-spawn interval (*inject-secs*) and
-        ;; its last-inject clock (start), updated only by the renderer's messages.
+        logger (perflog/log-start *log-path*)
         sim (spawn (sim-loop me
-                     stats
                      board
+                     start
                      0
                      (- start *frame-ns*)
                      0
-                     start
                      nil
                      0
-                     *target-fps*
                      *inject-secs*
-                     start)))
-    ;; the renderer keeps a LOCAL mirror of those values (for instant button labels) plus the
-    ;; transient drag state, and an empty info string until stats pushes the first one.
+                     start
+                     ""
+                     logger))
+        clock (spawn (clock-loop sim *target-fps*)))
+    ;; the renderer keeps a LOCAL mirror of cap/inject (for instant button labels) + drag state.
     (render-loop w
       sim
-      stats
+      clock
       board
       ""
-      {:cap *target-fps* :inject *inject-secs* :drag nil :dcol 0 :moved false :sent 0})))
+      {:cap *target-fps* :inject *inject-secs* :drag nil :dcol 0 :moved false})))
