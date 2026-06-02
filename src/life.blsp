@@ -358,11 +358,20 @@ buttons from `ui` + the sim's `info` string). Geometry is read from the board on
 ;; (`ui`) and redraws AT ONCE (feedback never waits on the tick), then messages the owner —
 ;; the CLOCK for the fps cap, the SIM for everything else. This loop never sleeps.
 (defn render-loop (w sim clock board info ui)
-  (receive ([:board nl st] (let (nl2 (bitboard/fit nl *w* *h*))
-                             (do
-                               (draw! w nl2 st ui)
-                               (send sim [:drawn])
-                               (render-loop w sim clock nl2 st ui))))
+  (receive
+    ([:board nl st]
+      (do
+        ;; Re-read the window each frame into *w*/*h*: the cell grid grows
+        ;; after the async gui-font! applies (and a font change sends no
+        ;; [:resize]), so this is what makes the board FILL the window and
+        ;; the bar sit at the bottom — without it *h* stays at its startup
+        ;; (default-font) value and the bar floats mid-window.
+        (grid-fit w)
+        (let (nl2 (bitboard/fit nl *w* *h*))
+          (do
+            (draw! w nl2 st ui)
+            (send sim [:drawn])
+            (render-loop w sim clock nl2 st ui)))))
     ;; Resize from the EVENT's cell grid — refit the cached board to it and redraw now.
     ([:resize cols rows] (let (z *board-zoom*
                                vrows (max 1 (- rows *status-scale*)))
