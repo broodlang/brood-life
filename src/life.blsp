@@ -3,8 +3,8 @@
 board is a packed BITBOARD (see `bitboard`) fit to the window. It starts EMPTY — LEFT
 click/drag drops random shapes, RIGHT click/drag drops glider guns, holding either
 auto-repeats (throttled), and the SCROLL wheel zooms the board. Keys: `-`/`=` lower/raise
-the fps cap, `[`/`]` make the auto-spawn rarer/more-often. The sim paces to the
-*target-fps* cap; the footer stays a fixed height while only the board zooms."
+an (opt-in) fps cap, `[`/`]` make the auto-spawn rarer/more-often. It runs UNCAPPED by
+default (fast — instant drawing); the footer stays a fixed height while only the board zooms."
   (:use editor/display))
 
 (require 'bitboard)  ; the packed-bitboard board: make / bset / place / step / cells / live-count
@@ -14,13 +14,16 @@ the fps cap, `[`/`]` make the auto-spawn rarer/more-often. The sim paces to the
 
 (def *w* 120)
 (def *h* 40)
-;; The frame-rate CAP: the sim paces each generation to *target-fps* (sleeps out the rest
-;; of the budget after drawing). Adjustable live with `-`/`=` (slower/faster), clamped to
-;; [*fps-min*, *fps-max*]; *frame-ns* is re-derived on each change and the sim re-reads it.
-(def *target-fps* 30)  ; the cap (generations/frames per second)
+;; The frame-rate cap. DEFAULT 0 = UNCAPPED (go ham — steps as fast as it can draw, which
+;; keeps drawing/mouse feedback instant); a POSITIVE value paces the sim by sleeping out the
+;; rest of each frame's budget, to slow the sim down enough to watch. Adjustable live with
+;; `-`/`=` (slower/faster; `=` past *fps-max* rolls back to uncapped). *frame-ns* below is a
+;; FIXED nominal budget used ONLY for spike detection — independent of the cap.
+(def *target-fps* 0)  ; 0 = uncapped (default); >0 = the fps cap
 (def *fps-min* 1)
-(def *fps-max* 240)
-(def *frame-ns* (quot 1000000000 *target-fps*))  ; per-frame period in ns (≈33ms at 30)
+(def *fps-max* 120)
+(def *fps-step* 5)  ; fps per `-`/`=` press
+(def *frame-ns* (quot 1000000000 30))  ; nominal ~33ms frame budget — for spike counting only
 (def *board-height* 5)  ; the board window's OWN cell font px (per-window) — small ⇒ dense board
 ;; Scroll-wheel zoom: each notch steps *board-height* by *zoom-step* px (bigger font ⇒
 ;; fewer, larger cells ⇒ zoomed IN), clamped to [*zoom-min*, *zoom-max*]. Zooming in
@@ -106,9 +109,8 @@ fps cap and auto-spawn interval (read from the globals the keys adjust)."
     gen
     " · "
     (quot 1000 (max 1 (quot per 1000000)))
-    "/"
-    *target-fps*
     " fps"
+    (if (> *target-fps* 0) (str " (cap " *target-fps* ")") " (uncapped)")
     " · "
     cells
     " cells"
@@ -252,10 +254,13 @@ the last fresh PRESS (a drag draws but doesn't reset it). `:stop` ends it."
                             (inject-pattern nxt2 s2)
                             [nxt2 s2]))
             (do
-              ;; pace to the fps cap: sim-pace already blocked on the renderer's ack, so
-              ;; this just sleeps out the rest of this frame's *frame-ns* budget.
-              (let (nap (quot (- *frame-ns* (- (now-ns) now)) 1000000))
-                (when (> nap 0) (sleep nap)))
+              ;; pace ONLY when a cap is set (*target-fps* > 0): sleep out the rest of this
+              ;; frame's budget. Uncapped (0) = NO sleep, runs flat out as before (sim-pace
+              ;; already blocked on the renderer's ack, so it never runs more than a frame
+              ;; ahead). This is why the default feels instant; a cap is opt-in.
+              (when (> *target-fps* 0)
+                (let (nap (quot (- (quot 1000000000 *target-fps*) (- (now-ns) now)) 1000000))
+                  (when (> nap 0) (sleep nap))))
               (sim-loop renderer stats nxt3 (+ gen 1) now spk s3 held2 hn2))))))))
 
 (defn quit-signal? (m)
@@ -281,6 +286,14 @@ in this SAME mailbox, so a quit signal stops the sim + stats and closes the wind
                             (send sim [:drawn])
                             (render-loop w sim stats nl status))))
     ([:status s] (render-loop w sim stats live s))
+    ;; Redraw the cached board IMMEDIATELY on a resize (the std editor loop redraws on
+    ;; every size read; we do it event-driven). Otherwise the bottom bar only re-fits on the
+    ;; sim's next [:board] — at the sim's pace, lagging the drag and jittering. grid-fit
+    ;; re-reads the new cell grid and sizes *w*/*h* for the sim's next frame.
+    ([:resize cols rows] (let ([vcols vrows] (grid-fit w))
+                           (do
+                             (gui-draw w (render live status vcols vrows))
+                             (render-loop w sim stats live status))))
     ;; Left button draws SHAPES, right button draws GUNS. A PRESS draws once and arms the
     ;; key-repeat; a DRAG draws at each cell crossed without re-arming, so dragging is
     ;; freehand drawing; release (either button) stops the auto-repeat. The scroll wheel
@@ -351,11 +364,19 @@ out), clamped to [*zoom-min*, *zoom-max*]. The next `grid-fit` re-reads the cell
 refits the torus, clipping any cells now off-board; the footer keeps its pixel height."
   (apply-zoom! w (max *zoom-min* (min *zoom-max* (+ *board-height* dir)))))
 
-(defn set-fps (delta)
-  "Change the frame-rate cap by `delta` fps (clamped to [*fps-min*, *fps-max*]) and
-re-derive *frame-ns*; the sim re-reads it next frame. Behind the `-`/`=` keys."
-  (let (f (max *fps-min* (min *fps-max* (+ *target-fps* delta))))
-    (do (def *target-fps* f) (def *frame-ns* (quot 1000000000 f)))))
+(defn set-fps (dir)
+  "Change the fps cap. `dir` > 0 = faster: raise the cap by *fps-step*, and past *fps-max*
+roll back to UNCAPPED (0). `dir` < 0 = slower: from uncapped engage the cap at *fps-max*,
+else lower it by *fps-step* down to *fps-min*. The sim reads *target-fps* each frame; only a
+positive value paces it. Behind the `-`/`=` keys."
+  (def *target-fps*
+    (if (> dir 0)
+      (if (or (= *target-fps* 0) (>= *target-fps* *fps-max*))
+        0
+        (min *fps-max* (+ *target-fps* *fps-step*)))
+      (if (= *target-fps* 0)
+        *fps-max*
+        (max *fps-min* (- *target-fps* *fps-step*))))))
 
 (defn set-inject (dir)
   "Adjust the auto-spawn interval. `dir` > 0 makes it RARER (interval +1 s; past *inject-max*
