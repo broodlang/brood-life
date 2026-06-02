@@ -8,14 +8,17 @@ oscillators, spaceships and methuselahs, in every rotation: a ~110-pattern catal
 delay, then throttled. Controls:
 
 - **scroll wheel** — zoom the board (the footer keeps a fixed height; only the board scales)
-- **`-` / `=`** — lower / raise the frame-rate cap
-- **`[` / `]`** — auto-spawn a random pattern rarer / more often (`[` past the max = never; the default is off)
+- **status-bar buttons** — click **`[spawn …]`** to toggle auto-spawn on/off; **drag**
+  **`[fps …]`** left/right to scrub the frame-rate cap
+- **`-` / `=`** — lower / raise the frame-rate cap (keyboard equivalent of the fps button)
+- **`[` / `]`** — auto-spawn a random pattern rarer / more often (`[` past the max = never)
 - **`q` / Esc / window-X** — quit
 
-The sim **paces to a frame-rate cap** (default 30 fps, adjustable). It fits itself to
-the window and tracks live resizes, so the torus always fills the frame. A big block-font
-status line below the board reports generation, FPS (`measured/cap`), live cell count,
-frame spikes, the auto-spawn interval, and memory.
+It runs **uncapped by default** (as fast as it can draw, so drawing/mouse feedback is
+instant); the fps button/keys engage an opt-in cap when you want to slow it down to watch.
+It fits itself to the window and tracks live resizes, so the torus always fills the frame.
+A big block-font status line below the board leads with the two buttons, then reports
+generation, measured FPS, live cell count, frame spikes, and memory.
 
 The board is a packed **bitboard** — one arbitrary-precision integer per row, bit `x`
 = cell alive. A whole generation is one bit-plane neighbour sum per row over the three
