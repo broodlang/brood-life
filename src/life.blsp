@@ -55,15 +55,19 @@ default (fast — instant drawing); the footer stays a fixed height while only t
 ;; rolling past *inject-max* back to never) and `]` (more often; from never it switches on).
 (def *inject-secs* 0)  ; seconds between random auto-injects (0 = never)
 (def *inject-max* 30)
-;; The bottom bar leads with two clickable BUTTONS at fixed char columns (overlaid on the
-;; bar in *btn-face*, hit-tested by `col / *status-scale*`): a SPAWN toggle and an FPS
-;; control (click cycles a preset, drag scrubs). The RENDERER owns these values for the
+;; The bottom bar leads with two clickable BUTTONS — a SPAWN toggle and an FPS control
+;; (click cycles a preset, drag scrubs). They're light raised KEYS overlaid on the reverse
+;; bar with MARGINS around them (so the bar shows between/around, not covered edge-to-edge)
+;; and a 1-cell drop-SHADOW on the right for a beveled feel; hit-tested by `col /
+;; *status-scale*`. Layout in chars: [0]=margin [1..12)=spawn [12]=shadow [13]=gap
+;; [14..23)=fps [23]=shadow [24]=gap [25…]=info. The RENDERER owns these values for the
 ;; label (so feedback is instant, independent of the sim's frame rate) and forwards every
-;; change to the SIM as a message — throttled to *fps-throttle-ns* while dragging — so the
-;; board-ticking process, not the input handler, owns the authoritative live cap/interval.
-(def *btn-spawn* [0 11])  ; char range [start end) of the `[spawn …]` button
-(def *btn-fps* [12 21])  ; char range of the `[fps …]` button
-(def *btn-face* {:bold true})  ; NON-reverse + bold → the buttons sit raised on the reverse bar
+;; change to the SIM as a message — throttled to *fps-throttle-ns* while dragging.
+(def *btn-spawn* [1 12])  ; char range [start end) of the spawn key (inset 1 from the left)
+(def *btn-fps* [14 23])  ; char range of the fps key (after spawn + its shadow + a gap)
+(def *btn-info* 25)  ; char where the info text starts — clear of both keys, shadows, gaps
+(def *btn-face* {:bg :white :fg :black :bold true})  ; a light raised KEY on the reverse bar
+(def *btn-shadow* {:bg :dark-grey})  ; the 1-cell drop-shadow column to a key's right
 (def *fps-throttle-ns* 50000000)  ; ≥50 ms between [:set-fps] messages while dragging
 (def *status-every* 10)  ; stats push the bar every N gens (~3 Hz at 30 fps) — readable, not a blur
 (def *log-every* 30)  ; stats write a perf line to life.log every N gens (~1 Hz at 30 fps)
@@ -112,10 +116,10 @@ bitboard `live`, threading the PRNG `s`; returns `[live' s']`."
 ;; They take the value to show (the renderer's LOCAL copy) rather than reading a global, so
 ;; the renderer can repaint them the instant you click/drag, ahead of the sim.
 (defn spawn-label (inject)
-  (str "[spawn " (if (> inject 0) (str (pad-left (str inject) 2) "s") "off") "]"))
+  (str " spawn " (if (> inject 0) (str (pad-left (str inject) 2) "s") "off") " "))
 
 (defn fps-label (cap)
-  (str "[fps " (pad-left (if (> cap 0) (str cap) "max") 3) "]"))
+  (str " fps " (pad-left (if (> cap 0) (str cap) "max") 3) " "))
 
 ;; The INFO half of the bar (gen / measured fps / cells / spikes / memory). The two buttons
 ;; are prepended by the renderer (`footer-ops`), not here — STATS only knows the
@@ -141,14 +145,19 @@ the previous frame). The renderer composes this after the buttons."
 ;; (`render`), so the bar is always positioned consistently with the board — no resize jump.
 (defn footer-ops (ui info top vcols)
   (let (scale *status-scale*
-        [sa _] *btn-spawn*
-        [fa _] *btn-fps*
+        [sa sb] *btn-spawn*  ; sa = key's first char, sb = the char just past it (its shadow)
+        [fa fb] *btn-fps*
         face (assoc *btn-face* :scale scale)
+        shadow (assoc *btn-shadow* :scale scale)
+        ;; info is pushed past *btn-info* blank cols so it can't underlap the keys/shadows;
+        ;; those leading blanks (and the gaps the keys don't cover) show the reverse bar.
         bg (bar top
              vcols
-             (str (string-repeat " " 22) info)
+             (str (string-repeat " " *btn-info*) info)
              {:face *status-face* :align :left :scale scale}))
-    [bg [:text top (* sa scale) (spawn-label (get ui :inject)) face]
+    [bg [:text top (* sb scale) " " shadow]
+      [:text top (* fb scale) " " shadow]
+      [:text top (* sa scale) (spawn-label (get ui :inject)) face]
       [:text top (* fa scale) (fps-label (get ui :cap)) face]]))
 
 ;; The leading `clear` wipes the previous frame, so we paint only what's lit. ALL geometry
@@ -301,16 +310,25 @@ the bar can't disagree with the board on resize). No `gui-size` here — that's 
   (receive
     ([:board nl]
       (do
-        (grid-fit w)  ; size the sim's next fit; geometry to draw is nl's
-        (draw! w nl info ui)
-        (send sim [:drawn])
-        (render-loop w sim stats nl info ui)))
+        (grid-fit w)  ; track the live window/zoom size into *w*/*h*
+        ;; Draw the board at the CURRENT size, not the sim's (which fit it a frame or two
+        ;; ago): refit it here so the board always fills the window and the bar — drawn from
+        ;; the SAME board's dims — never lags behind a resize. (No-op when already sized.)
+        (let (nl2 (bitboard/fit nl *w* *h*))
+          (do
+            (draw! w nl2 info ui)
+            (send sim [:drawn])
+            (render-loop w sim stats nl2 info ui)))))
     ([:status s] (do (draw! w live s ui) (render-loop w sim stats live s ui)))
-    ;; On resize: update *w*/*h*, then REFIT our cached board to it and redraw now — so the
-    ;; board fills the new window and the bar (drawn from the board's own dims) stays glued
-    ;; to it, with no jump, even before the sim's next frame lands.
-    ([:resize cols rows] (let (_ (grid-fit w) nl (bitboard/fit live *w* *h*))
-                           (do (draw! w nl info ui) (render-loop w sim stats nl info ui))))
+    ;; Resize from the EVENT's cell grid (cols rows) — the authoritative new size, like the
+    ;; brood-edit loop — NOT a re-query that could lag it; refit the cached board to it and
+    ;; redraw now, so it fills immediately even before the sim's next frame lands.
+    ([:resize cols rows] (let (vrows (max 1 (- rows *status-scale*)))
+                           (do
+                             (def *w* (max *grid-min* cols))
+                             (def *h* (max *grid-min* vrows))
+                             (let (nl (bitboard/fit live *w* *h*))
+                               (do (draw! w nl info ui) (render-loop w sim stats nl info ui))))))
     ;; One mouse dispatcher; `on-mouse` returns `[ui' redraw?]` and does any sim sends.
     ([:mouse action button row col mods] (let ([ui2 rd] (on-mouse sim w action button row col ui))
                                            (do
