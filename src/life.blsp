@@ -179,21 +179,26 @@ the previous frame). The renderer composes this after the buttons."
 ;; Each live cell is one `:text` op magnified by `z` (a z×z block at z=*board-zoom*), the
 ;; brood-edit `:scale` zoom (ADR-079): the window grid is fixed, so the bar never reflows.
 (defn render (live ui info)
-  "A display frame from `live`: each live cell a `:text` op scaled by *board-zoom*, then the
-bottom bar (buttons + `info`) at the board's scaled bottom. Geometry from `live` only."
+  "A display frame from `live`: each live cell a `:text` op (magnified by *board-zoom*), then
+the bottom bar (buttons + `info`) at the board's scaled bottom. Geometry from `live` only.
+The z=1 path builds the op INLINE (no per-cell call) — this is the hot loop over every live
+cell, so an extra closure call here is a several-thousand-cell tax."
   (let (z *board-zoom*
         rows (get live :rows)
         h (get live :h)
-        wdt (get live :w)
-        ;; hoist the per-cell op builder so the z=1 hot path stays a bare 3-element op
-        cell (if (= z 1)
-               (fn (y x) [:text y x "▪"])
-               (fn (y x) [:text (* y z) (* x z) "▪" {:scale z}])))
+        wdt (get live :w))
     (into (into [(clear)]
-            (mapcat (fn (y)
-                      (let (r (vector-ref rows y))
-                        (if (= r 0) nil (map (fn (x) (cell y x)) (bit-positions r)))))
-              (range h)))
+            (if (= z 1)
+              (mapcat (fn (y)
+                        (let (r (vector-ref rows y))
+                          (if (= r 0) nil (map (fn (x) [:text y x "▪"]) (bit-positions r)))))
+                (range h))
+              (mapcat (fn (y)
+                        (let (r (vector-ref rows y))
+                          (if (= r 0)
+                            nil
+                            (map (fn (x) [:text (* y z) (* x z) "▪" {:scale z}]) (bit-positions r)))))
+                (range h))))
       (footer-ops ui info (* h z) (* wdt z)))))
 
 ;; ---- the actors: SIM (model + clock) → STATS → RENDERER (compositor) -------------
@@ -288,13 +293,48 @@ ack the clock `clk`, and recurse. The held-cell repeat fires every *spawn-every*
           (sim-loop renderer nxt s2 (+ gen 1) now spk held hn2 inject last-inj2 st2 logger))))))
 
 (defn sim-paste (renderer board s gen prev spikes held hn inject last-inj st logger kind x y newhn)
-  "Apply ONE pasted pattern and DRAW it immediately — the responsiveness win: a paste is
-never queued behind the cap, because the SIM never sleeps. Carries on with the new board +
-held cell (`newhn` re-arms the auto-repeat on a press, keeps it on a drag)."
+  "Apply ONE pasted pattern; if more paste events are ALREADY queued (a fast drag), apply
+those too BEFORE redrawing — so a burst is ONE O(live) redraw, not one per cell crossed (the
+fix for spawning tanking the fps). A `[:tick]` waiting in the mailbox isn't consumed here, so
+it's drawn right after. Then draw once and carry on with the latest held cell."
   (let ([b2 s2] (apply-clicks board [[x y kind]] s))
-    (if (= :stop (sim-draw renderer b2 st))
-      (perflog/log-stop logger)
-      (sim-loop renderer b2 s2 gen prev spikes [x y kind] newhn inject last-inj st logger))))
+    (receive ([:press k a b] (sim-paste renderer
+                               b2
+                               s2
+                               gen
+                               prev
+                               spikes
+                               held
+                               hn
+                               inject
+                               last-inj
+                               st
+                               logger
+                               k
+                               a
+                               b
+                               0))
+      ([:drag k a b] (sim-paste renderer
+                       b2
+                       s2
+                       gen
+                       prev
+                       spikes
+                       held
+                       hn
+                       inject
+                       last-inj
+                       st
+                       logger
+                       k
+                       a
+                       b
+                       newhn))
+      (:stop (perflog/log-stop logger))
+      (after 0
+        (if (= :stop (sim-draw renderer b2 st))
+          (perflog/log-stop logger)
+          (sim-loop renderer b2 s2 gen prev spikes [x y kind] newhn inject last-inj st logger))))))
 
 (defn sim-loop (renderer board s gen prev spikes held hn inject last-inj st logger)
   "SIM: owns the board; NEVER sleeps — it just reacts to its mailbox. A `[:tick clk]` from
@@ -405,13 +445,17 @@ buttons from `ui` + the sim's `info` string). Geometry is read from the board on
 ;; image-wide, so the next `step` wraps on the new size.
 (defn grid-fit (w)
   "Re-fit the sim torus to window `w`: set `*w*`/`*h*` to the board area (window cells, less
-the bar, divided by *board-zoom*). Returns `[cols rows]` (the raw screen grid)."
+the bar, divided by *board-zoom*). Only `def`s when a value actually CHANGED — runs every
+frame, and rebinding a global can invalidate caches, so skip it on the common no-op frame.
+Returns `[cols rows]` (the raw screen grid)."
   (let ([cols rows] (gui-size w)
         z *board-zoom*
-        vrows (max 1 (- rows *status-scale*)))
+        vrows (max 1 (- rows *status-scale*))
+        nw (max *grid-min* (quot cols z))
+        nh (max *grid-min* (quot vrows z)))
     (do
-      (def *w* (max *grid-min* (quot cols z)))
-      (def *h* (max *grid-min* (quot vrows z)))
+      (when (not (= nw *w*)) (def *w* nw))
+      (when (not (= nh *h*)) (def *h* nh))
       [cols rows])))
 
 (defn zoom! (w dir)
