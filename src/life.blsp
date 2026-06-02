@@ -1,10 +1,13 @@
 (defmodule life
-  "Conway's Game of Life on a wrapping torus, sown with random known patterns and
-animated in a native GUI window (the board is fit to the window at startup)."
+  "Conway's Game of Life on a wrapping torus, animated in a native GUI window. The
+board is a packed BITBOARD (see `bitboard`) fit to the window. It starts EMPTY —
+click anywhere to drop a random shape at that cell — and steps as fast as it can
+draw (no frame-rate cap)."
   (:use editor/display))
 
-(require 'shapes)  ; still-life / oscillator / spaceship patterns (*shapes*)
-(require 'guns)  ; glider-gun patterns (*shooters*) — both sown by inject-pattern
+(require 'bitboard)  ; the packed-bitboard board: make / bset / place / step / cells / live-count
+(require 'shapes)  ; still-life / oscillator / spaceship patterns (*shapes*) — dropped on click
+(require 'guns)  ; glider-gun patterns (*shooters*) — sown by inject-pattern
 (require 'perflog)  ; tiny file logger — the stats process writes a perf line to life.log
 
 (def *w* 120)
@@ -20,11 +23,9 @@ animated in a native GUI window (the board is fit to the window at startup)."
 (def *status-scale* 4)
 (def *status-face* {:bg :blue :fg :white :bold true})  ; the bottom buffer-bar style (display/bar)
 (def *grid-min* 5)  ; the sim torus never shrinks below *grid-min* x *grid-min*
-(def *seed-fill* 100)  ; ~1 starting shape per this many torus cells — LOWER ⇒ denser seed,
-; so the board ramps to a busy state (and useful perf numbers) faster
-(def *inject-fast* 20)  ; constant-ish board: gens until the next pattern (quick revive)
-(def *inject-slow* 90)  ; lively board: gens until the next pattern (occasional variety)
-(def *stale-tol* 8)  ; population drift at/below max(this, 5%) over the interval ⇒ flat
+(def *seed-cells* 3000)  ; target initial ACTIVE (live) cell count — `seed` sows random
+; shapes until ~this many cells are live (the working population we pace to 30 fps).
+; Capped to ~90% of the torus area so a board smaller than this can't loop forever.
 (def *status-every* 10)  ; stats push the bar every N gens (~3 Hz at 30 fps) — readable, not a blur
 (def *log-every* 30)  ; stats write a perf line to life.log every N gens (~1 Hz at 30 fps)
 (def *log-path* "life.log")  ; where the perf log is written (cwd; truncated each run)
@@ -44,54 +45,25 @@ animated in a native GUI window (the board is fit to the window at startup)."
   "The 8 torus-wrapped neighbours of cell `[x y]`."
   (let ([x y] cell) (shift *offsets* x y)))
 
-(defn step--bump (a k)
-  "Tally one live cell's contribution to neighbour-count map `a`: `+1` at key `k`."
-  (assoc a k (+ 1 (get a k 0))))
+;; The generation step itself is `bitboard/step` (one bit-plane neighbour sum over the
+;; packed rows — cost independent of population). `neighbours`/`shift` above stay as the
+;; pure torus-coordinate helpers (used by the tests and pattern placement).
 
-;; Hot path — this is ~all the sim's CPU. For each live cell we precompute its FOUR
-;; wrapped neighbour coordinates once (`xl`/`xr`/`yu`/`yd`), then bump the 8 neighbours
-;; UNROLLED: 4 `mod`s per cell instead of 16 (the 8 neighbours share the precomputed
-;; columns/rows) and no inner `reduce`/lambda/destructure per offset — measured ~1.7×
-;; faster than folding over `*offsets*`. (`mod` beat a hand-rolled compare-and-wrap;
-;; inlining `step--bump` was slower — the extra `let` bindings cost more than the calls
-;; they save.) NOT `(frequencies (mapcat neighbours …))` — materialising the 8N-element
-;; list and the per-cell `map` closure benchmarked ~1.4× slower than counting in place.
-(defn step (live)
-  "Advance one generation. `live` is a map keyed by live `[x y]` cells; returns the next
-generation in the same shape. We tally each live cell's 8 neighbours straight into a
-count map, then keep the cells with 3 (birth) or 2-while-already-live (survival)."
-  (into {}
-    (filter (fn ([c n]) (or (= n 3) (and (= n 2) (contains? live c))))
-      (reduce (fn (acc cell)
-                (let ([x y] cell
-                      xl (mod (+ x -1) *w*)
-                      xr (mod (+ x 1) *w*)
-                      yu (mod (+ y -1) *h*)
-                      yd (mod (+ y 1) *h*)
-                      a1 (step--bump acc [xl yu])
-                      a2 (step--bump a1 [x yu])
-                      a3 (step--bump a2 [xr yu])
-                      a4 (step--bump a3 [xl y])
-                      a5 (step--bump a4 [xr y])
-                      a6 (step--bump a5 [xl yd])
-                      a7 (step--bump a6 [x yd]))
-                  (step--bump a7 [xr yd])))
-        {}
-        (keys live)))))
-
-(defn seed--sow (n s acc)
-  "Sow `n` random shapes at random positions, threading the PRNG `s`; returns the
-accumulated `[x y]` cells in `acc`."
-  (if (= n 0)
+(defn seed--sow (s acc target)
+  "Sow random shapes at random positions, threading the PRNG `s`, until the bitboard
+`acc` holds at least `target` live cells; returns the board. Used by the test suite
+(the live app starts empty — see `run-life`)."
+  (if (>= (bitboard/live-count acc) target)
     acc
     (let ([shape s1] (sample s *shapes*)
           [x s2] (rand-int s1 *w*)
           [y s3] (rand-int s2 *h*))
-      (seed--sow (- n 1) s3 (concat acc (shift shape x y))))))
+      (seed--sow s3 (bitboard/place acc shape x y) target))))
 
 (defn seed (s)
-  "A random board: known shapes scattered across the torus, count scaled to area."
-  (into {} (map (fn (c) [c true]) (seed--sow (max 4 (quot (* *w* *h*) *seed-fill*)) s []))))
+  "A random board: known shapes scattered across the torus until ~*seed-cells* cells
+are live — capped to ~90% of the torus area (floored at 4) so a small board still seeds."
+  (seed--sow s (bitboard/make *w* *h*) (max 4 (min *seed-cells* (floor (* 0.9 (* *w* *h*)))))))
 
 ;; Pattern GEOMETRY lives in the `shapes` / `guns` modules; placement is `life`'s job
 ;; (it needs the torus `*w*`/`*h*` and `shift`). The sim calls this on a schedule both
@@ -99,11 +71,11 @@ accumulated `[x y]` cells in `acc`."
 ;; re-energises it).
 (defn inject-pattern (live s)
   "Sow a random known pattern — any of `*patterns*` — at a random torus position onto
-board `live`, threading the PRNG `s`; returns `[live' s']`."
+bitboard `live`, threading the PRNG `s`; returns `[live' s']`."
   (let ([pat s1] (sample s *patterns*)
-        [x s2] (rand-int s1 *w*)
-        [y s3] (rand-int s2 *h*))
-    [(into live (map (fn (c) [c true]) (shift pat x y))) s3]))
+        [x s2] (rand-int s1 (get live :w))
+        [y s3] (rand-int s2 (get live :h)))
+    [(bitboard/place live pat x y) s3]))
 
 ;; The space before each unit and the ` · ` between fields keep the digits from running
 ;; together, so the line reads at a glance: `gen 5 · 22 fps · 30 cells · 0 spikes · 12 MB`.
@@ -140,12 +112,20 @@ generation's measurement (`per` = nanoseconds since the previous frame)."
 ;; frame — O(area), ~30× slower and the reason the frame rate was pinned regardless of
 ;; the pacing target.
 (defn render (live status vcols vrows)
-  "A display frame: the board as ONE `text` op per live cell (sparse, clipped to the
-`vcols`×`vrows` viewport), with a full-width status bar across the bottom rows."
-  (apply frame
-    (clear)
-    (concat (map (fn ([x y]) (text y x "▪"))
-              (filter (fn ([x y]) (and (< x vcols) (< y vrows))) (keys live)))
+  "A display frame: the board as ONE `text` op per live cell (enumerated from the
+bitboard, clipped to the `vcols`×`vrows` viewport), with a full-width status bar
+across the bottom rows."
+  ;; One pass: a `text` op straight from each set bit (`bit-positions` per non-empty
+  ;; row), no intermediate `[x y]` list, no clip (the bitboard IS the viewport), no
+  ;; `apply`/`frame` nil-filter. `clear` first, status bar last.
+  (let (rows (get live :rows))
+    (into (into [(clear)]
+            (mapcat (fn (y)
+                      (let (r (vector-ref rows y))
+                        ;; the display `:text` op literal (display/text without the
+                        ;; per-cell fn call + optional-face check) — this is the hot path
+                        (if (= r 0) nil (map (fn (x) [:text y x "▪"]) (bit-positions r)))))
+              (range (get live :h))))
       [(status-bar status vrows vcols)])))
 
 ;; ---- the actors: SIM (model + clock) → STATS → RENDERER (compositor) -------------
@@ -183,42 +163,42 @@ and writes a perf line to the `logger` every `*log-every*` gens."
                                       (perflog/log-line logger (log-fmt gen cells per spikes)))
                                     (stats-loop renderer logger)))))
 
-(defn sim-pace (deadline)
-  "SIM pacing: wait for the renderer's `[:drawn]` ack — so the sim never runs more than
-one frame ahead of it (bounds the mailbox) — then sleep out the rest of the frame budget
-to `deadline`, staying responsive to `:stop`. Returns `:go` or `:stop`."
+(defn sim-pace (clicks)
+  "Wait for the renderer's `[:drawn]` ack — so the sim never runs more than one frame
+ahead of it (bounds the mailbox) — collecting any `[:click x y]` (a mouse drop the
+renderer forwards) that arrive meanwhile. Returns `:stop`, or the accumulated list of
+click `[x y]` cells to fold into the next generation. The frame-rate cap is REMOVED (go
+ham): it returns as soon as the renderer acks, with no sleep."
   (receive (:stop :stop)
-    ([:drawn] (let (left (quot (- deadline (now-ns)) 1000000))
-                (if (> left 0) (receive (:stop :stop) (after left :go)) :go)))))
+    ([:drawn] clicks)
+    ([:click x y] (sim-pace (cons [x y] clicks)))))
 
-;; Patterns on an ADAPTIVE schedule: when the interval elapses it sows ONE random pattern
-;; (inject-pattern), then picks the next interval from how the board behaved —
-;; *inject-fast* if it went constant-ish (drift within max(*stale-tol*, 5%)), *inject-slow*
-;; if it's lively — each randomised to [base, 2·base). `s` threads the PRNG; `pop0` is the
-;; population at the last injection, `wait` the scheduled interval, `since` the generations
-;; elapsed. `prev` gives the true period for the fps/spike read.
-(defn sim-loop (renderer stats live gen prev spikes s pop0 wait since)
-  "SIM: the model + the clock. Each frame it pushes the current board to the renderer and
-a raw measurement to stats, computes the NEXT generation with `step` (overlapping the
-renderer drawing this one), runs the adaptive pattern schedule, then paces. `:stop` ends it."
-  (let (now (now-ns)
+(defn apply-clicks (board clicks s)
+  "Drop a random shape (`*shapes*`) at each click cell `[x y]`, threading the PRNG `s`;
+returns `[board' s']`. This is the only way cells enter the board — the app starts empty."
+  (reduce (fn ([b s] [x y])
+            (let ([shape s1] (sample s *shapes*))
+              [(bitboard/place b shape x y) s1]))
+    [board s] clicks))
+
+(defn sim-loop (renderer stats live gen prev spikes s)
+  "SIM: the model + the clock. Each frame it fits the board to the current window, pushes
+it to the renderer and a measurement to stats, computes the NEXT generation with
+`bitboard/step` (overlapping the renderer drawing this one), then waits for the ack —
+folding in any clicked-in shapes — and recurses. `:stop` ends it."
+  (let (live (bitboard/fit live *w* *h*)
+        now (now-ns)
         per (- now prev)
         spk (if (> per (quot (* *frame-ns* 3) 2)) (+ spikes 1) spikes))
     (do
       (send renderer [:board live])
-      (send stats [:meas gen (count live) per spk])
-      (let (nxt (step live))
-        ; overlaps the renderer drawing `live`
-        (if (= :stop (sim-pace (+ now *frame-ns*)))
+      (send stats [:meas gen (bitboard/live-count live) per spk])
+      (let (nxt (bitboard/step live)  ; overlaps the renderer drawing `live`
+            paced (sim-pace []))
+        (if (= :stop paced)
           :stopped
-          (if (< since wait)
-            (sim-loop renderer stats nxt (+ gen 1) now spk s pop0 wait (+ since 1))
-            (let (cur (count nxt)
-                  flat? (<= (abs (- cur pop0)) (max *stale-tol* (quot cur 20)))
-                  [nxt2 s2] (inject-pattern nxt s)
-                  base (if flat? *inject-fast* *inject-slow*)
-                  [jit s3] (rand-int s2 base))
-              (sim-loop renderer stats nxt2 (+ gen 1) now spk s3 (count nxt2) (+ base jit) 0))))))))
+          (let ([nxt2 s2] (apply-clicks nxt paced s))
+            (sim-loop renderer stats nxt2 (+ gen 1) now spk s2)))))))
 
 (defn quit-signal? (m)
   "Is `m` a quit signal? — the window's X (`:close`, a frontend signal distinct from the
@@ -243,6 +223,11 @@ in this SAME mailbox, so a quit signal stops the sim + stats and closes the wind
                             (send sim [:drawn])
                             (render-loop w sim stats nl status))))
     ([:status s] (render-loop w sim stats live s))
+    ;; A left-click drops a shape: forward the cell to the sim (col=x, row=y), which
+    ;; folds it into the next generation. Other mouse events fall through (ignored).
+    ([:mouse :press :left row col mods] (do
+                                          (send sim [:click col row])
+                                          (render-loop w sim stats live status)))
     (m (if (quit-signal? m) (render-quit sim stats w) (render-loop w sim stats live status)))))
 
 ;; `*w*`/`*h*` — the torus `step` wraps on — track the window area but are FLOORED at
@@ -263,23 +248,14 @@ for `render` to clip to (the board is the window less the bottom `*status-scale*
 (defn run-life ()
   "Wire up and run the three actors. This root process becomes the RENDERER (it owns the
 window); only the board window is shrunk via per-window `gui-font!`. We `grid-fit` once to
-size `*w*`/`*h*` before seeding, then spawn stats + sim and hand them this process's pid so
-they can push `[:status]`/`[:board]` in."
+size `*w*`/`*h*`, start with an EMPTY board (click to drop shapes), then spawn stats + sim
+and hand them this process's pid so they can push `[:status]`/`[:board]` in."
   (let (w (gui-open)
         _ (gui-font! w {:family :mono :height *board-height*})  ; smaller blocks, board window ONLY
-        _ (grid-fit w)  ; sizes *w*/*h* before we seed
+        _ (grid-fit w)  ; sizes *w*/*h* before we build the board
         start (now-ns)
-        board (seed start)
+        board (bitboard/make *w* *h*)  ; START EMPTY — clicks add random shapes
         me (self)  ; this root process is the renderer
         stats (spawn (stats-loop me (perflog/log-start *log-path*)))
-        sim (spawn (sim-loop me
-                     stats
-                     board
-                     0
-                     (- start *frame-ns*)
-                     0
-                     start
-                     (count board)
-                     *inject-slow*
-                     0)))
+        sim (spawn (sim-loop me stats board 0 (- start *frame-ns*) 0 start)))
     (render-loop w sim stats board "")))

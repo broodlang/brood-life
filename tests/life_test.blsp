@@ -1,21 +1,25 @@
-;; Tests for the life simulation core. The render loop (`run-life`) takes over
-;; the terminal, so exercise it with `nest run --for 2s` instead.
-(defmodule life-test (:use life) (:use test))
+;; Tests for the life simulation core. The render loop (`run-life`) takes over the
+;; window, so exercise it with `nest run --for 2s` instead. The board is a bitboard
+;; (`bitboard` module): build one with `make` + `bset`, inspect it with `cells`
+;; (live `[x y]` list) and `live-count` (population).
+(defmodule life-test (:use life) (:use bitboard) (:use test))
 
-(defn board (coords) (into {} (map (fn (c) [c true]) coords)))
+(defn board (coords)
+  "A 120×40 bitboard with `coords` (a list of `[x y]`) live."
+  (reduce (fn (b [x y]) (bset b x y)) (make 120 40) coords))
 
 (describe "life"
   (test "a blinker oscillates with period 2"
     (let (b (board [[1 0] [1 1] [1 2]]))
       (do
-        (assert= (sort (keys (step b))) (sort [[0 1] [1 1] [2 1]]))
-        (assert= (sort (keys (step (step b)))) (sort (keys b))))))
+        (assert= (sort (cells (step b))) (sort [[0 1] [1 1] [2 1]]))
+        (assert= (sort (cells (step (step b)))) (sort (cells b))))))
 
   (test "a glider translates by (+1,+1) every 4 generations"
     (let (g (board [[1 0] [2 1] [0 2] [1 2] [2 2]])
           g4 (step (step (step (step g)))))
-      (assert= (sort (keys g4))
-        (sort (map (fn ([x y]) [(+ x 1) (+ y 1)]) (keys g))))))
+      (assert= (sort (cells g4))
+        (sort (map (fn ([x y]) [(+ x 1) (+ y 1)]) (cells g))))))
 
   (test "neighbours wrap around the torus"
     (is (includes? (neighbours [0 0]) [119 39])))
@@ -23,16 +27,23 @@
   (test "a seeded board is deterministic, non-empty, and on-grid"
     (let (s (seed 42))
       (do
-        (assert= (keys s) (keys (seed 42)))  ; same seed -> same board
-        (is (> (count s) 0))
-        (is (every? (fn ([x y]) (and (>= x 0) (< x 120) (>= y 0) (< y 40))) (keys s))))))
+        (assert= (sort (cells s)) (sort (cells (seed 42))))  ; same seed -> same board
+        (is (> (live-count s) 0))
+        (is (every? (fn ([x y]) (and (>= x 0) (< x 120) (>= y 0) (< y 40))) (cells s))))))
 
   (test "different seeds give different boards"
-    (is (not (= (keys (seed 1)) (keys (seed 9)))))))
+    (is (not (= (sort (cells (seed 1))) (sort (cells (seed 9)))))))
+
+  (test "a click drops a random shape onto the empty board"
+    (let (blank (make 120 40)
+          [dropped _] (apply-clicks blank [[10 10]] 3))
+      (do
+        (is (= (live-count blank) 0))       ; the app starts empty
+        (is (> (live-count dropped) 0))))))  ; a click adds cells
 
 ;; Shooters: the anti-stagnation guns. A gun keeps emitting gliders, so `inject-pattern`
-;; sowing one onto a settled board makes the population trend up again (the sim
-;; calls it on stagnation). A one-cell typo in *gosper-gun* would silently break it.
+;; sowing one onto a settled board makes the population trend up again. A one-cell typo
+;; in *gosper-gun* would silently break it.
 (defn stepn (b n) (reduce (fn (acc _) (step acc)) b (range n)))
 
 (describe "shooters re-energise a stagnant board"
@@ -40,8 +51,8 @@
     (let (g (board *gosper-gun*))
       ; at origin, fits 120x40 without wrapping
       (do
-        (assert= (count g) 36)
-        (is (> (count (stepn g 60)) (count g))))))
+        (assert= (live-count g) 36)
+        (is (> (live-count (stepn g 60)) (live-count g))))))
 
   (test "the shooter set is four 36-cell reflections of the gun, each in its box"
     (do
@@ -56,11 +67,11 @@
           [revived _] (inject-pattern settled 7)
           [again _] (inject-pattern settled 7))
       (do
-        (is (> (count revived) (count settled)))  ; a pattern was sown in
-        (assert= (keys revived) (keys again))))))  ; same seed -> same sow
+        (is (> (live-count revived) (live-count settled)))  ; a pattern was sown in
+        (assert= (sort (cells revived)) (sort (cells again)))))))  ; same seed -> same sow
 
 ;; The renderer (render-loop) routes its mailbox on `quit-signal?`: the window's X
-;; (`:close`) and the q / Esc / Ctrl-C keys quit; board/status/other messages don't.
+;; (`:close`) and the q / Esc / Ctrl-C keys quit; board/status/mouse/other don't.
 ;; The loop itself owns a GUI window so it's exercised live, not in the suite — but
 ;; the quit *decision* is a pure predicate, so we test that directly.
 (describe "renderer quit signals"
@@ -70,9 +81,9 @@
       (is (quit-signal? "q"))
       (is (quit-signal? :escape))
       (is (quit-signal? :ctrl-c))))
-  (test "board / status / other messages are not quit signals"
+  (test "board / status / mouse / other messages are not quit signals"
     (do
       (is (not (quit-signal? [:board (board [[0 0]])])))
       (is (not (quit-signal? [:status "gen 0"])))
-      (is (not (quit-signal? [:mouse :press :left 0 0])))
+      (is (not (quit-signal? [:mouse :press :left 0 0 []])))
       (is (not (quit-signal? :drawn))))))
