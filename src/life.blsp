@@ -227,21 +227,32 @@ and writes a perf line to the `logger` every `*log-every*` gens."
                                       (perflog/log-line logger (log-fmt gen cells per spikes)))
                                     (stats-loop renderer logger)))))
 
-(defn sim-pace (clicks held armed cap inject)
-  "Drain the renderer's messages until its `[:drawn]` ack — so the sim never runs more than
-one frame ahead of it (bounds the mailbox) — while threading the sim-owned control state.
-`[:press kind x y]` draws a `kind` pattern (`:shape`/`:gun`), sets the held cell + ARMS the
-key-repeat; `[:drag kind x y]` draws + moves the held cell without re-arming; `[:release]`
-clears it. `[:set-fps n]`/`[:set-inject n]` (sent by the renderer, throttled) update the
-authoritative cap / auto-spawn interval HERE, in the ticking process. Returns `:stop`, or
-`[clicks held' armed? cap' inject']`."
-  (receive (:stop :stop)
-    ([:drawn] [clicks held armed cap inject])
-    ([:press kind x y] (sim-pace (cons [x y kind] clicks) [x y kind] true cap inject))
-    ([:drag kind x y] (sim-pace (cons [x y kind] clicks) [x y kind] armed cap inject))
-    ([:release] (sim-pace clicks nil armed cap inject))
-    ([:set-fps n] (sim-pace clicks held armed n inject))
-    ([:set-inject n] (sim-pace clicks held armed cap n))))
+(defn sim-serve (renderer board s held cap inject armed due acked)
+  "Hold the sim between steps WITHOUT a blocking sleep: stay responsive until `due` ns (the
+next step's deadline at the current cap). A press/drag draws its pattern onto `board` and
+REDRAWS it at once — so a spawn appears immediately even at a 1 fps cap, not on the next
+tick — then awaits that frame's ack; release clears the held cell; `[:set-fps]`/`[:set-inject]`
+retune the sim-owned controls. It drains `[:drawn]` acks and won't return until the last
+board it sent is acked (`acked`), which bounds the mailbox like the old per-frame wait.
+Returns `:stop`, or `[board s held cap inject armed]` at the deadline."
+  (let (left (- due (now-ns)))
+    (if (and acked (<= left 0))
+      [board s held cap inject armed]
+      (receive (:stop :stop)
+        ([:drawn] (sim-serve renderer board s held cap inject armed due true))
+        ([:press kind x y] (let ([b2 s2] (apply-clicks board [[x y kind]] s))
+                             (do
+                               (send renderer [:board b2])
+                               (sim-serve renderer b2 s2 [x y kind] cap inject true due false))))
+        ([:drag kind x y] (let ([b2 s2] (apply-clicks board [[x y kind]] s))
+                            (do
+                              (send renderer [:board b2])
+                              (sim-serve renderer b2 s2 [x y kind] cap inject armed due false))))
+        ([:release] (sim-serve renderer board s nil cap inject armed due acked))
+        ([:set-fps n] (sim-serve renderer board s held n inject armed due acked))
+        ([:set-inject n] (sim-serve renderer board s held cap n armed due acked))
+        (after (if acked (max 1 (quot (max 1 left) 1000000)) 2000)
+          [board s held cap inject armed])))))
 
 (defn apply-clicks (board clicks s)
   "Drop a random pattern at each click cell `[x y kind]`, threading the PRNG `s`: a `:gun`
@@ -256,12 +267,11 @@ cell samples a glider gun (`*shooters*`, right button), any other kind samples a
     clicks))
 
 (defn sim-loop (renderer stats live gen prev spikes s held hn cap inject last-inj)
-  "SIM: the model + the clock, and the OWNER of the live `cap` (fps) and `inject` (auto-spawn
-seconds) — updated only by the renderer's throttled `[:set-fps]`/`[:set-inject]` messages,
-never by a shared global, so input never contends with the tick. Each frame it fits the
-board, pushes it + a measurement out, steps the NEXT generation (overlapping the draw),
-waits for the ack folding in drawn patterns + the held-cell key-repeat, auto-injects on a
-wall-clock schedule, paces to `cap`, and recurses. `:stop` ends it."
+  "SIM: the model + the clock, OWNER of the live `cap`/`inject` (retuned only by the
+renderer's messages, so input never contends with the tick). Each tick it fits + draws the
+board + a measurement, then SERVES input until the next tick is due — drawing any spawn the
+instant it's clicked, even at a low cap — folds in the held-cell key-repeat and the
+wall-clock auto-inject, steps one generation, and recurses. `:stop` ends it."
   (let (live (bitboard/fit live *w* *h*)
         now (now-ns)
         per (- now prev)
@@ -269,35 +279,28 @@ wall-clock schedule, paces to `cap`, and recurses. `:stop` ends it."
     (do
       (send renderer [:board live])
       (send stats [:meas gen (bitboard/live-count live) per spk])
-      (let (nxt (bitboard/step live)  ; overlaps the renderer drawing `live`
-            paced (sim-pace [] held false cap inject))
-        (if (= :stop paced)
+      ;; serve input (drawing clicks immediately) until the next step is due — `due` is now
+      ;; for an uncapped sim (step as soon as the draw is acked) else now + the cap's budget.
+      (let (due (+ now (if (> cap 0) (quot 1000000000 cap) 0))
+            served (sim-serve renderer live s held cap inject false due false))
+        (if (= :stop served)
           :stopped
-          (let ([clicks held2 armed cap2 inject2] paced
-                ;; Only a fresh PRESS (`armed`) re-arms the delay (hn←0); a drag draws but
-                ;; lets hn keep climbing, so a stopped drag keeps auto-repeating instead of
-                ;; restarting the warm-up. Auto-repeat fires on idle frames (nothing drawn
-                ;; this frame) once hn passes *hold-delay*, then every *spawn-every* gens.
-                hn2 (if armed 0 (if held2 (+ hn 1) 0))
+          (let ([cur s2 held2 cap2 inject2 armed2] served
+                ;; held-cell auto-repeat: a fresh PRESS (`armed2`) re-arms (hn←0); a
+                ;; stationary hold counts up and re-drops every *spawn-every* gens past the
+                ;; warm-up (discrete presses/drags already drew immediately in sim-serve).
+                hn2 (if armed2 0 (if held2 (+ hn 1) 0))
                 repeat? (and held2
-                          (= 0 (count clicks))
                           (>= hn2 *hold-delay*)
                           (= 0 (mod (- hn2 *hold-delay*) *spawn-every*)))
-                drops (if repeat? (cons held2 clicks) clicks)
-                [nxt2 s2] (apply-clicks nxt drops s)
+                [cur1 s3] (if repeat? (apply-clicks cur [held2] s2) [cur s2])
                 ;; auto-inject on a WALL-CLOCK schedule (robust to the cap — a gen count
                 ;; would divide by the fps and flood when uncapped). 0 = never.
-                due? (and (> inject2 0) (>= (- now last-inj) (* inject2 1000000000)))
-                [nxt3 s3] (if due? (inject-pattern nxt2 s2) [nxt2 s2])
-                last-inj2 (if due? now last-inj))
-            (do
-              ;; pace ONLY when a cap is set (`cap` > 0): sleep out the rest of this frame's
-              ;; budget. Uncapped (0) = NO sleep, flat out (sim-pace already blocked on the
-              ;; ack, so it never runs more than a frame ahead). The cap is opt-in.
-              (when (> cap2 0)
-                (let (nap (quot (- (quot 1000000000 cap2) (- (now-ns) now)) 1000000))
-                  (when (> nap 0) (sleep nap))))
-              (sim-loop renderer stats nxt3 (+ gen 1) now spk s3 held2 hn2 cap2 inject2 last-inj2))))))))
+                inj? (and (> inject2 0) (>= (- now last-inj) (* inject2 1000000000)))
+                [cur2 s4] (if inj? (inject-pattern cur1 s3) [cur1 s3])
+                last-inj2 (if inj? now last-inj)
+                nxt (bitboard/step cur2))
+            (sim-loop renderer stats nxt (+ gen 1) now spk s4 held2 hn2 cap2 inject2 last-inj2)))))))
 
 (defn quit-signal? (m)
   "Is `m` a quit signal? — the window's X (`:close`, a frontend signal distinct from the
