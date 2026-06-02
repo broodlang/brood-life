@@ -24,20 +24,19 @@ default (fast — instant drawing); the footer stays a fixed height while only t
 (def *fps-max* 120)
 (def *fps-step* 5)  ; fps per `-`/`=` press
 (def *frame-ns* (quot 1000000000 30))  ; nominal ~33ms frame budget — for spike counting only
-(def *board-height* 5)  ; the board window's OWN cell font px (per-window) — small ⇒ dense board
-;; Scroll-wheel zoom: each notch steps *board-height* by *zoom-step* px (bigger font ⇒
-;; fewer, larger cells ⇒ zoomed IN), clamped to [*zoom-min*, *zoom-max*]. Zooming in
-;; shrinks the torus and DROPS the cells that fall off (bitboard/refit clips) — what's not
-;; on the board is gone, not wrapped back on.
-(def *zoom-min* 2)
-(def *zoom-max* 40)
+(def *board-height* 5)  ; the FIXED window cell-font px (set once) — small ⇒ dense board cells
+;; Scroll-wheel zoom is brood-edit's way (ADR-079): the WINDOW FONT never changes — so the
+;; status bar never reflows or jumps; the zoom is SEAMLESS — only the BOARD is drawn larger.
+;; Each board cell is rendered at per-op `:scale *board-zoom*` (a z×z screen-cell block), so
+;; the torus is cols/z × rows/z cells: zoom IN ⇒ bigger cells, fewer of them, the overflow
+;; dropped (bitboard/refit clips). Clamped to [*zoom-min*, *zoom-max*].
+(def *board-zoom* 1)  ; board-cell magnification (1 = native dense; higher = zoomed in)
+(def *zoom-min* 1)
+(def *zoom-max* 10)
 (def *zoom-step* 1)
-;; The bottom status bar is held at a FIXED PIXEL height regardless of zoom: only the
-;; BOARD scales with the wheel. The bar is drawn *status-scale* board-cells tall, so as the
-;; board font (*board-height*) changes we RE-DERIVE *status-scale* to keep the bar ≈
-;; *footer-px* px (apply-zoom! does this). At the defaults (20 / 5) that's the old fixed 4.
-(def *footer-px* 20)  ; target footer height in px (constant across zoom)
-(def *status-scale* 4)  ; board-cells tall; re-derived from *footer-px*/*board-height* on zoom
+;; The bottom status bar is a FIXED *status-scale* screen-cells tall at the FIXED window
+;; font, so its pixel height is constant and zoom never touches it (the seamless win).
+(def *status-scale* 4)  ; the bar's height in (constant) screen cells / its glyph scale
 (def *status-face* {:reverse true})  ; the bottom bar: reverse-video, like the brood-edit mode line
 (def *grid-min* 5)  ; the sim torus never shrinks below *grid-min* x *grid-min*
 (def *seed-cells* 3000)  ; target initial ACTIVE (live) cell count — `seed` sows random
@@ -176,21 +175,28 @@ the previous frame). The renderer composes this after the buttons."
       [:text brow fx0 (fps-label (get ui :cap)) face]]))
 
 ;; The leading `clear` wipes the previous frame, so we paint only what's lit. ALL geometry
-;; comes from `live` itself (`:h`/`:w`), so the board and the bar below it are sized from
-;; ONE snapshot — the brood-edit anti-jitter rule: never composite a stale board under a
-;; freshly-measured bar position (that mismatch is what made the footer jump on resize).
+;; comes from `live` itself (`:h`/`:w`) scaled by *board-zoom*, so the board and the bar
+;; below it are sized from ONE snapshot — the brood-edit anti-jitter rule: never composite a
+;; stale board under a freshly-measured bar position (that mismatch made the footer jump).
+;; Each live cell is one `:text` op magnified by `z` (a z×z block at z=*board-zoom*), the
+;; brood-edit `:scale` zoom (ADR-079): the window grid is fixed, so the bar never reflows.
 (defn render (live ui info)
-  "A display frame from the board `live`: one `:text` op per live cell, then the bottom bar
-(buttons + `info`) at row `(get live :h)`. Geometry is read from `live` only."
-  (let (rows (get live :rows)
+  "A display frame from `live`: each live cell a `:text` op scaled by *board-zoom*, then the
+bottom bar (buttons + `info`) at the board's scaled bottom. Geometry from `live` only."
+  (let (z *board-zoom*
+        rows (get live :rows)
         h (get live :h)
-        wdt (get live :w))
+        wdt (get live :w)
+        ;; hoist the per-cell op builder so the z=1 hot path stays a bare 3-element op
+        cell (if (= z 1)
+               (fn (y x) [:text y x "▪"])
+               (fn (y x) [:text (* y z) (* x z) "▪" {:scale z}])))
     (into (into [(clear)]
             (mapcat (fn (y)
                       (let (r (vector-ref rows y))
-                        (if (= r 0) nil (map (fn (x) [:text y x "▪"]) (bit-positions r)))))
+                        (if (= r 0) nil (map (fn (x) (cell y x)) (bit-positions r)))))
               (range h)))
-      (footer-ops ui info h wdt))))
+      (footer-ops ui info (* h z) (* wdt z)))))
 
 ;; ---- the actors: SIM (model + clock) → STATS → RENDERER (compositor) -------------
 ;; Each source is its own process that PUSHES updates to a thin renderer (ADR-058
@@ -341,10 +347,11 @@ the bar can't disagree with the board on resize). No `gui-size` here — that's 
     ;; Resize from the EVENT's cell grid (cols rows) — the authoritative new size, like the
     ;; brood-edit loop — NOT a re-query that could lag it; refit the cached board to it and
     ;; redraw now, so it fills immediately even before the sim's next frame lands.
-    ([:resize cols rows] (let (vrows (max 1 (- rows *status-scale*)))
+    ([:resize cols rows] (let (z *board-zoom*
+                               vrows (max 1 (- rows *status-scale*)))
                            (do
-                             (def *w* (max *grid-min* cols))
-                             (def *h* (max *grid-min* vrows))
+                             (def *w* (max *grid-min* (quot cols z)))
+                             (def *h* (max *grid-min* (quot vrows z)))
                              (let (nl (bitboard/fit live *w* *h*))
                                (do (draw! w nl info ui) (render-loop w sim stats nl info ui))))))
     ;; One mouse dispatcher; `on-mouse` returns `[ui' redraw?]` and does any sim sends.
@@ -361,35 +368,27 @@ the bar can't disagree with the board on resize). No `gui-size` here — that's 
              (when rd (draw! w live info ui2))
              (render-loop w sim stats live info ui2)))))))
 
-;; `*w*`/`*h*` — the torus `step` wraps on — track the window area (in cells, which the
-;; zoom font size also changes) but are FLOORED at *grid-min*×*grid-min* so a tiny window
-;; or deep zoom can't collapse the torus to nothing. Shrinking clips off-board cells
-;; (bitboard/refit), so they don't come back when it grows again. Globals are image-wide,
-;; so the next `step` wraps on the new size. The std `ui--loop` re-reads size the same way.
+;; `*w*`/`*h*` — the torus `step` wraps on — are the window's BOARD area in board-cells:
+;; the screen grid (less the bottom *status-scale* bar rows) divided by *board-zoom*, since
+;; each board cell is drawn z×z. FLOORED at *grid-min*² so a tiny window or deep zoom can't
+;; collapse the torus. Shrinking clips off-board cells (bitboard/refit). Globals are
+;; image-wide, so the next `step` wraps on the new size.
 (defn grid-fit (w)
-  "Re-fit the sim torus to window `w` and return the visible board viewport `[vcols vrows]`
-for `render` to clip to (the board is the window less the bottom `*status-scale*`-row bar)."
+  "Re-fit the sim torus to window `w`: set `*w*`/`*h*` to the board area (window cells, less
+the bar, divided by *board-zoom*). Returns `[cols rows]` (the raw screen grid)."
   (let ([cols rows] (gui-size w)
+        z *board-zoom*
         vrows (max 1 (- rows *status-scale*)))
     (do
-      (def *w* (max *grid-min* cols))
-      (def *h* (max *grid-min* vrows))
-      [cols vrows])))
-
-(defn apply-zoom! (w h)
-  "Set the board font to `h` px AND re-derive *status-scale* so the bottom bar keeps a
-fixed ≈*footer-px* pixel height — only the BOARD scales with zoom, the footer doesn't.
-Re-applies the font to window `w`; the next `grid-fit` refits the torus to the new grid."
-  (do
-    (def *board-height* h)
-    (def *status-scale* (max 1 (quot (+ *footer-px* (quot h 2)) h)))  ; rounded *footer-px*/h
-    (gui-font! w {:family :mono :height h})))
+      (def *w* (max *grid-min* (quot cols z)))
+      (def *h* (max *grid-min* (quot vrows z)))
+      [cols rows])))
 
 (defn zoom (w dir)
-  "Step the board font size by `dir` px (+ zooms IN: bigger cells, fewer of them; − zooms
-out), clamped to [*zoom-min*, *zoom-max*]. The next `grid-fit` re-reads the cell grid and
-refits the torus, clipping any cells now off-board; the footer keeps its pixel height."
-  (apply-zoom! w (max *zoom-min* (min *zoom-max* (+ *board-height* dir)))))
+  "Step the board magnification by `dir` (+ zooms IN: bigger cells, fewer of them), clamped
+to [*zoom-min*, *zoom-max*]. Only the BOARD scales — the window font/grid and the status bar
+are untouched (seamless). The next `grid-fit` refits the torus, clipping any cells off-board."
+  (def *board-zoom* (max *zoom-min* (min *zoom-max* (+ *board-zoom* dir)))))
 
 ;; ---- PURE control math (no globals, no I/O): given a value, return the next one --------
 (defn fps-nudge (cap d)
@@ -417,9 +416,9 @@ in-between value from a drag rounds down to the next lower preset)."
 
 ;; ---- input → [ui' redraw?], sending the SIM throttled control messages -----------------
 (defn in-footer? (row)
-  "Is screen `row` in the bottom status bar? `*h*` is the board's row count, so the footer
-is everything from there down."
-  (>= row *h*))
+  "Is screen `row` in the bottom status bar? The board is `*h*` cells tall, each drawn z
+high, so the bar begins at screen row `*h*×*board-zoom*`."
+  (>= row (* *h* *board-zoom*)))
 
 (defn in-range? (x [a b])
   "Is cell `x` inside the `[start end)` cell range?"
@@ -467,9 +466,13 @@ is on the board and draws via the sim (left = shapes, right = guns)."
     (= action :release) (footer-release sim ui)
     (= (get ui :drag) :fps) (if (= action :drag) (fps-drag sim ui col) [ui false])
     (in-footer? row) (if (= action :press) (footer-press sim ui col) [ui false])
+    ;; on the board: map the screen cell to a BOARD cell (÷ *board-zoom*, since each board
+    ;; cell is drawn that many screen cells wide/high) before forwarding it to the sim.
     :else (do
             (send sim
-              [(if (= action :press) :press :drag) (if (= button :right) :gun :shape) col row])
+              [(if (= action :press) :press :drag) (if (= button :right) :gun :shape)
+                (quot col *board-zoom*)
+                (quot row *board-zoom*)])
             [ui false])))
 
 (defn on-key (sim m ui)
@@ -488,11 +491,11 @@ interval. Like the buttons, this updates the LOCAL copy and messages the sim."
 
 (defn run-life ()
   "Wire up and run the three actors. This root process becomes the RENDERER (it owns the
-window); the board window's font is set via `apply-zoom!` (which also fixes the footer
-height). We `grid-fit` once to size `*w*`/`*h*`, start with an EMPTY board (click to drop
-shapes), then spawn stats + sim and hand them this process's pid so they push in."
+window). The window cell font is set ONCE to *board-height* and never changes — zoom is the
+per-op `:scale` of *board-zoom*, so the bar never reflows. We `grid-fit` once to size
+`*w*`/`*h*`, start EMPTY (click to drop shapes), then spawn stats + sim."
   (let (w (gui-open "Brood Life")  ; the OS title-bar text (gui-title! could change it later)
-        _ (apply-zoom! w *board-height*)  ; board font + derived footer scale, board window ONLY
+        _ (gui-font! w {:family :mono :height *board-height*})  ; the FIXED window font (board only)
         _ (grid-fit w)  ; sizes *w*/*h* before we build the board
         start (now-ns)
         board (bitboard/make *w* *h*)  ; START EMPTY — clicks add random shapes
