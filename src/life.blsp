@@ -55,6 +55,14 @@ default (fast — instant drawing); the footer stays a fixed height while only t
 ;; rolling past *inject-max* back to never) and `]` (more often; from never it switches on).
 (def *inject-secs* 0)  ; seconds between random auto-injects (0 = never)
 (def *inject-max* 30)
+;; The bottom bar carries two clickable BUTTONS at fixed char columns (drawn at the front
+;; of the status string, hit-tested by `col / *status-scale*`): a SPAWN toggle and an FPS
+;; control you drag left/right. *drag* is the transient pointer state (renderer-process
+;; only): :fps while the fps control is held, *drag-col* the last pointer column.
+(def *btn-spawn* [0 11])  ; char range [start end) of the `[spawn …]` button
+(def *btn-fps* [12 21])  ; char range of the `[fps …]` button (drag to change)
+(def *drag* nil)
+(def *drag-col* 0)
 (def *status-every* 10)  ; stats push the bar every N gens (~3 Hz at 30 fps) — readable, not a blur
 (def *log-every* 30)  ; stats write a perf line to life.log every N gens (~1 Hz at 30 fps)
 (def *log-path* "life.log")  ; where the perf log is written (cwd; truncated each run)
@@ -97,40 +105,47 @@ bitboard `live`, threading the PRNG `s`; returns `[live' s']`."
         [y s3] (rand-int s2 (get live :h)))
     [(bitboard/place live pat x y) s3]))
 
+;; The two CLICKABLE buttons that lead the bar, each a FIXED-WIDTH label (so its char
+;; columns — and thus its hit region, `*btn-spawn*`/`*btn-fps*` — stay put as the numbers
+;; change). `spawn-label` is 11 chars (`[spawn ` + 3 + `]`), `fps-label` 9 (`[fps ` + 3 +
+;; `]`); the `pad-left` keeps the value column fixed. They read the same globals the keys do.
+(defn spawn-label ()
+  (str "[spawn " (if (> *inject-secs* 0) (str (pad-left (str *inject-secs*) 2) "s") "off") "]"))
+
+(defn fps-label ()
+  (str "[fps " (pad-left (if (> *target-fps* 0) (str *target-fps*) "max") 3) "]"))
+
 ;; The space before each unit and the ` · ` between fields keep the digits from running
-;; together, so the line reads at a glance: `gen 5 · 22/30 fps · 30 cells · spawn off · 12 MB`.
-;; The `cap`/`spawn` fields echo the live controls (`-`/`=` fps, `[`/`]` spawn) so the
-;; current settings are always visible. (No GC field: `gc-stats` is dev-only.)
+;; together, so the line reads at a glance. The leading `[spawn …] [fps …]` are the buttons
+;; (state shown there, not repeated in the fields). (No GC field: `gc-stats` is dev-only.)
 (defn status (gen cells per spikes)
-  "The live status line for the bottom strip — spelled-out, gapped fields from one
-generation's measurement (`per` = nanoseconds since the previous frame), plus the current
-fps cap and auto-spawn interval (read from the globals the keys adjust)."
-  (str "gen "
+  "The live status line for the bottom strip: the two clickable buttons, then spelled-out,
+gapped fields from one generation's measurement (`per` = nanoseconds since the previous
+frame). The button labels read the live globals the keys/clicks adjust."
+  (str (spawn-label)
+    " "
+    (fps-label)
+    "  gen "
     gen
     " · "
     (quot 1000 (max 1 (quot per 1000000)))
-    " fps"
-    (if (> *target-fps* 0) (str " (cap " *target-fps* ")") " (uncapped)")
-    " · "
+    " fps · "
     cells
-    " cells"
-    " · "
+    " cells · "
     spikes
-    " spikes"
-    " · spawn "
-    (if (> *inject-secs* 0) (str *inject-secs* "s") "off")
-    " · "
+    " spikes · "
     (quot (mem-bytes) 1048576)
     " MB"))
 
-;; `*status-face*` fills the whole `vcols`-wide line with the text centred and drawn at
-;; the FIXED `*status-scale*` via the GUI Face's per-op `:scale` (ADR-079), so the bar is
-;; always `*status-scale*` rows tall and the glyphs never resize (no auto-fit — a status
-;; too long for the window is truncated by `bar`, not shrunk). The terminal frontend
-;; ignores `:scale`/`:bg` and renders it 1×.
+;; `*status-face*` fills the whole `vcols`-wide line with the text drawn at the FIXED
+;; `*status-scale*` via the GUI Face's per-op `:scale` (ADR-079), so the bar is always
+;; `*status-scale*` rows tall and the glyphs never resize. LEFT-aligned (not centred) so the
+;; leading buttons sit at fixed char columns 0… — that's what makes `col / *status-scale*`
+;; hit-test them. A status too long for the window is truncated by `bar`, not shrunk; the
+;; terminal frontend ignores `:scale`/`:bg` and renders it 1×.
 (defn status-bar (status top vcols)
   "Render `status` as a full-width buffer bar (std `display/bar`) topped at screen row `top`."
-  (bar top vcols status {:face *status-face* :align :center :scale *status-scale*}))
+  (bar top vcols status {:face *status-face* :align :left :scale *status-scale*}))
 
 ;; The leading `clear` wipes the previous frame, so we paint only what's lit. An earlier
 ;; single-pane version scanned the whole grid and built a full-width string per row every
@@ -294,31 +309,11 @@ in this SAME mailbox, so a quit signal stops the sim + stats and closes the wind
                            (do
                              (gui-draw w (render live status vcols vrows))
                              (render-loop w sim stats live status))))
-    ;; Left button draws SHAPES, right button draws GUNS. A PRESS draws once and arms the
-    ;; key-repeat; a DRAG draws at each cell crossed without re-arming, so dragging is
-    ;; freehand drawing; release (either button) stops the auto-repeat. The scroll wheel
-    ;; zooms the board font. Cells forward as (col=x, row=y); other events fall through.
-    ([:mouse :press :left row col mods] (do
-                                          (send sim [:press :shape col row])
-                                          (render-loop w sim stats live status)))
-    ([:mouse :drag :left row col mods] (do
-                                         (send sim [:drag :shape col row])
-                                         (render-loop w sim stats live status)))
-    ([:mouse :press :right row col mods] (do
-                                           (send sim [:press :gun col row])
+    ;; All mouse input goes through one dispatcher (`on-mouse`), so the board/footer split
+    ;; is decided in a single place rather than re-checked (and negated) per clause.
+    ([:mouse action button row col mods] (do
+                                           (on-mouse sim w action button row col)
                                            (render-loop w sim stats live status)))
-    ([:mouse :drag :right row col mods] (do
-                                          (send sim [:drag :gun col row])
-                                          (render-loop w sim stats live status)))
-    ([:mouse :release _ row col mods] (do
-                                        (send sim [:release])
-                                        (render-loop w sim stats live status)))
-    ([:mouse :scroll-up _ row col mods] (do
-                                          (zoom w *zoom-step*)
-                                          (render-loop w sim stats live status)))
-    ([:mouse :scroll-down _ row col mods] (do
-                                            (zoom w (- 0 *zoom-step*))
-                                            (render-loop w sim stats live status)))
     ;; Keyboard knobs (keys arrive as 1-char strings): `-`/`=` slower/faster fps cap,
     ;; `[`/`]` rarer/more-often auto-spawn. They `def` the globals the sim + status read,
     ;; then the loop continues; anything else that isn't a quit signal is ignored.
@@ -386,6 +381,55 @@ it switches on at a sensible 5 s). Behind the `[`/`]` keys."
     (if (> dir 0)
       (if (>= *inject-secs* *inject-max*) 0 (+ *inject-secs* 1))
       (if (= *inject-secs* 0) 5 (max 1 (- *inject-secs* 1))))))
+
+(defn toggle-inject ()
+  "Flip auto-spawn off↔on (on resumes at a sensible 5 s). The `[spawn …]` button."
+  (def *inject-secs* (if (> *inject-secs* 0) 0 5)))
+
+(defn adjust-fps (d)
+  "Nudge the fps cap by `d` (1 per pointer cell, from the fps-button drag). Uncapped acts as
+just past *fps-max*, so dragging left engages the cap at the top and dragging right past the
+top returns to uncapped (0); clamped to [*fps-min*, *fps-max*] otherwise."
+  (let (base (if (= *target-fps* 0) (+ *fps-max* 1) *target-fps*)
+        f (+ base d))
+    (def *target-fps* (if (> f *fps-max*) 0 (max *fps-min* f)))))
+
+(defn in-footer? (row)
+  "Is screen `row` in the bottom status bar (below the board)? `*h*` is the board's row
+count, so the footer is everything from there down."
+  (>= row *h*))
+
+(defn in-btn? (ci btn)
+  "Is char index `ci` inside button char-range `btn` = `[start end)`?"
+  (let ([a b] btn) (and (>= ci a) (< ci b))))
+
+(defn footer-press (col)
+  "A press in the footer: hit-test the char column (`col / *status-scale*`) against the
+buttons. Spawn toggles; the fps button starts a drag (tracked in *drag*/*drag-col*)."
+  (let (ci (quot col *status-scale*))
+    (if (in-btn? ci *btn-spawn*)
+      (toggle-inject)
+      (if (in-btn? ci *btn-fps*)
+        (do (def *drag* :fps) (def *drag-col* col))
+        nil))))
+
+(defn footer-drag (col)
+  "Continue an fps drag: change the cap by the horizontal cells moved since the last event."
+  (do (adjust-fps (- col *drag-col*)) (def *drag-col* col)))
+
+(defn on-mouse (sim w action button row col)
+  "Route one mouse event — the ONE place the footer/board split lives. Scroll zooms;
+release ends any fps drag; an in-progress fps drag scrubs the cap; a press/drag in the
+footer hits the bar's buttons; everything else is on the board and draws via the sim
+(left = shapes, right = guns). `col`/`row` are the cell, forwarded as (x, y)."
+  (cond
+    (= action :scroll-up) (zoom w *zoom-step*)
+    (= action :scroll-down) (zoom w (- 0 *zoom-step*))
+    (= action :release) (do (def *drag* nil) (send sim [:release]))
+    (= *drag* :fps) (when (= action :drag) (footer-drag col))
+    (in-footer? row) (when (= action :press) (footer-press col))
+    :else (send sim
+            [(if (= action :press) :press :drag) (if (= button :right) :gun :shape) col row])))
 
 (defn run-life ()
   "Wire up and run the three actors. This root process becomes the RENDERER (it owns the
