@@ -57,17 +57,13 @@ default (fast — instant drawing); the footer stays a fixed height while only t
 (def *inject-max* 30)
 ;; The bottom bar leads with two clickable BUTTONS — a SPAWN toggle and an FPS control
 ;; (click cycles a preset, drag scrubs). They're light raised KEYS overlaid on the reverse
-;; bar with MARGINS around them (so the bar shows between/around, not covered edge-to-edge)
-;; and a 1-cell drop-SHADOW on the right for a beveled feel; hit-tested by `col /
-;; *status-scale*`. Layout in chars: [0]=margin [1..12)=spawn [12]=shadow [13]=gap
-;; [14..23)=fps [23]=shadow [24]=gap [25…]=info. The RENDERER owns these values for the
-;; label (so feedback is instant, independent of the sim's frame rate) and forwards every
-;; change to the SIM as a message — throttled to *fps-throttle-ns* while dragging.
-(def *btn-spawn* [1 12])  ; char range [start end) of the spawn key (inset 1 from the left)
-(def *btn-fps* [14 23])  ; char range of the fps key (after spawn + its shadow + a gap)
-(def *btn-info* 25)  ; char where the info text starts — clear of both keys, shadows, gaps
+;; bar, drawn *btn-inset* scale-steps SMALLER than the bar — so the bar shows as a margin
+;; around AND a shelf below each key (spacing + a beveled, inset look). `footer-layout`
+;; computes their cell columns + scale ONCE, and both the renderer and the click hit-test
+;; use it. The RENDERER owns these values for instant labels and messages the SIM on every
+;; change (throttled to *fps-throttle-ns* while dragging).
+(def *btn-inset* 1)  ; how many scale-steps smaller the keys are than the bar (1 ⇒ a shelf below)
 (def *btn-face* {:bg :white :fg :black :bold true})  ; a light raised KEY on the reverse bar
-(def *btn-shadow* {:bg :dark-grey})  ; the 1-cell drop-shadow column to a key's right
 (def *fps-throttle-ns* 50000000)  ; ≥50 ms between [:set-fps] messages while dragging
 (def *status-every* 10)  ; stats push the bar every N gens (~3 Hz at 30 fps) — readable, not a blur
 (def *log-every* 30)  ; stats write a perf line to life.log every N gens (~1 Hz at 30 fps)
@@ -111,15 +107,36 @@ bitboard `live`, threading the PRNG `s`; returns `[live' s']`."
         [y s3] (rand-int s2 (get live :h)))
     [(bitboard/place live pat x y) s3]))
 
-;; The two CLICKABLE button labels — fixed width (11 + 9 chars) so their hit ranges
-;; (*btn-spawn*/*btn-fps*) stay put as the numbers change; `pad-left` holds the value column.
-;; They take the value to show (the renderer's LOCAL copy) rather than reading a global, so
-;; the renderer can repaint them the instant you click/drag, ahead of the sim.
+;; The two CLICKABLE button labels — fixed width (11 + 9 chars) so the layout/hit ranges
+;; stay put as the numbers change; `pad-left` holds the value column. They take the value to
+;; show (the renderer's LOCAL copy) rather than reading a global, so the renderer can repaint
+;; them the instant you click/drag, ahead of the sim.
 (defn spawn-label (inject)
   (str " spawn " (if (> inject 0) (str (pad-left (str inject) 2) "s") "off") " "))
 
 (defn fps-label (cap)
   (str " fps " (pad-left (if (> cap 0) (str cap) "max") 3) " "))
+
+;; The footer's CELL layout at the current scale, the single source of truth for both the
+;; renderer and the click hit-test. The keys are *btn-inset* steps smaller than the bar, so
+;; each char is `bs` cells; `m`-cell bar margins sit around/between them; `voff` drops the
+;; (shorter) key to sit in the bar with a shelf below; `info-char` is where the full-scale
+;; info text starts, clear of the keys (in bar-chars, ceil'd).
+(defn footer-layout ()
+  (let (bs (max 1 (- *status-scale* *btn-inset*))
+        m bs
+        sw (* (string-length (spawn-label 0)) bs)
+        fw (* (string-length (fps-label 0)) bs)
+        sx0 m
+        sx1 (+ sx0 sw)
+        fx0 (+ sx1 m m)
+        fx1 (+ fx0 fw)
+        infocell (+ fx1 m m))
+    {:bs bs
+     :voff (quot (- *status-scale* bs) 2)
+     :spawn [sx0 sx1]
+     :fps [fx0 fx1]
+     :info-char (quot (+ infocell (- *status-scale* 1)) *status-scale*)}))
 
 ;; The INFO half of the bar (gen / measured fps / cells / spikes / memory). The two buttons
 ;; are prepended by the renderer (`footer-ops`), not here — STATS only knows the
@@ -139,26 +156,24 @@ the previous frame). The renderer composes this after the buttons."
     (quot (mem-bytes) 1048576)
     " MB"))
 
-;; The bottom bar as render ops: a full-width background `bar` holding the INFO (shifted
-;; past the button columns so it can't underlap), then the two buttons OVERLAID in
-;; *btn-face* so they read as raised buttons. `top`/`vcols` come from the board being drawn
-;; (`render`), so the bar is always positioned consistently with the board — no resize jump.
+;; The bottom bar as render ops: a full-width reverse `bar` holding the INFO (shifted past
+;; the keys so it can't underlap), then the two SMALLER keys OVERLAID in *btn-face* at the
+;; cell columns `footer-layout` computes, dropped by `voff` so the bar shows as a shelf below
+;; them. `top`/`vcols` come from the board being drawn (`render`), so the bar is always
+;; positioned consistently with the board — no resize jump.
 (defn footer-ops (ui info top vcols)
-  (let (scale *status-scale*
-        [sa sb] *btn-spawn*  ; sa = key's first char, sb = the char just past it (its shadow)
-        [fa fb] *btn-fps*
-        face (assoc *btn-face* :scale scale)
-        shadow (assoc *btn-shadow* :scale scale)
-        ;; info is pushed past *btn-info* blank cols so it can't underlap the keys/shadows;
-        ;; those leading blanks (and the gaps the keys don't cover) show the reverse bar.
+  (let (l (footer-layout)
+        bs (get l :bs)
+        face (assoc *btn-face* :scale bs)
+        [sx0 _] (get l :spawn)
+        [fx0 _] (get l :fps)
+        brow (+ top (get l :voff))
         bg (bar top
              vcols
-             (str (string-repeat " " *btn-info*) info)
-             {:face *status-face* :align :left :scale scale}))
-    [bg [:text top (* sb scale) " " shadow]
-      [:text top (* fb scale) " " shadow]
-      [:text top (* sa scale) (spawn-label (get ui :inject)) face]
-      [:text top (* fa scale) (fps-label (get ui :cap)) face]]))
+             (str (string-repeat " " (get l :info-char)) info)
+             {:face *status-face* :align :left :scale *status-scale*}))
+    [bg [:text brow sx0 (spawn-label (get ui :inject)) face]
+      [:text brow fx0 (fps-label (get ui :cap)) face]]))
 
 ;; The leading `clear` wipes the previous frame, so we paint only what's lit. ALL geometry
 ;; comes from `live` itself (`:h`/`:w`), so the board and the bar below it are sized from
@@ -403,18 +418,19 @@ in-between value from a drag rounds down to the next lower preset)."
 is everything from there down."
   (>= row *h*))
 
-(defn in-btn? (ci btn)
-  "Is char index `ci` inside button char-range `btn` = `[start end)`?"
-  (let ([a b] btn) (and (>= ci a) (< ci b))))
+(defn in-range? (x [a b])
+  "Is cell `x` inside the `[start end)` cell range?"
+  (and (>= x a) (< x b)))
 
 (defn footer-press (sim ui col)
-  "A press in the footer: hit-test the char column (`col / *status-scale*`). Spawn toggles
-(send the sim the new interval); the fps button arms a drag (tracked in `ui`, no send yet)."
-  (let (ci (quot col *status-scale*))
+  "A press in the footer: hit-test the cell `col` against the keys' cell ranges (from
+`footer-layout`). Spawn toggles (send the sim the new interval); the fps key arms a drag
+(tracked in `ui`, no send yet)."
+  (let (l (footer-layout))
     (cond
-      (in-btn? ci *btn-spawn*) (let (j (inject-toggle (get ui :inject)))
-                                 (do (send sim [:set-inject j]) [(assoc ui :inject j) true]))
-      (in-btn? ci *btn-fps*) [(assoc ui :drag :fps :dcol col :moved false) true]
+      (in-range? col (get l :spawn)) (let (j (inject-toggle (get ui :inject)))
+                                       (do (send sim [:set-inject j]) [(assoc ui :inject j) true]))
+      (in-range? col (get l :fps)) [(assoc ui :drag :fps :dcol col :moved false) true]
       :else [ui false])))
 
 (defn fps-drag (sim ui col)
