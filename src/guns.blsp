@@ -3,7 +3,7 @@
 oscillators in life's `*shapes*`, emit a glider every period FOREVER, so dropping
 one onto a settled board re-energises it. Pure pattern GEOMETRY: cells as `[dx dy]`
 from a top-left origin, plus reflections. Torus placement (`*w*`/`*h*`, `shift`)
-and the stagnation logic that sows them stay in `life` (life/inject-shooter).")
+and the schedule that sows them stay in `life` (life/inject-pattern).")
 
 ;; The Gosper glider gun (36×9, period 30), as `[dx dy]` cells from its top-left
 ;; origin — the base pattern every shooter is built from.
@@ -44,13 +44,16 @@ and the stagnation logic that sows them stay in `life` (life/inject-shooter).")
     [35 2]
     [35 3]])
 
-;; `pat` mirrored across its own vertical / horizontal mid-line. A reflection of a gun
-;; is itself a valid gun (Life's rules are reflection-symmetric), so the one Gosper
-;; definition yields more shooters — firing along different diagonals — for free.
+;; A reflection of a gun is itself a valid gun (Life's rules are reflection-symmetric),
+;; so the one Gosper definition yields more shooters — firing along different diagonals
+;; — for free.
 (defn flip-x (pat)
+  "`pat` mirrored across its own vertical mid-line."
   (let (mx (apply max (map (fn ([x y]) x) pat)))
     (map (fn ([x y]) [(- mx x) y]) pat)))
+
 (defn flip-y (pat)
+  "`pat` mirrored across its own horizontal mid-line."
   (let (my (apply max (map (fn ([x y]) y) pat)))
     (map (fn ([x y]) [x (- my y)]) pat)))
 

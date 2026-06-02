@@ -1,7 +1,20 @@
-# foobar — guidance for Claude
+# life — guidance for Claude
 
-This is a Brood (`.blsp`) project scaffolded by `nest new`. Replace this stub
-with project-specific guidance — commands, conventions, gotchas.
+Conway's Game of Life on a wrapping torus, animated in a native GUI window.
+Written in Brood (`.blsp`). The architecture is three processes (ADR-058): a
+**SIM** (model + clock), a **STATS** formatter/logger, and the **RENDERER** (the
+root process, which owns the window and composites). The sim steps the board
+serially. See `README.md` for the design notes and `src/` layout.
+
+Conventions worth knowing here:
+
+- The sim core is **pure** (`step`, `seed`, `shift`, `inject-pattern`) and is what
+  the test suite covers; the frame loop owns a GUI window, so exercise it with
+  `nest run --for <ms>`, not `nest test`.
+- Pattern **geometry** lives in `shapes`/`guns`; torus **placement** (the
+  `*w*`/`*h*` globals and `shift`) stays in `life`.
+- `*foo*` globals (board size, pacing, schedule) are the tuning knobs — each is
+  documented inline at the top of `src/life.blsp`.
 
 ## Running
 
@@ -31,7 +44,7 @@ find what exists instead of guessing names.
 
 ## MCP integration
 
-`.mcp.json` points Claude Code at this project's `nest mcp` server, so `cd foobar && claude`
+`.mcp.json` points Claude Code at this project's `nest mcp` server, so `cd life && claude`
 auto-attaches an agent that can `eval`, `load`, `lookup`, `macroexpand`, `format`,
 and discover the image with `apropos` / `all-globals` / `doc-search`, against the
 live image (ADR-036, `docs/mcp.md` upstream).

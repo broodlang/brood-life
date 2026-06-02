@@ -6,12 +6,11 @@ animated in a native GUI window (the board is fit to the window at startup)."
 (require 'shapes)  ; still-life / oscillator / spaceship patterns (*shapes*)
 (require 'guns)  ; glider-gun patterns (*shooters*) — both sown by inject-pattern
 (require 'perflog)  ; tiny file logger — the stats process writes a perf line to life.log
-(require 'observer)  ; std process observer — the `o` key opens it in its own window
 
 (def *w* 120)
 (def *h* 40)
-(def *target-fps* 30)  ; generations/frames per second the loop paces to (capped here)
-(def *frame-ns* (quot 1000000000 *target-fps*))  ; per-frame period in ns (≈16.7ms at 60)
+(def *target-fps* 30)  ; generations/frames per second the loop paces to
+(def *frame-ns* (quot 1000000000 *target-fps*))  ; per-frame period in ns (≈33ms at 30)
 (def *board-height* 5)  ; the board window's OWN cell font px (per-window) — small ⇒ dense board
 ;; FIXED bottom-bar font scale: the status text is always drawn this many board-cells
 ;; tall (≈*board-height*×*status-scale* px), never auto-fitted to the content/width —
@@ -22,13 +21,10 @@ animated in a native GUI window (the board is fit to the window at startup)."
 (def *status-face* {:bg :blue :fg :white :bold true})  ; the bottom buffer-bar style (display/bar)
 (def *grid-min* 5)  ; the sim torus never shrinks below *grid-min* x *grid-min*
 (def *seed-fill* 100)  ; ~1 starting shape per this many torus cells — LOWER ⇒ denser seed,
-; so the board ramps to a busy state (and useful perf numbers) faster (was 400)
+; so the board ramps to a busy state (and useful perf numbers) faster
 (def *inject-fast* 20)  ; constant-ish board: gens until the next pattern (quick revive)
 (def *inject-slow* 90)  ; lively board: gens until the next pattern (occasional variety)
 (def *stale-tol* 8)  ; population drift at/below max(this, 5%) over the interval ⇒ flat
-(def *par-workers* 8)  ; row-bands to fan `step` across when the board is big (≤ nproc)
-(def *par-threshold* 300)  ; below this many live cells, serial step beats the fan-out overhead
-; (raise if the fan-out costs more than it saves on a small board)
 (def *status-every* 10)  ; stats push the bar every N gens (~3 Hz at 30 fps) — readable, not a blur
 (def *log-every* 30)  ; stats write a perf line to life.log every N gens (~1 Hz at 30 fps)
 (def *log-path* "life.log")  ; where the perf log is written (cwd; truncated each run)
@@ -40,29 +36,30 @@ animated in a native GUI window (the board is fit to the window at startup)."
 ;; lands often enough to keep re-energising a settling board.
 (def *patterns* (concat *shapes* *shooters*))
 
-;; `pat` (a list of `[dx dy]`) shifted to origin `[x y]` and wrapped on the torus.
 (defn shift (pat x y)
+  "`pat` (a list of `[dx dy]`) shifted to origin `[x y]` and wrapped on the torus."
   (map (fn ([dx dy]) [(mod (+ x dx) *w*) (mod (+ y dy) *h*)]) pat))
 
-(defn neighbours ([x y]) (shift *offsets* x y))
+(defn neighbours (cell)
+  "The 8 torus-wrapped neighbours of cell `[x y]`."
+  (let ([x y] cell) (shift *offsets* x y)))
 
-;; Tally one live cell's contribution to the neighbour-count map `a`: +1 at key `k`.
-(defn step--bump (a k) (assoc a k (+ 1 (get a k 0))))
+(defn step--bump (a k)
+  "Tally one live cell's contribution to neighbour-count map `a`: `+1` at key `k`."
+  (assoc a k (+ 1 (get a k 0))))
 
-;; Advance one generation; the board is a map keyed by live `[x y]` cells. We tally
-;; each live cell's 8 neighbours straight into a count map, then keep the cells with 3
-;; (birth) or 2-while-already-live (survival). NOT `(frequencies (mapcat neighbours …))`
-;; — materialising the 8N-element list and the per-cell `map` closure benchmarked ~1.4×
-;; slower than counting in place.
-;;
-;; Hot path (this is ~all the sim's CPU, parallelised by `pstep`): for each live cell we
-;; precompute its FOUR wrapped neighbour coordinates once — `xl`/`xr`/`yu`/`yd` — then
-;; bump the 8 neighbours UNROLLED. That's 4 `mod`s per cell instead of 16 (each of the 8
-;; neighbours sharing the precomputed columns/rows) and no inner `reduce`/lambda/
-;; destructure per offset — measured ~1.7× faster than folding over `*offsets*`. (`mod`
-;; beat a hand-rolled compare-and-wrap; inlining `step--bump` was slower — the extra
-;; `let` bindings cost more than the calls they save.)
+;; Hot path — this is ~all the sim's CPU. For each live cell we precompute its FOUR
+;; wrapped neighbour coordinates once (`xl`/`xr`/`yu`/`yd`), then bump the 8 neighbours
+;; UNROLLED: 4 `mod`s per cell instead of 16 (the 8 neighbours share the precomputed
+;; columns/rows) and no inner `reduce`/lambda/destructure per offset — measured ~1.7×
+;; faster than folding over `*offsets*`. (`mod` beat a hand-rolled compare-and-wrap;
+;; inlining `step--bump` was slower — the extra `let` bindings cost more than the calls
+;; they save.) NOT `(frequencies (mapcat neighbours …))` — materialising the 8N-element
+;; list and the per-cell `map` closure benchmarked ~1.4× slower than counting in place.
 (defn step (live)
+  "Advance one generation. `live` is a map keyed by live `[x y]` cells; returns the next
+generation in the same shape. We tally each live cell's 8 neighbours straight into a
+count map, then keep the cells with 3 (birth) or 2-while-already-live (survival)."
   (into {}
     (filter (fn ([c n]) (or (= n 3) (and (= n 2) (contains? live c))))
       (reduce (fn (acc cell)
@@ -82,74 +79,9 @@ animated in a native GUI window (the board is fit to the window at startup)."
         {}
         (keys live)))))
 
-;; ---- parallel step (fan `step` across cores, ADR-058) -----------------------
-;; `step` is embarrassingly parallel: split the torus into `*par-workers*` horizontal
-;; ROW-bands, step each band on its own green process, and stitch the results. The
-;; serial worker used one core no matter how big the board got; this uses many. This
-;; is the live sim's stepper — the board is kept LIVELY by the shooters, so most cells
-;; are active most of the time and a full parallel recompute beats trying to skip
-;; "stable" cells (there are rarely many).
-
-;; Split `live` into `k` row-band sub-boards (`bh` = rows per band), returned as a map
-;; band-index → sub-board. Each cell lands in its own band AND in the 1-row halo of any
-;; band it borders (with torus wrap via `mod k`), so every band carries all the
-;; neighbours it needs to step its OWN rows. (Accumulate into a MAP keyed by band index
-;; — brood's `assoc` is map-only, there is no vector index-assoc.)
-(defn band-add (acc p cell) (assoc acc p (assoc (get acc p) cell true)))
-(defn band-parts (live k bh)
-  (reduce (fn (acc cell)
-            (let ([x y] cell
-                  b (min (- k 1) (quot y bh))
-                  lo (* b bh)
-                  hi (min *h* (* (+ b 1) bh))
-                  a1 (band-add acc b cell)
-                  a2 (if (= y lo) (band-add a1 (mod (- b 1) k) cell) a1))
-              (if (= y (- hi 1)) (band-add a2 (mod (+ b 1) k) cell) a2)))
-    (into {} (map (fn (i) [i {}]) (range k)))
-    (keys live)))
-
-;; Step a halo'd sub-board but KEEP only cells in the band's owned rows `[lo, hi)`:
-;; their neighbour counts are exact (the halo supplies every adjacent row), while
-;; halo-row outputs would be wrong, so they're dropped (the neighbouring band owns
-;; those and computes them correctly).
-(defn band-step (sub lo hi)
-  (into {} (filter (fn (kv) (let ([[x y] _] kv) (and (>= y lo) (< y hi)))) (step sub))))
-
-;; Receive `k` band results and merge them — disjoint by row, so a plain `into`.
-(defn collect-bands (k acc)
-  (if (= k 0)
-    acc
-    (receive ([:band-done m] (collect-bands (- k 1) (into acc m))))))
-
-;; A PERSISTENT band-worker process: steps whatever halo'd sub-board it's handed for
-;; rows `[lo, hi)` and replies, then loops. Spawned once into a pool (band-pool) and
-;; reused every generation — so we pay the process spawn ONCE, not per frame, and the
-;; workers stay live. `:stop` ends it.
-(defn band-worker ()
-  (receive (:stop nil)
-    ([:band sub lo hi reply] (do (send reply [:band-done (band-step sub lo hi)]) (band-worker)))))
-
-;; Spawn a pool of `k` persistent band-workers; returns a vector of their pids.
-(defn band-pool (k) (into [] (map (fn (_) (spawn (band-worker))) (range k))))
-
-;; Parallel `step`: equal to `(step live)` but fanned across the `pool` of band-worker
-;; processes — for boards past `*par-threshold*` (small boards step serially: the
-;; per-band copy overhead isn't worth it; an empty/absent pool also steps serially).
-;; Each worker gets its band + owned rows and sends its slice back to `me`; we merge.
-(defn pstep (live &optional (pool nil))
-  (let (k (count (or pool [])))
-    (if (or (= k 0) (< (count live) *par-threshold*))
-      (step live)
-      (let (bh (max 1 (quot (+ *h* k -1) k))
-            subs (band-parts live k bh)
-            me (self))
-        (do
-          (dotimes (b k)
-            (send (nth pool b) [:band (get subs b) (* b bh) (min *h* (* (+ b 1) bh)) me]))
-          (collect-bands k {}))))))
-
-;; Sow `n` random shapes at random positions, threading the PRNG `s`.
 (defn seed--sow (n s acc)
+  "Sow `n` random shapes at random positions, threading the PRNG `s`; returns the
+accumulated `[x y]` cells in `acc`."
   (if (= n 0)
     acc
     (let ([shape s1] (sample s *shapes*)
@@ -157,27 +89,28 @@ animated in a native GUI window (the board is fit to the window at startup)."
           [y s3] (rand-int s2 *h*))
       (seed--sow (- n 1) s3 (concat acc (shift shape x y))))))
 
-;; A random board: known shapes scattered across the torus, count scaled to area.
 (defn seed (s)
+  "A random board: known shapes scattered across the torus, count scaled to area."
   (into {} (map (fn (c) [c true]) (seed--sow (max 4 (quot (* *w* *h*) *seed-fill*)) s []))))
 
-;; Sow a random KNOWN PATTERN — any of `*shapes*` (still-lifes/oscillators/spaceships)
-;; or `*shooters*` (glider guns) — at a random torus position onto board `live`,
-;; threading the PRNG `s`; returns `[live' s']`. The sim calls it on a schedule both
+;; Pattern GEOMETRY lives in the `shapes` / `guns` modules; placement is `life`'s job
+;; (it needs the torus `*w*`/`*h*` and `shift`). The sim calls this on a schedule both
 ;; for visual variety and to revive a stagnant board (a gun lands eventually and
-;; re-energises it). Pattern GEOMETRY lives in the `shapes` / `guns` modules; placement
-;; is `life`'s job (it needs the torus `*w*`/`*h*` and `shift`).
+;; re-energises it).
 (defn inject-pattern (live s)
+  "Sow a random known pattern — any of `*patterns*` — at a random torus position onto
+board `live`, threading the PRNG `s`; returns `[live' s']`."
   (let ([pat s1] (sample s *patterns*)
         [x s2] (rand-int s1 *w*)
         [y s3] (rand-int s2 *h*))
     [(into live (map (fn (c) [c true]) (shift pat x y))) s3]))
 
-;; The live status line for the bottom strip — spelled-out labels with a gap between
-;; fields so it reads at a glance: `gen 5 · 22 fps · 30 cells · 0 spikes · 12 MB`. The
-;; space before each unit and the ` · ` between fields keep the digits from running
-;; together. (No GC field: `gc-stats` is a dev-only builtin, absent from `nest release`.)
+;; The space before each unit and the ` · ` between fields keep the digits from running
+;; together, so the line reads at a glance: `gen 5 · 22 fps · 30 cells · 0 spikes · 12 MB`.
+;; (No GC field: `gc-stats` is a dev-only builtin, absent from `nest release`.)
 (defn status (gen cells per spikes)
+  "The live status line for the bottom strip — spelled-out, gapped fields from one
+generation's measurement (`per` = nanoseconds since the previous frame)."
   (str "gen "
     gen
     " · "
@@ -193,41 +126,36 @@ animated in a native GUI window (the board is fit to the window at startup)."
     (quot (mem-bytes) 1048576)
     " MB"))
 
-;; Render `status` as a full-width buffer bar (std `display/bar`) topped at screen row
-;; `top` — `*status-face*` fills the whole `vcols`-wide line with the text centred and
-;; drawn at the FIXED `*status-scale*` via the GUI Face's per-op `:scale` (ADR-079), so
-;; the bar is always `*status-scale*` rows tall and the glyphs never resize (no
-;; auto-fit — a status too long for the window is truncated by `bar`, not shrunk). The
-;; terminal frontend ignores `:scale`/`:bg` and renders it 1×.
+;; `*status-face*` fills the whole `vcols`-wide line with the text centred and drawn at
+;; the FIXED `*status-scale*` via the GUI Face's per-op `:scale` (ADR-079), so the bar is
+;; always `*status-scale*` rows tall and the glyphs never resize (no auto-fit — a status
+;; too long for the window is truncated by `bar`, not shrunk). The terminal frontend
+;; ignores `:scale`/`:bg` and renders it 1×.
 (defn status-bar (status top vcols)
+  "Render `status` as a full-width buffer bar (std `display/bar`) topped at screen row `top`."
   (bar top vcols status {:face *status-face* :align :center :scale *status-scale*}))
 
-;; A display frame, the window split into two stacked "buffers":
-;;   • TOP — the GOL board, ONE `text` op per *live* cell (sparse: tens of ops,
-;;     not *w*×*h*), clipped to the board viewport `vcols`×`vrows`. Cells beyond it
-;;     — e.g. the torus floored at *grid-min* while the window is tinier — stay
-;;     alive in memory, just not drawn this frame.
-;;   • BOTTOM — a full-width status BAR across rows `vrows`… (its filled background
-;;     is the separator — no rule needed), drawn *status-scale*× larger (status-bar).
-;; The leading `clear` wipes the previous frame, so we paint only what's lit. The
-;; old single-pane version scanned the whole grid and built a full-width string per
-;; row every frame — O(area), ~30x slower and the reason the frame rate was pinned
-;; regardless of the pacing target.
+;; The leading `clear` wipes the previous frame, so we paint only what's lit. An earlier
+;; single-pane version scanned the whole grid and built a full-width string per row every
+;; frame — O(area), ~30× slower and the reason the frame rate was pinned regardless of
+;; the pacing target.
 (defn render (live status vcols vrows)
+  "A display frame: the board as ONE `text` op per live cell (sparse, clipped to the
+`vcols`×`vrows` viewport), with a full-width status bar across the bottom rows."
   (apply frame
     (clear)
     (concat (map (fn ([x y]) (text y x "▪"))
               (filter (fn ([x y]) (and (< x vcols) (< y vrows))) (keys live)))
       [(status-bar status vrows vcols)])))
 
-;; ---- the actors: SIM (model + clock) → STATS → RENDERER (compositor) ------------
-;; `life--loop` used to do all three jobs; now each source is its own process that
-;; PUSHES updates to a thin renderer (ADR-058 concurrency).
+;; ---- the actors: SIM (model + clock) → STATS → RENDERER (compositor) -------------
+;; Each source is its own process that PUSHES updates to a thin renderer (ADR-058
+;; concurrency); the renderer owns the window and composites.
 
-;; A compact, tab-separated perf line for the debug log (one column per field, so it
-;; greps/plots cleanly). `cells` and `fps` are the headline; `ms`/gen, `spikes` and `mb`
-;; round it out so a frame-rate dip can be tied to rising population or memory churn.
 (defn log-fmt (gen cells per spikes)
+  "A compact, tab-separated perf line for the debug log — one column per field, so it
+greps/plots cleanly (`cells` and `fps` are the headline; `ms`/gen, `spikes` and `mb`
+tie a frame-rate dip to rising population or memory churn)."
   (str "gen "
     gen
     "\tcells "
@@ -241,13 +169,12 @@ animated in a native GUI window (the board is fit to the window at startup)."
     "\tmb "
     (quot (mem-bytes) 1048576)))
 
-;; STATS: formats the status line OFF the hot paths and at its OWN cadence — it sees
-;; every generation's raw `[:meas …]` but only re-renders + pushes `[:status …]` every
-;; *status-every* gens (so the readout updates a few times a second, legibly, instead
-;; of blurring at 60 Hz) and writes a perf line to the `logger` every *log-every* gens.
-;; The `mem-bytes` call and the file write stay off the sim/render threads.
-;; `:stop` ends it and stops the logger (flushing nothing — the buffer is already on disk).
+;; The `mem-bytes` call and the file write stay off the sim/render threads. `:stop` ends
+;; it and stops the logger (flushing nothing — the buffer is already on disk).
 (defn stats-loop (renderer logger)
+  "STATS: formats the status line OFF the hot paths and at its OWN cadence — it sees
+every generation's `[:meas …]` but only pushes `[:status …]` every `*status-every*` gens
+and writes a perf line to the `logger` every `*log-every*` gens."
   (receive (:stop (perflog/log-stop logger))
     ([:meas gen cells per spikes] (do
                                     (when (= 0 (mod gen *status-every*))
@@ -256,102 +183,76 @@ animated in a native GUI window (the board is fit to the window at startup)."
                                       (perflog/log-line logger (log-fmt gen cells per spikes)))
                                     (stats-loop renderer logger)))))
 
-;; SIM pacing: after emitting a board, wait for the renderer's `[:drawn]` ack — so the
-;; sim never runs more than one frame ahead of it (bounds the mailbox) — then out the
-;; rest of the frame budget to `deadline`, staying responsive to `:stop`. → :go | :stop.
 (defn sim-pace (deadline)
+  "SIM pacing: wait for the renderer's `[:drawn]` ack — so the sim never runs more than
+one frame ahead of it (bounds the mailbox) — then sleep out the rest of the frame budget
+to `deadline`, staying responsive to `:stop`. Returns `:go` or `:stop`."
   (receive (:stop :stop)
     ([:drawn] (let (left (quot (- deadline (now-ns)) 1000000))
                 (if (> left 0) (receive (:stop :stop) (after left :go)) :go)))))
 
-;; SIM: the model + the clock. Owns the band-worker `pool`. Each frame it pushes the
-;; current board to the renderer and a raw measurement to stats, computes the NEXT
-;; generation with `pstep` (which overlaps with the renderer drawing this one), runs
-;; the adaptive pattern schedule, then paces. `:stop` ends it and the whole pool.
-;;
-;; Patterns on an ADAPTIVE schedule: when the interval elapses it sows ONE random
-;; pattern (inject-pattern), then picks the next interval from how the board behaved —
-;; *inject-fast* if it went constant-ish (drift within max(*stale-tol*, 5%)),
-;; *inject-slow* if it's lively — each randomised to [base, 2·base). `s` threads the
-;; PRNG; `pop0` is the population at the last injection, `wait` the scheduled interval,
-;; `since` the generations elapsed. `prev` gives the true period for the fps/spike read.
-(defn sim-loop (renderer stats pool live gen prev spikes s pop0 wait since)
+;; Patterns on an ADAPTIVE schedule: when the interval elapses it sows ONE random pattern
+;; (inject-pattern), then picks the next interval from how the board behaved —
+;; *inject-fast* if it went constant-ish (drift within max(*stale-tol*, 5%)), *inject-slow*
+;; if it's lively — each randomised to [base, 2·base). `s` threads the PRNG; `pop0` is the
+;; population at the last injection, `wait` the scheduled interval, `since` the generations
+;; elapsed. `prev` gives the true period for the fps/spike read.
+(defn sim-loop (renderer stats live gen prev spikes s pop0 wait since)
+  "SIM: the model + the clock. Each frame it pushes the current board to the renderer and
+a raw measurement to stats, computes the NEXT generation with `step` (overlapping the
+renderer drawing this one), runs the adaptive pattern schedule, then paces. `:stop` ends it."
   (let (now (now-ns)
         per (- now prev)
         spk (if (> per (quot (* *frame-ns* 3) 2)) (+ spikes 1) spikes))
     (do
       (send renderer [:board live])
       (send stats [:meas gen (count live) per spk])
-      (let (nxt (pstep live pool))
+      (let (nxt (step live))
         ; overlaps the renderer drawing `live`
         (if (= :stop (sim-pace (+ now *frame-ns*)))
-          (doseq (p pool) (send p :stop))
+          :stopped
           (if (< since wait)
-            (sim-loop renderer stats pool nxt (+ gen 1) now spk s pop0 wait (+ since 1))
+            (sim-loop renderer stats nxt (+ gen 1) now spk s pop0 wait (+ since 1))
             (let (cur (count nxt)
                   flat? (<= (abs (- cur pop0)) (max *stale-tol* (quot cur 20)))
                   [nxt2 s2] (inject-pattern nxt s)
                   base (if flat? *inject-fast* *inject-slow*)
                   [jit s3] (rand-int s2 base))
-              (sim-loop renderer
-                stats
-                pool
-                nxt2
-                (+ gen 1)
-                now
-                spk
-                s3
-                (count nxt2)
-                (+ base jit)
-                0))))))))
+              (sim-loop renderer stats nxt2 (+ gen 1) now spk s3 (count nxt2) (+ base jit) 0))))))))
 
-;; A quit signal in the renderer's mailbox: the window's X (`:close`, a frontend
-;; signal distinct from the Escape *key*), or the `q` / Esc / Ctrl-C keys.
 (defn quit-signal? (m)
+  "Is `m` a quit signal? — the window's X (`:close`, a frontend signal distinct from the
+Escape *key*), or the `q` / Esc / Ctrl-C keys."
   (or (= m :close) (= m "q") (= m :escape) (= m :ctrl-c)))
 
-;; RENDERER (this program's root process): owns the window and is a thin COMPOSITOR.
-;; It caches the latest board + status and redraws on each `[:board …]` (the 60 Hz
-;; driver), acking `[:drawn]` so the sim never outruns it; `[:status …]` just updates
-;; the cached string, picked up by the next board redraw. GUI input lands in this SAME
-;; mailbox, so a quit signal stops the sim + stats and closes, and releasing `o`/`O`
-;; opens the std process observer in its own window (one at a time — see render-loop)
-;; in a spawned process, so the sim keeps running. Because the renderer
-;; ONLY ever acts on a received message, input is drained no matter how long a frame
-;; takes (the old "can't close an over-budget window" bug can't recur). `grid-fit`
-;; re-reads the window each redraw, so the board tracks a live resize.
 (defn render-quit (sim stats w)
+  "Tear down: stop the sim and stats actors, then close window `w`."
   (do (send sim :stop) (send stats :stop) (gui-close w)))
 
+;; Because the renderer ONLY ever acts on a received message, input is drained no matter
+;; how long a frame takes (the old "can't close an over-budget window" bug can't recur).
+;; `grid-fit` re-reads the window each redraw, so the board tracks a live resize.
 (defn render-loop (w sim stats live status)
+  "RENDERER (this program's root process): owns the window and is a thin COMPOSITOR. It
+caches the latest board + status and redraws on each `[:board …]`, acking `[:drawn]` so
+the sim never outruns it; `[:status …]` just updates the cached string. GUI input lands
+in this SAME mailbox, so a quit signal stops the sim + stats and closes the window."
   (receive ([:board nl] (let ([vcols vrows] (grid-fit w))
                           (do
                             (gui-draw w (render nl status vcols vrows))
                             (send sim [:drawn])
                             (render-loop w sim stats nl status))))
     ([:status s] (render-loop w sim stats live s))
-    ;; `o`/`O` opens the observer on key *release*, NOT press: a held key's OS
-    ;; auto-repeat floods press events (esp. on Wayland, where winit's repeat flag
-    ;; leaks — ADR-086), so triggering on the bare `"o"` press would fire many times
-    ;; per tap. The `[:key-up …]` release fires exactly once per physical tap.
-    ;; `(observer/observe)` is single-instance per runtime: a second press while the
-    ;; window is open just raises it to the front (no duplicate), and after it's
-    ;; closed the next press opens a fresh one.
-    ([:key-up k] (if (or (= k "o") (= k "O"))
-                   (do (observer/observe) (render-loop w sim stats live status))
-                   (render-loop w sim stats live status)))
     (m (if (quit-signal? m) (render-quit sim stats w) (render-loop w sim stats live status)))))
 
-;; Re-fit the sim torus to window `w` and return the visible board viewport
-;; `[vcols vrows]` for `render` to clip to. The board is the window less the bottom
-;; status bar (`*status-scale*` rows). `*w*`/`*h*` —
-;; the torus `step` wraps on — track that area but are FLOORED at *grid-min*×
-;; *grid-min*: shrinking the window below the board then can't collapse the torus
-;; and wrap every cell onto itself ("lose all our blocks"); those cells stay live in
-;; memory, off-view, and reappear when the window grows back. Globals are image-wide,
-;; so the worker's next `step` wraps on the new size too. The std `ui--loop` re-reads
-;; size the same way each frame (std/ui.blsp).
+;; `*w*`/`*h*` — the torus `step` wraps on — track the window area but are FLOORED at
+;; *grid-min*×*grid-min*: shrinking the window below the board then can't collapse the
+;; torus and wrap every cell onto itself; those cells stay live in memory, off-view, and
+;; reappear when the window grows back. Globals are image-wide, so the next `step` wraps on
+;; the new size too. The std `ui--loop` re-reads size the same way each frame (std/editor/ui.blsp).
 (defn grid-fit (w)
+  "Re-fit the sim torus to window `w` and return the visible board viewport `[vcols vrows]`
+for `render` to clip to (the board is the window less the bottom `*status-scale*`-row bar)."
   (let ([cols rows] (gui-size w)
         vrows (max 1 (- rows *status-scale*)))
     (do
@@ -359,36 +260,26 @@ animated in a native GUI window (the board is fit to the window at startup)."
       (def *h* (max *grid-min* vrows))
       [cols vrows])))
 
-;; Wire up and run the three actors. This root process becomes the RENDERER (it owns
-;; the window); only the board window is shrunk via per-window `gui-font!`. We `grid-fit`
-;; once to size `*w*`/`*h*` before seeding, then spawn stats + sim (the sim spawns the
-;; band pool) and hand them this process's pid so they can push `[:status]`/`[:board]`
-;; in. `start` seeds the board and threads the sim's PRNG (pattern picks / intervals);
-;; the first pattern lands after a slow interval, then the cadence adapts.
 (defn run-life ()
+  "Wire up and run the three actors. This root process becomes the RENDERER (it owns the
+window); only the board window is shrunk via per-window `gui-font!`. We `grid-fit` once to
+size `*w*`/`*h*` before seeding, then spawn stats + sim and hand them this process's pid so
+they can push `[:status]`/`[:board]` in."
   (let (w (gui-open)
-         _
-         (gui-font! w {:family :mono :height *board-height*})  ; smaller blocks, board window ONLY
-         _
-         (grid-fit w)  ; sizes *w*/*h* before we seed
-         start
-         (now-ns)
-         board
-         (seed start)
-         me
-         (self)  ; this root process is the renderer
-         stats
-         (spawn (stats-loop me (perflog/log-start *log-path*)))
-         sim
-         (spawn (sim-loop me
-                  stats
-                  []
-                  board
-                  0
-                  (- start *frame-ns*)
-                  0
-                  start
-                  (count board)
-                  *inject-slow*
-                  0)))
+        _ (gui-font! w {:family :mono :height *board-height*})  ; smaller blocks, board window ONLY
+        _ (grid-fit w)  ; sizes *w*/*h* before we seed
+        start (now-ns)
+        board (seed start)
+        me (self)  ; this root process is the renderer
+        stats (spawn (stats-loop me (perflog/log-start *log-path*)))
+        sim (spawn (sim-loop me
+                     stats
+                     board
+                     0
+                     (- start *frame-ns*)
+                     0
+                     start
+                     (count board)
+                     *inject-slow*
+                     0)))
     (render-loop w sim stats board "")))

@@ -1,6 +1,6 @@
-;; foobar — a Brood project.
+;; life — Conway's Game of Life, a Brood project.
 (project :name
-  "foobar"
+  "life"
   :version
   "0.1.0"
   :main

@@ -52,46 +52,12 @@
 
   (test "inject-pattern sows a known pattern onto a flat board, deterministically"
     (let (settled (board [[0 0] [1 0] [0 1] [1 1]])
-           ; a still-life block: population flat
-           [revived _]
-           (inject-pattern settled 7)
-           [again _]
-           (inject-pattern settled 7))
+          ; a still-life block: population flat
+          [revived _] (inject-pattern settled 7)
+          [again _] (inject-pattern settled 7))
       (do
         (is (> (count revived) (count settled)))  ; a pattern was sown in
         (assert= (keys revived) (keys again))))))  ; same seed -> same sow
-
-;; Parallel step (pstep): the torus is split into row-bands stepped on separate
-;; processes, then stitched. The fan-out needs a live scheduler, but its CORRECTNESS
-;; is the pure decomposition — band-parts (halo'd split) + band-step (owned-rows next
-;; gen) must reassemble into EXACTLY (step board). We check that sequentially (no
-;; spawn → deterministic), including the torus seam and a band count not dividing the
-;; grid, then sanity-check pstep's serial fallback.
-(defn band-merge (live k)
-  (let (bh (max 1 (quot (+ *h* k -1) k)) subs (band-parts live k bh))
-    (reduce (fn (acc b) (into acc (band-step (get subs b) (* b bh) (min *h* (* (+ b 1) bh)))))
-      {}
-      (range k))))
-
-(describe "parallel step matches serial step"
-  (test "row-band decomposition reassembles into exactly (step board)"
-    (let (g (board
-              [[1 0] [2 1]
-                [0 2]
-                [1 2]
-                [2 2]  ; a glider
-                [10 0]
-                [10 39]
-                [11 39]
-                [0 20]]))
-      ; cells on the torus seam (h=40)
-      (do
-        (assert= (band-merge g 8) (step g))  ; 8 bands
-        (assert= (band-merge g 3) (step g))  ; band height not dividing h=40
-        (assert= (band-merge (stepn g 5) 8) (step (stepn g 5))))))
-  (test "pstep falls back to serial step below the threshold"
-    (let (g (board [[1 0] [2 1] [0 2] [1 2] [2 2]]))
-      (assert= (pstep g) (step g)))))
 
 ;; The renderer (render-loop) routes its mailbox on `quit-signal?`: the window's X
 ;; (`:close`) and the q / Esc / Ctrl-C keys quit; board/status/other messages don't.
