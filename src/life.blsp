@@ -38,7 +38,7 @@ default (fast — instant drawing); the footer stays a fixed height while only t
 ;; *footer-px* px (apply-zoom! does this). At the defaults (20 / 5) that's the old fixed 4.
 (def *footer-px* 20)  ; target footer height in px (constant across zoom)
 (def *status-scale* 4)  ; board-cells tall; re-derived from *footer-px*/*board-height* on zoom
-(def *status-face* {:bg :blue :fg :white :bold true})  ; the bottom buffer-bar style (display/bar)
+(def *status-face* {:reverse true})  ; the bottom bar: reverse-video, like the brood-edit mode line
 (def *grid-min* 5)  ; the sim torus never shrinks below *grid-min* x *grid-min*
 (def *seed-cells* 3000)  ; target initial ACTIVE (live) cell count — `seed` sows random
 ; shapes until ~this many cells are live (the working population we pace to 30 fps).
@@ -55,14 +55,16 @@ default (fast — instant drawing); the footer stays a fixed height while only t
 ;; rolling past *inject-max* back to never) and `]` (more often; from never it switches on).
 (def *inject-secs* 0)  ; seconds between random auto-injects (0 = never)
 (def *inject-max* 30)
-;; The bottom bar carries two clickable BUTTONS at fixed char columns (drawn at the front
-;; of the status string, hit-tested by `col / *status-scale*`): a SPAWN toggle and an FPS
-;; control you drag left/right. *drag* is the transient pointer state (renderer-process
-;; only): :fps while the fps control is held, *drag-col* the last pointer column.
+;; The bottom bar leads with two clickable BUTTONS at fixed char columns (overlaid on the
+;; bar in *btn-face*, hit-tested by `col / *status-scale*`): a SPAWN toggle and an FPS
+;; control (click cycles a preset, drag scrubs). The RENDERER owns these values for the
+;; label (so feedback is instant, independent of the sim's frame rate) and forwards every
+;; change to the SIM as a message — throttled to *fps-throttle-ns* while dragging — so the
+;; board-ticking process, not the input handler, owns the authoritative live cap/interval.
 (def *btn-spawn* [0 11])  ; char range [start end) of the `[spawn …]` button
-(def *btn-fps* [12 21])  ; char range of the `[fps …]` button (drag to change)
-(def *drag* nil)
-(def *drag-col* 0)
+(def *btn-fps* [12 21])  ; char range of the `[fps …]` button
+(def *btn-face* {:bold true})  ; NON-reverse + bold → the buttons sit raised on the reverse bar
+(def *fps-throttle-ns* 50000000)  ; ≥50 ms between [:set-fps] messages while dragging
 (def *status-every* 10)  ; stats push the bar every N gens (~3 Hz at 30 fps) — readable, not a blur
 (def *log-every* 30)  ; stats write a perf line to life.log every N gens (~1 Hz at 30 fps)
 (def *log-path* "life.log")  ; where the perf log is written (cwd; truncated each run)
@@ -105,27 +107,23 @@ bitboard `live`, threading the PRNG `s`; returns `[live' s']`."
         [y s3] (rand-int s2 (get live :h)))
     [(bitboard/place live pat x y) s3]))
 
-;; The two CLICKABLE buttons that lead the bar, each a FIXED-WIDTH label (so its char
-;; columns — and thus its hit region, `*btn-spawn*`/`*btn-fps*` — stay put as the numbers
-;; change). `spawn-label` is 11 chars (`[spawn ` + 3 + `]`), `fps-label` 9 (`[fps ` + 3 +
-;; `]`); the `pad-left` keeps the value column fixed. They read the same globals the keys do.
-(defn spawn-label ()
-  (str "[spawn " (if (> *inject-secs* 0) (str (pad-left (str *inject-secs*) 2) "s") "off") "]"))
+;; The two CLICKABLE button labels — fixed width (11 + 9 chars) so their hit ranges
+;; (*btn-spawn*/*btn-fps*) stay put as the numbers change; `pad-left` holds the value column.
+;; They take the value to show (the renderer's LOCAL copy) rather than reading a global, so
+;; the renderer can repaint them the instant you click/drag, ahead of the sim.
+(defn spawn-label (inject)
+  (str "[spawn " (if (> inject 0) (str (pad-left (str inject) 2) "s") "off") "]"))
 
-(defn fps-label ()
-  (str "[fps " (pad-left (if (> *target-fps* 0) (str *target-fps*) "max") 3) "]"))
+(defn fps-label (cap)
+  (str "[fps " (pad-left (if (> cap 0) (str cap) "max") 3) "]"))
 
-;; The space before each unit and the ` · ` between fields keep the digits from running
-;; together, so the line reads at a glance. The leading `[spawn …] [fps …]` are the buttons
-;; (state shown there, not repeated in the fields). (No GC field: `gc-stats` is dev-only.)
+;; The INFO half of the bar (gen / measured fps / cells / spikes / memory). The two buttons
+;; are prepended by the renderer (`footer-ops`), not here — STATS only knows the
+;; measurement; the renderer owns the control values. (No GC field: `gc-stats` is dev-only.)
 (defn status (gen cells per spikes)
-  "The live status line for the bottom strip: the two clickable buttons, then spelled-out,
-gapped fields from one generation's measurement (`per` = nanoseconds since the previous
-frame). The button labels read the live globals the keys/clicks adjust."
-  (str (spawn-label)
-    " "
-    (fps-label)
-    "  gen "
+  "The info fields of the bottom strip from one generation's measurement (`per` = ns since
+the previous frame). The renderer composes this after the buttons."
+  (str "gen "
     gen
     " · "
     (quot 1000 (max 1 (quot per 1000000)))
@@ -137,38 +135,38 @@ frame). The button labels read the live globals the keys/clicks adjust."
     (quot (mem-bytes) 1048576)
     " MB"))
 
-;; `*status-face*` fills the whole `vcols`-wide line with the text drawn at the FIXED
-;; `*status-scale*` via the GUI Face's per-op `:scale` (ADR-079), so the bar is always
-;; `*status-scale*` rows tall and the glyphs never resize. LEFT-aligned (not centred) so the
-;; leading buttons sit at fixed char columns 0… — that's what makes `col / *status-scale*`
-;; hit-test them. A status too long for the window is truncated by `bar`, not shrunk; the
-;; terminal frontend ignores `:scale`/`:bg` and renders it 1×.
-(defn status-bar (status top vcols)
-  "Render `status` as a full-width buffer bar (std `display/bar`) topped at screen row `top`."
-  (bar top vcols status {:face *status-face* :align :left :scale *status-scale*}))
+;; The bottom bar as render ops: a full-width background `bar` holding the INFO (shifted
+;; past the button columns so it can't underlap), then the two buttons OVERLAID in
+;; *btn-face* so they read as raised buttons. `top`/`vcols` come from the board being drawn
+;; (`render`), so the bar is always positioned consistently with the board — no resize jump.
+(defn footer-ops (ui info top vcols)
+  (let (scale *status-scale*
+        [sa _] *btn-spawn*
+        [fa _] *btn-fps*
+        face (assoc *btn-face* :scale scale)
+        bg (bar top
+             vcols
+             (str (string-repeat " " 22) info)
+             {:face *status-face* :align :left :scale scale}))
+    [bg [:text top (* sa scale) (spawn-label (get ui :inject)) face]
+      [:text top (* fa scale) (fps-label (get ui :cap)) face]]))
 
-;; The leading `clear` wipes the previous frame, so we paint only what's lit. An earlier
-;; single-pane version scanned the whole grid and built a full-width string per row every
-;; frame — O(area), ~30× slower and the reason the frame rate was pinned regardless of
-;; the pacing target.
-(defn render (live status vcols vrows)
-  "A display frame: the board as ONE `text` op per live cell (enumerated from the
-bitboard, clipped to the `vcols`×`vrows` viewport), with a full-width status bar
-across the bottom rows."
-  ;; One pass: a `text` op straight from each set bit (`bit-positions` per non-empty
-  ;; row), no intermediate `[x y]` list, no clip (the bitboard IS the viewport), no
-  ;; `apply`/`frame` nil-filter. `clear` first, status bar last.
-  (let (rows (get live :rows))
-    (into
-      (into [(clear)]
-        (mapcat
-          (fn (y)
-            (let (r (vector-ref rows y))
-              ;; the display `:text` op literal (display/text without the
-              ;; per-cell fn call + optional-face check) — this is the hot path
-              (if (= r 0) nil (map (fn (x) [:text y x "▪"]) (bit-positions r)))))
-          (range (get live :h))))
-      [(status-bar status vrows vcols)])))
+;; The leading `clear` wipes the previous frame, so we paint only what's lit. ALL geometry
+;; comes from `live` itself (`:h`/`:w`), so the board and the bar below it are sized from
+;; ONE snapshot — the brood-edit anti-jitter rule: never composite a stale board under a
+;; freshly-measured bar position (that mismatch is what made the footer jump on resize).
+(defn render (live ui info)
+  "A display frame from the board `live`: one `:text` op per live cell, then the bottom bar
+(buttons + `info`) at row `(get live :h)`. Geometry is read from `live` only."
+  (let (rows (get live :rows)
+        h (get live :h)
+        wdt (get live :w))
+    (into (into [(clear)]
+            (mapcat (fn (y)
+                      (let (r (vector-ref rows y))
+                        (if (= r 0) nil (map (fn (x) [:text y x "▪"]) (bit-positions r)))))
+              (range h)))
+      (footer-ops ui info h wdt))))
 
 ;; ---- the actors: SIM (model + clock) → STATS → RENDERER (compositor) -------------
 ;; Each source is its own process that PUSHES updates to a thin renderer (ADR-058
@@ -205,20 +203,21 @@ and writes a perf line to the `logger` every `*log-every*` gens."
                                       (perflog/log-line logger (log-fmt gen cells per spikes)))
                                     (stats-loop renderer logger)))))
 
-(defn sim-pace (clicks held armed)
-  "Wait for the renderer's `[:drawn]` ack — so the sim never runs more than one frame
-ahead of it (bounds the mailbox) — collecting the `[x y kind]` cells to draw this frame
-and tracking the held button. A `[:press kind x y]` draws a `kind` pattern (`:shape` on
-left, `:gun` on right), sets the held cell, and ARMS the key-repeat delay; a `[:drag kind
-x y]` draws and moves the held cell but leaves the delay alone (drawing doesn't re-arm);
-`[:release]` clears the held cell. Returns `:stop`, or `[clicks held' armed?]` — the cells
-to fold in, the held `[x y kind]` (or nil), and whether a press happened this frame. The
-frame-rate cap is REMOVED (go ham): it returns as soon as the renderer acks, with no sleep."
+(defn sim-pace (clicks held armed cap inject)
+  "Drain the renderer's messages until its `[:drawn]` ack — so the sim never runs more than
+one frame ahead of it (bounds the mailbox) — while threading the sim-owned control state.
+`[:press kind x y]` draws a `kind` pattern (`:shape`/`:gun`), sets the held cell + ARMS the
+key-repeat; `[:drag kind x y]` draws + moves the held cell without re-arming; `[:release]`
+clears it. `[:set-fps n]`/`[:set-inject n]` (sent by the renderer, throttled) update the
+authoritative cap / auto-spawn interval HERE, in the ticking process. Returns `:stop`, or
+`[clicks held' armed? cap' inject']`."
   (receive (:stop :stop)
-    ([:drawn] [clicks held armed])
-    ([:press kind x y] (sim-pace (cons [x y kind] clicks) [x y kind] true))
-    ([:drag kind x y] (sim-pace (cons [x y kind] clicks) [x y kind] armed))
-    ([:release] (sim-pace clicks nil armed))))
+    ([:drawn] [clicks held armed cap inject])
+    ([:press kind x y] (sim-pace (cons [x y kind] clicks) [x y kind] true cap inject))
+    ([:drag kind x y] (sim-pace (cons [x y kind] clicks) [x y kind] armed cap inject))
+    ([:release] (sim-pace clicks nil armed cap inject))
+    ([:set-fps n] (sim-pace clicks held armed n inject))
+    ([:set-inject n] (sim-pace clicks held armed cap n))))
 
 (defn apply-clicks (board clicks s)
   "Drop a random pattern at each click cell `[x y kind]`, threading the PRNG `s`: a `:gun`
@@ -232,13 +231,13 @@ cell samples a glider gun (`*shooters*`, right button), any other kind samples a
     [board s]
     clicks))
 
-(defn sim-loop (renderer stats live gen prev spikes s held hn)
-  "SIM: the model + the clock. Each frame it fits the board to the current window, pushes
-it to the renderer and a measurement to stats, computes the NEXT generation with
-`bitboard/step` (overlapping the renderer drawing this one), then waits for the ack —
-folding in any drawn patterns (shapes on left, guns on right), plus a key-repeat drop at
-the HELD cell once it's been held past *hold-delay* — and recurses. `hn` counts gens since
-the last fresh PRESS (a drag draws but doesn't reset it). `:stop` ends it."
+(defn sim-loop (renderer stats live gen prev spikes s held hn cap inject last-inj)
+  "SIM: the model + the clock, and the OWNER of the live `cap` (fps) and `inject` (auto-spawn
+seconds) — updated only by the renderer's throttled `[:set-fps]`/`[:set-inject]` messages,
+never by a shared global, so input never contends with the tick. Each frame it fits the
+board, pushes it + a measurement out, steps the NEXT generation (overlapping the draw),
+waits for the ack folding in drawn patterns + the held-cell key-repeat, auto-injects on a
+wall-clock schedule, paces to `cap`, and recurses. `:stop` ends it."
   (let (live (bitboard/fit live *w* *h*)
         now (now-ns)
         per (- now prev)
@@ -247,10 +246,10 @@ the last fresh PRESS (a drag draws but doesn't reset it). `:stop` ends it."
       (send renderer [:board live])
       (send stats [:meas gen (bitboard/live-count live) per spk])
       (let (nxt (bitboard/step live)  ; overlaps the renderer drawing `live`
-            paced (sim-pace [] held false))
+            paced (sim-pace [] held false cap inject))
         (if (= :stop paced)
           :stopped
-          (let ([clicks held2 armed] paced
+          (let ([clicks held2 armed cap2 inject2] paced
                 ;; Only a fresh PRESS (`armed`) re-arms the delay (hn←0); a drag draws but
                 ;; lets hn keep climbing, so a stopped drag keeps auto-repeating instead of
                 ;; restarting the warm-up. Auto-repeat fires on idle frames (nothing drawn
@@ -262,21 +261,19 @@ the last fresh PRESS (a drag draws but doesn't reset it). `:stop` ends it."
                           (= 0 (mod (- hn2 *hold-delay*) *spawn-every*)))
                 drops (if repeat? (cons held2 clicks) clicks)
                 [nxt2 s2] (apply-clicks nxt drops s)
-                ;; auto-inject: every *inject-secs* seconds (≈ secs×fps gens) sow a random
-                ;; pattern so the board keeps moving on its own (0 = never — skip entirely).
-                [nxt3 s3] (if (and (> *inject-secs* 0)
-                                (= 0 (mod gen (max 1 (* *inject-secs* *target-fps*)))))
-                            (inject-pattern nxt2 s2)
-                            [nxt2 s2]))
+                ;; auto-inject on a WALL-CLOCK schedule (robust to the cap — a gen count
+                ;; would divide by the fps and flood when uncapped). 0 = never.
+                due? (and (> inject2 0) (>= (- now last-inj) (* inject2 1000000000)))
+                [nxt3 s3] (if due? (inject-pattern nxt2 s2) [nxt2 s2])
+                last-inj2 (if due? now last-inj))
             (do
-              ;; pace ONLY when a cap is set (*target-fps* > 0): sleep out the rest of this
-              ;; frame's budget. Uncapped (0) = NO sleep, runs flat out as before (sim-pace
-              ;; already blocked on the renderer's ack, so it never runs more than a frame
-              ;; ahead). This is why the default feels instant; a cap is opt-in.
-              (when (> *target-fps* 0)
-                (let (nap (quot (- (quot 1000000000 *target-fps*) (- (now-ns) now)) 1000000))
+              ;; pace ONLY when a cap is set (`cap` > 0): sleep out the rest of this frame's
+              ;; budget. Uncapped (0) = NO sleep, flat out (sim-pace already blocked on the
+              ;; ack, so it never runs more than a frame ahead). The cap is opt-in.
+              (when (> cap2 0)
+                (let (nap (quot (- (quot 1000000000 cap2) (- (now-ns) now)) 1000000))
                   (when (> nap 0) (sleep nap))))
-              (sim-loop renderer stats nxt3 (+ gen 1) now spk s3 held2 hn2))))))))
+              (sim-loop renderer stats nxt3 (+ gen 1) now spk s3 held2 hn2 cap2 inject2 last-inj2))))))))
 
 (defn quit-signal? (m)
   "Is `m` a quit signal? — the window's X (`:close`, a frontend signal distinct from the
@@ -287,47 +284,46 @@ Escape *key*), or the `q` / Esc / Ctrl-C keys."
   "Tear down: stop the sim and stats actors, then close window `w`."
   (do (send sim :stop) (send stats :stop) (gui-close w)))
 
-;; Because the renderer ONLY ever acts on a received message, input is drained no matter
-;; how long a frame takes (the old "can't close an over-budget window" bug can't recur).
-;; `grid-fit` re-reads the window each redraw, so the board tracks a live resize.
-(defn render-loop (w sim stats live status)
-  "RENDERER (this program's root process): owns the window and is a thin COMPOSITOR. It
-caches the latest board + status and redraws on each `[:board …]`, acking `[:drawn]` so
-the sim never outruns it; `[:status …]` just updates the cached string. GUI input lands
-in this SAME mailbox, so a quit signal stops the sim + stats and closes the window."
-  (receive ([:board nl] (let ([vcols vrows] (grid-fit w))
-                          (do
-                            (gui-draw w (render nl status vcols vrows))
-                            (send sim [:drawn])
-                            (render-loop w sim stats nl status))))
-    ([:status s] (render-loop w sim stats live s))
-    ;; Redraw the cached board IMMEDIATELY on a resize (the std editor loop redraws on
-    ;; every size read; we do it event-driven). Otherwise the bottom bar only re-fits on the
-    ;; sim's next [:board] — at the sim's pace, lagging the drag and jittering. grid-fit
-    ;; re-reads the new cell grid and sizes *w*/*h* for the sim's next frame.
-    ([:resize cols rows] (let ([vcols vrows] (grid-fit w))
-                           (do
-                             (gui-draw w (render live status vcols vrows))
-                             (render-loop w sim stats live status))))
-    ;; All mouse input goes through one dispatcher (`on-mouse`), so the board/footer split
-    ;; is decided in a single place rather than re-checked (and negated) per clause.
-    ([:mouse action button row col mods] (do
-                                           (on-mouse sim w action button row col)
-                                           (render-loop w sim stats live status)))
-    ;; Keyboard knobs (keys arrive as 1-char strings): `-`/`=` slower/faster fps cap,
-    ;; `[`/`]` rarer/more-often auto-spawn. They `def` the globals the sim + status read,
-    ;; then the loop continues; anything else that isn't a quit signal is ignored.
+(defn draw! (w live info ui)
+  "Composite + paint one frame: the cached board with the bottom bar = the two buttons
+(from the renderer-LOCAL `ui`) + the stats `info`. Geometry is read from `live` only (so
+the bar can't disagree with the board on resize). No `gui-size` here — that's `grid-fit`."
+  (gui-draw w (render live ui info)))
+
+;; The renderer owns the window and is a thin COMPOSITOR. It threads its cached board
+;; (`live`), the stats `info` string, and `ui` — the LOCAL control state {:cap :inject :drag
+;; :dcol :moved :sent}. It redraws on `[:board …]` (acking `[:drawn]`), on `[:status …]`, on
+;; `[:resize]`, AND immediately after any footer interaction — so control feedback never
+;; waits on the sim's frame rate (the bug where a low cap froze the whole UI). Input that
+;; changes a control is sent to the sim as a message (throttled while dragging); the sim,
+;; not this loop, owns the authoritative value. `grid-fit` only updates *w*/*h* for the sim.
+(defn render-loop (w sim stats live info ui)
+  (receive
+    ([:board nl]
+      (do
+        (grid-fit w)  ; size the sim's next fit; geometry to draw is nl's
+        (draw! w nl info ui)
+        (send sim [:drawn])
+        (render-loop w sim stats nl info ui)))
+    ([:status s] (do (draw! w live s ui) (render-loop w sim stats live s ui)))
+    ;; On resize: update *w*/*h*, then REFIT our cached board to it and redraw now — so the
+    ;; board fills the new window and the bar (drawn from the board's own dims) stays glued
+    ;; to it, with no jump, even before the sim's next frame lands.
+    ([:resize cols rows] (let (_ (grid-fit w) nl (bitboard/fit live *w* *h*))
+                           (do (draw! w nl info ui) (render-loop w sim stats nl info ui))))
+    ;; One mouse dispatcher; `on-mouse` returns `[ui' redraw?]` and does any sim sends.
+    ([:mouse action button row col mods] (let ([ui2 rd] (on-mouse sim w action button row col ui))
+                                           (do
+                                             (when rd (draw! w live info ui2))
+                                             (render-loop w sim stats live info ui2))))
+    ;; Keys (`-`/`=` fps, `[`/`]` spawn) route the same way via `on-key`: update the local
+    ;; copy, send the sim a message, redraw. A quit signal tears everything down.
     (m (if (quit-signal? m)
          (render-quit sim stats w)
-         (do
-           (if (= m "-")
-             (set-fps -1)
-             (if (= m "=")
-               (set-fps 1)
-               (if (= m "[")
-                 (set-inject 1)
-                 (if (= m "]") (set-inject -1) nil))))
-           (render-loop w sim stats live status))))))
+         (let ([ui2 rd] (on-key sim m ui))
+           (do
+             (when rd (draw! w live info ui2))
+             (render-loop w sim stats live info ui2)))))))
 
 ;; `*w*`/`*h*` — the torus `step` wraps on — track the window area (in cells, which the
 ;; zoom font size also changes) but are FLOORED at *grid-min*×*grid-min* so a tiny window
@@ -359,77 +355,99 @@ out), clamped to [*zoom-min*, *zoom-max*]. The next `grid-fit` re-reads the cell
 refits the torus, clipping any cells now off-board; the footer keeps its pixel height."
   (apply-zoom! w (max *zoom-min* (min *zoom-max* (+ *board-height* dir)))))
 
-(defn set-fps (dir)
-  "Change the fps cap. `dir` > 0 = faster: raise the cap by *fps-step*, and past *fps-max*
-roll back to UNCAPPED (0). `dir` < 0 = slower: from uncapped engage the cap at *fps-max*,
-else lower it by *fps-step* down to *fps-min*. The sim reads *target-fps* each frame; only a
-positive value paces it. Behind the `-`/`=` keys."
-  (def *target-fps*
-    (if (> dir 0)
-      (if (or (= *target-fps* 0) (>= *target-fps* *fps-max*))
-        0
-        (min *fps-max* (+ *target-fps* *fps-step*)))
-      (if (= *target-fps* 0)
-        *fps-max*
-        (max *fps-min* (- *target-fps* *fps-step*))))))
+;; ---- PURE control math (no globals, no I/O): given a value, return the next one --------
+(defn fps-nudge (cap d)
+  "The fps cap moved by `d` (− slower, + faster). Uncapped (0) acts as just past *fps-max*,
+so + past the top returns to uncapped and − from uncapped engages the cap near the top;
+otherwise clamped to [*fps-min*, *fps-max*]."
+  (let (base (if (= cap 0) (+ *fps-max* 1) cap) f (+ base d))
+    (if (> f *fps-max*) 0 (max *fps-min* f))))
 
-(defn set-inject (dir)
-  "Adjust the auto-spawn interval. `dir` > 0 makes it RARER (interval +1 s; past *inject-max*
-it rolls back to never/0); `dir` < 0 makes it MORE OFTEN (−1 s, floored at 1; from 'never'
-it switches on at a sensible 5 s). Behind the `[`/`]` keys."
-  (def *inject-secs*
-    (if (> dir 0)
-      (if (>= *inject-secs* *inject-max*) 0 (+ *inject-secs* 1))
-      (if (= *inject-secs* 0) 5 (max 1 (- *inject-secs* 1))))))
+(defn fps-cycle (cap)
+  "The next fps preset for a CLICK on the button: uncapped → 30 → 10 → 1 → uncapped (any
+in-between value from a drag rounds down to the next lower preset)."
+  (cond (= cap 0) 30 (> cap 10) 10 (> cap 1) 1 :else 0))
 
-(defn toggle-inject ()
-  "Flip auto-spawn off↔on (on resumes at a sensible 5 s). The `[spawn …]` button."
-  (def *inject-secs* (if (> *inject-secs* 0) 0 5)))
+(defn inject-toggle (inject)
+  "Flip auto-spawn off↔on (on resumes at a sensible 5 s) — the `[spawn]` button click."
+  (if (> inject 0) 0 5))
 
-(defn adjust-fps (d)
-  "Nudge the fps cap by `d` (1 per pointer cell, from the fps-button drag). Uncapped acts as
-just past *fps-max*, so dragging left engages the cap at the top and dragging right past the
-top returns to uncapped (0); clamped to [*fps-min*, *fps-max*] otherwise."
-  (let (base (if (= *target-fps* 0) (+ *fps-max* 1) *target-fps*)
-        f (+ base d))
-    (def *target-fps* (if (> f *fps-max*) 0 (max *fps-min* f)))))
+(defn inject-nudge (inject dir)
+  "The auto-spawn interval moved a notch: `dir` > 0 RARER (+1 s; past *inject-max* → never),
+`dir` < 0 MORE OFTEN (−1 s, floored at 1; from never → 5 s). Behind the `[`/`]` keys."
+  (if (> dir 0)
+    (if (>= inject *inject-max*) 0 (+ inject 1))
+    (if (= inject 0) 5 (max 1 (- inject 1)))))
 
+;; ---- input → [ui' redraw?], sending the SIM throttled control messages -----------------
 (defn in-footer? (row)
-  "Is screen `row` in the bottom status bar (below the board)? `*h*` is the board's row
-count, so the footer is everything from there down."
+  "Is screen `row` in the bottom status bar? `*h*` is the board's row count, so the footer
+is everything from there down."
   (>= row *h*))
 
 (defn in-btn? (ci btn)
   "Is char index `ci` inside button char-range `btn` = `[start end)`?"
   (let ([a b] btn) (and (>= ci a) (< ci b))))
 
-(defn footer-press (col)
-  "A press in the footer: hit-test the char column (`col / *status-scale*`) against the
-buttons. Spawn toggles; the fps button starts a drag (tracked in *drag*/*drag-col*)."
+(defn footer-press (sim ui col)
+  "A press in the footer: hit-test the char column (`col / *status-scale*`). Spawn toggles
+(send the sim the new interval); the fps button arms a drag (tracked in `ui`, no send yet)."
   (let (ci (quot col *status-scale*))
-    (if (in-btn? ci *btn-spawn*)
-      (toggle-inject)
-      (if (in-btn? ci *btn-fps*)
-        (do (def *drag* :fps) (def *drag-col* col))
-        nil))))
+    (cond
+      (in-btn? ci *btn-spawn*) (let (j (inject-toggle (get ui :inject)))
+                                 (do (send sim [:set-inject j]) [(assoc ui :inject j) true]))
+      (in-btn? ci *btn-fps*) [(assoc ui :drag :fps :dcol col :moved false) true]
+      :else [ui false])))
 
-(defn footer-drag (col)
-  "Continue an fps drag: change the cap by the horizontal cells moved since the last event."
-  (do (adjust-fps (- col *drag-col*)) (def *drag-col* col)))
+(defn fps-drag (sim ui col)
+  "Continue an fps drag: update the LOCAL cap by the cells moved (instant label feedback),
+and send the sim a `[:set-fps]` only every *fps-throttle-ns* so a drag can't flood it."
+  (let (cap (fps-nudge (get ui :cap) (- col (get ui :dcol)))
+        ui2 (assoc ui :cap cap :dcol col :moved true)
+        now (now-ns))
+    (if (>= (- now (get ui :sent)) *fps-throttle-ns*)
+      (do (send sim [:set-fps cap]) [(assoc ui2 :sent now) true])
+      [ui2 true])))
 
-(defn on-mouse (sim w action button row col)
-  "Route one mouse event — the ONE place the footer/board split lives. Scroll zooms;
-release ends any fps drag; an in-progress fps drag scrubs the cap; a press/drag in the
-footer hits the bar's buttons; everything else is on the board and draws via the sim
-(left = shapes, right = guns). `col`/`row` are the cell, forwarded as (x, y)."
+(defn footer-release (sim ui)
+  "Mouse up: always tell the sim the board press ended. If an fps drag was active, settle
+it — a release with no movement is a CLICK (cycle a preset), otherwise flush the final
+dragged value (the debounce tail) — and clear the drag."
+  (do
+    (send sim [:release])
+    (if (= (get ui :drag) :fps)
+      (let (cap (if (get ui :moved) (get ui :cap) (fps-cycle (get ui :cap))))
+        (do (send sim [:set-fps cap]) [(assoc ui :cap cap :drag nil) true]))
+      [ui false])))
+
+(defn on-mouse (sim w action button row col ui)
+  "Route one mouse event to `[ui' redraw?]`, doing any sim sends. Scroll zooms; release
+settles a drag; an in-progress fps drag scrubs; a footer press hits a button; anything else
+is on the board and draws via the sim (left = shapes, right = guns)."
   (cond
-    (= action :scroll-up) (zoom w *zoom-step*)
-    (= action :scroll-down) (zoom w (- 0 *zoom-step*))
-    (= action :release) (do (def *drag* nil) (send sim [:release]))
-    (= *drag* :fps) (when (= action :drag) (footer-drag col))
-    (in-footer? row) (when (= action :press) (footer-press col))
-    :else (send sim
-            [(if (= action :press) :press :drag) (if (= button :right) :gun :shape) col row])))
+    (= action :scroll-up) (do (zoom w *zoom-step*) [ui true])
+    (= action :scroll-down) (do (zoom w (- 0 *zoom-step*)) [ui true])
+    (= action :release) (footer-release sim ui)
+    (= (get ui :drag) :fps) (if (= action :drag) (fps-drag sim ui col) [ui false])
+    (in-footer? row) (if (= action :press) (footer-press sim ui col) [ui false])
+    :else (do
+            (send sim
+              [(if (= action :press) :press :drag) (if (= button :right) :gun :shape) col row])
+            [ui false])))
+
+(defn on-key (sim m ui)
+  "Route a control key to `[ui' redraw?]`: `-`/`=` nudge the fps cap, `[`/`]` the auto-spawn
+interval. Like the buttons, this updates the LOCAL copy and messages the sim."
+  (cond
+    (= m "-") (let (c (fps-nudge (get ui :cap) (- 0 *fps-step*)))
+                (do (send sim [:set-fps c]) [(assoc ui :cap c) true]))
+    (= m "=") (let (c (fps-nudge (get ui :cap) *fps-step*))
+                (do (send sim [:set-fps c]) [(assoc ui :cap c) true]))
+    (= m "[") (let (j (inject-nudge (get ui :inject) 1))
+                (do (send sim [:set-inject j]) [(assoc ui :inject j) true]))
+    (= m "]") (let (j (inject-nudge (get ui :inject) -1))
+                (do (send sim [:set-inject j]) [(assoc ui :inject j) true]))
+    :else [ui false]))
 
 (defn run-life ()
   "Wire up and run the three actors. This root process becomes the RENDERER (it owns the
@@ -443,5 +461,25 @@ shapes), then spawn stats + sim and hand them this process's pid so they push in
         board (bitboard/make *w* *h*)  ; START EMPTY — clicks add random shapes
         me (self)  ; this root process is the renderer
         stats (spawn (stats-loop me (perflog/log-start *log-path*)))
-        sim (spawn (sim-loop me stats board 0 (- start *frame-ns*) 0 start nil 0)))
-    (render-loop w sim stats board "")))
+        ;; the sim owns the live cap (*target-fps*) + auto-spawn interval (*inject-secs*) and
+        ;; its last-inject clock (start), updated only by the renderer's messages.
+        sim (spawn (sim-loop me
+                     stats
+                     board
+                     0
+                     (- start *frame-ns*)
+                     0
+                     start
+                     nil
+                     0
+                     *target-fps*
+                     *inject-secs*
+                     start)))
+    ;; the renderer keeps a LOCAL mirror of those values (for instant button labels) plus the
+    ;; transient drag state, and an empty info string until stats pushes the first one.
+    (render-loop w
+      sim
+      stats
+      board
+      ""
+      {:cap *target-fps* :inject *inject-secs* :drag nil :dcol 0 :moved false :sent 0})))
