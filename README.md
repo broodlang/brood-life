@@ -2,12 +2,20 @@
 
 Conway's Game of Life on a wrapping torus, rendered in a native GUI window.
 
-The board starts **empty** — **click anywhere to drop a random shape** (still-lifes,
-oscillators, spaceships: block, blinker, glider, toad, beacon, beehive, LWSS) at that
-cell — and runs **uncapped** (as fast as it can draw, no frame-rate limit). It fits
-itself to the window and tracks live resizes, so the torus always fills the frame. A
-big block-font status line below the board reports generation, FPS, live cell count,
-frame spikes, and memory.
+The board starts **empty** — **left-click/drag to drop random shapes** (still-lifes,
+oscillators, spaceships and methuselahs, in every rotation: a ~110-pattern catalog) and
+**right-click/drag to drop glider guns**. Holding a button auto-repeats after a short
+delay, then throttled. Controls:
+
+- **scroll wheel** — zoom the board (the footer keeps a fixed height; only the board scales)
+- **`-` / `=`** — lower / raise the frame-rate cap
+- **`[` / `]`** — auto-spawn a random pattern rarer / more often (`[` past the max = never; the default is off)
+- **`q` / Esc / window-X** — quit
+
+The sim **paces to a frame-rate cap** (default 30 fps, adjustable). It fits itself to
+the window and tracks live resizes, so the torus always fills the frame. A big block-font
+status line below the board reports generation, FPS (`measured/cap`), live cell count,
+frame spikes, the auto-spawn interval, and memory.
 
 The board is a packed **bitboard** — one arbitrary-precision integer per row, bit `x`
 = cell alive. A whole generation is one bit-plane neighbour sum per row over the three
@@ -34,12 +42,13 @@ nest format         # format the source
 
 - `src/bitboard.blsp` — the packed-bitboard board: `make`/`bset`/`place`/`step`/
   `cells`/`live-count`. The bit-plane Game-of-Life step is here (`step`).
-- `src/life.blsp` — the demo: the random seeder, click-to-add-a-shape interaction,
-  the block-font status renderer, and the three-actor frame loop.
-- `src/shapes.blsp` — still-life / oscillator / spaceship pattern geometry
-  (`*shapes*`).
-- `src/guns.blsp` — Gosper glider-gun geometry and its reflections
-  (`*shooters*`); a gun keeps re-energising a settling board.
+- `src/life.blsp` — the demo: the random seeder, the click/drag/scroll interaction
+  (shapes left, guns right, scroll to zoom), the block-font status renderer, and the
+  three-actor frame loop.
+- `src/shapes.blsp` — still-life / oscillator / spaceship / methuselah geometry, fanned
+  by rotation + reflection (Life is isotropic) into the ~110-pattern `*shapes*` catalog.
+- `src/guns.blsp` — Gosper glider-gun geometry, fanned into all eight orientations
+  (`*shooters*`); dropped on right-click and to re-energise a settling board.
 - `src/perflog.blsp` — a tiny process logger that writes a perf line to
   `life.log`.
 - `tests/life_test.blsp` — exercises the simulation core (blinker, glider,
@@ -64,12 +73,19 @@ nest format         # format the source
 - The SIM steps the board **serially** — `step` is the bulk of the CPU, and on
   these board sizes a serial recompute beats the copy-on-send overhead of fanning
   it across processes.
-- There is **no frame-rate cap** (go ham): the SIM steps as fast as it can, but it
-  still waits for the renderer's `[:drawn]` ack each frame, bounding the mailbox so it
-  never runs more than one frame ahead.
+- The SIM **paces to a frame-rate cap** (`*target-fps*`, default 30, live-adjustable with
+  `-`/`=`): after drawing it sleeps out the rest of the frame budget. It also waits for the
+  renderer's `[:drawn]` ack each frame, bounding the mailbox so it never runs more than one
+  frame ahead.
 - The renderer **only ever acts on a received message**, so GUI input (including a
   quit signal and **mouse clicks**) is drained no matter how long a frame takes — the
   window stays responsive even when a frame runs over budget.
-- **Interaction:** the board starts empty; a left-click is forwarded by the renderer
-  to the SIM as `[:click x y]`, which drops a random shape at that cell into the next
-  generation. (The old adaptive auto-injection schedule was removed — you drive it.)
+- **Interaction:** the board starts empty; the renderer forwards each input to the SIM —
+  `[:press/:drag :shape|:gun col row]` (left draws shapes, right draws guns), `[:release]`,
+  scroll-wheel zoom, and the `-`/`=`/`[`/`]` knobs — and the SIM folds the drawn patterns
+  into the next generation. A held button auto-repeats after `*hold-delay*`, then every
+  `*spawn-every*` gens; a drag draws freehand (one per cell) without re-arming. Zoom resizes
+  the board font (the footer is re-scaled to a fixed pixel height, so only the board grows);
+  cells that fall off the shrunk board are dropped (`bitboard/refit` clips, no wrap-back).
+  Auto-injection is back as an **opt-in** knob (`[`/`]` set the interval, default off) —
+  every `*inject-secs*` seconds the SIM sows a random pattern.

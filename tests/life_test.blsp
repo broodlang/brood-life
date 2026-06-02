@@ -21,8 +21,10 @@
       (assert= (sort (cells g4))
         (sort (map (fn ([x y]) [(+ x 1) (+ y 1)]) (cells g))))))
 
-  (test "neighbours wrap around the torus"
-    (is (includes? (neighbours [0 0]) [119 39])))
+  (test "the torus wraps top-to-bottom: a blinker across the top edge rotates normally"
+    (let (vertical (board [[1 39] [1 0] [1 1]]))
+      ; col 1, rows 39/0/1 — straddles the top
+      (assert= (sort (cells (step vertical))) (sort [[0 0] [1 0] [2 0]]))))  ; -> horizontal, row 0
 
   (test "a seeded board is deterministic, non-empty, and on-grid"
     (let (s (seed 42))
@@ -34,12 +36,14 @@
   (test "different seeds give different boards"
     (is (not (= (sort (cells (seed 1))) (sort (cells (seed 9)))))))
 
-  (test "a click drops a random shape onto the empty board"
+  (test "a left click drops a shape, a right click drops a 36-cell gun"
     (let (blank (make 120 40)
-          [dropped _] (apply-clicks blank [[10 10]] 3))
+          [shape-drop _] (apply-clicks blank [[10 10 :shape]] 3)
+          [gun-drop _] (apply-clicks blank [[10 10 :gun]] 3))
       (do
-        (is (= (live-count blank) 0))       ; the app starts empty
-        (is (> (live-count dropped) 0))))))  ; a click adds cells
+        (is (= (live-count blank) 0))  ; the app starts empty
+        (is (> (live-count shape-drop) 0))  ; a left click adds a shape
+        (assert= (live-count gun-drop) 36)))))  ; a right click adds a full glider gun
 
 ;; Shooters: the anti-stagnation guns. A gun keeps emitting gliders, so `inject-pattern`
 ;; sowing one onto a settled board makes the population trend up again. A one-cell typo
@@ -54,11 +58,11 @@
         (assert= (live-count g) 36)
         (is (> (live-count (stepn g 60)) (live-count g))))))
 
-  (test "the shooter set is four 36-cell reflections of the gun, each in its box"
+  (test "the shooter set is eight 36-cell orientations of the gun, on a non-negative origin"
     (do
-      (assert= (count *shooters*) 4)
+      (assert= (count *shooters*) 8)
       (is (every? (fn (s) (= (count s) 36)) *shooters*))
-      (is (every? (fn (s) (every? (fn ([x y]) (and (>= x 0) (<= x 35) (>= y 0) (<= y 8))) s))
+      (is (every? (fn (s) (every? (fn ([x y]) (and (>= x 0) (>= y 0) (<= x 35) (<= y 35))) s))
             *shooters*))))
 
   (test "inject-pattern sows a known pattern onto a flat board, deterministically"

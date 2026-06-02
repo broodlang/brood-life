@@ -1,35 +1,60 @@
 (defmodule life
   "Conway's Game of Life on a wrapping torus, animated in a native GUI window. The
-board is a packed BITBOARD (see `bitboard`) fit to the window. It starts EMPTY —
-click anywhere to drop a random shape at that cell — and steps as fast as it can
-draw (no frame-rate cap)."
+board is a packed BITBOARD (see `bitboard`) fit to the window. It starts EMPTY — LEFT
+click/drag drops random shapes, RIGHT click/drag drops glider guns, holding either
+auto-repeats (throttled), and the SCROLL wheel zooms the board. Keys: `-`/`=` lower/raise
+the fps cap, `[`/`]` make the auto-spawn rarer/more-often. The sim paces to the
+*target-fps* cap; the footer stays a fixed height while only the board zooms."
   (:use editor/display))
 
 (require 'bitboard)  ; the packed-bitboard board: make / bset / place / step / cells / live-count
-(require 'shapes)  ; still-life / oscillator / spaceship patterns (*shapes*) — dropped on click
-(require 'guns)  ; glider-gun patterns (*shooters*) — sown by inject-pattern
+(require 'shapes)  ; still-life / oscillator / spaceship / methuselah patterns (*shapes*) — left click
+(require 'guns)  ; glider-gun patterns (*shooters*) — right click, and sown by inject-pattern
 (require 'perflog)  ; tiny file logger — the stats process writes a perf line to life.log
 
 (def *w* 120)
 (def *h* 40)
-(def *target-fps* 30)  ; generations/frames per second the loop paces to
+;; The frame-rate CAP: the sim paces each generation to *target-fps* (sleeps out the rest
+;; of the budget after drawing). Adjustable live with `-`/`=` (slower/faster), clamped to
+;; [*fps-min*, *fps-max*]; *frame-ns* is re-derived on each change and the sim re-reads it.
+(def *target-fps* 30)  ; the cap (generations/frames per second)
+(def *fps-min* 1)
+(def *fps-max* 240)
 (def *frame-ns* (quot 1000000000 *target-fps*))  ; per-frame period in ns (≈33ms at 30)
 (def *board-height* 5)  ; the board window's OWN cell font px (per-window) — small ⇒ dense board
-;; FIXED bottom-bar font scale: the status text is always drawn this many board-cells
-;; tall (≈*board-height*×*status-scale* px), never auto-fitted to the content/width —
-;; so the bar height and glyph size stay rock-steady frame to frame (a long line just
-;; truncates rather than shrinking the whole bar). 4 fits the ~52-char status across
-;; the default 840px window; raise for bigger text, lower to fit more on a narrow one.
-(def *status-scale* 4)
+;; Scroll-wheel zoom: each notch steps *board-height* by *zoom-step* px (bigger font ⇒
+;; fewer, larger cells ⇒ zoomed IN), clamped to [*zoom-min*, *zoom-max*]. Zooming in
+;; shrinks the torus and DROPS the cells that fall off (bitboard/refit clips) — what's not
+;; on the board is gone, not wrapped back on.
+(def *zoom-min* 2)
+(def *zoom-max* 40)
+(def *zoom-step* 1)
+;; The bottom status bar is held at a FIXED PIXEL height regardless of zoom: only the
+;; BOARD scales with the wheel. The bar is drawn *status-scale* board-cells tall, so as the
+;; board font (*board-height*) changes we RE-DERIVE *status-scale* to keep the bar ≈
+;; *footer-px* px (apply-zoom! does this). At the defaults (20 / 5) that's the old fixed 4.
+(def *footer-px* 20)  ; target footer height in px (constant across zoom)
+(def *status-scale* 4)  ; board-cells tall; re-derived from *footer-px*/*board-height* on zoom
 (def *status-face* {:bg :blue :fg :white :bold true})  ; the bottom buffer-bar style (display/bar)
 (def *grid-min* 5)  ; the sim torus never shrinks below *grid-min* x *grid-min*
 (def *seed-cells* 3000)  ; target initial ACTIVE (live) cell count — `seed` sows random
 ; shapes until ~this many cells are live (the working population we pace to 30 fps).
 ; Capped to ~90% of the torus area so a board smaller than this can't loop forever.
+;; A STATIONARY hold auto-repeats like a keyboard key: the press lands a shape AT ONCE,
+;; then nothing for *hold-delay* gens (so a quick click stays a single drop), then a repeat
+;; every *spawn-every* gens. Dragging is DRAWING — one shape per cell crossed — and does
+;; NOT re-arm the delay, so when a drag stops the auto-repeat picks straight up at the
+;; throttle rate; only a fresh press restarts the warm-up delay.
+(def *hold-delay* 12)  ; gens to hold before auto-repeat starts (~0.4 s at 30 fps)
+(def *spawn-every* 6)  ; gens between repeats once it's going (~5/s at 30 fps)
+;; Auto-inject: drop a random pattern every *inject-secs* seconds to keep the board lively
+;; on its own (0 = NEVER — the default; you drive it). Adjustable live with `[` (less often,
+;; rolling past *inject-max* back to never) and `]` (more often; from never it switches on).
+(def *inject-secs* 0)  ; seconds between random auto-injects (0 = never)
+(def *inject-max* 30)
 (def *status-every* 10)  ; stats push the bar every N gens (~3 Hz at 30 fps) — readable, not a blur
 (def *log-every* 30)  ; stats write a perf line to life.log every N gens (~1 Hz at 30 fps)
 (def *log-path* "life.log")  ; where the perf log is written (cwd; truncated each run)
-(def *offsets* [[-1 -1] [-1 0] [-1 1] [0 -1] [0 1] [1 -1] [1 0] [1 1]])
 
 ;; Everything sowable mid-run: the still-lifes / oscillators / spaceships of `*shapes*`
 ;; plus the glider guns of `*shooters*` (both required above). `inject-pattern` samples
@@ -37,17 +62,9 @@ draw (no frame-rate cap)."
 ;; lands often enough to keep re-energising a settling board.
 (def *patterns* (concat *shapes* *shooters*))
 
-(defn shift (pat x y)
-  "`pat` (a list of `[dx dy]`) shifted to origin `[x y]` and wrapped on the torus."
-  (map (fn ([dx dy]) [(mod (+ x dx) *w*) (mod (+ y dy) *h*)]) pat))
-
-(defn neighbours (cell)
-  "The 8 torus-wrapped neighbours of cell `[x y]`."
-  (let ([x y] cell) (shift *offsets* x y)))
-
-;; The generation step itself is `bitboard/step` (one bit-plane neighbour sum over the
-;; packed rows — cost independent of population). `neighbours`/`shift` above stay as the
-;; pure torus-coordinate helpers (used by the tests and pattern placement).
+;; The generation step is `bitboard/step` (one bit-plane neighbour sum over the packed
+;; rows — cost independent of population); torus wrapping lives entirely in `bitboard`
+;; (its row shifts wrap east/west, `place`/`refit` wrap or clip with `mod`/range checks).
 
 (defn seed--sow (s acc target)
   "Sow random shapes at random positions, threading the PRNG `s`, until the bitboard
@@ -66,8 +83,8 @@ are live — capped to ~90% of the torus area (floored at 4) so a small board st
   (seed--sow s (bitboard/make *w* *h*) (max 4 (min *seed-cells* (floor (* 0.9 (* *w* *h*)))))))
 
 ;; Pattern GEOMETRY lives in the `shapes` / `guns` modules; placement is `life`'s job
-;; (it needs the torus `*w*`/`*h*` and `shift`). The sim calls this on a schedule both
-;; for visual variety and to revive a stagnant board (a gun lands eventually and
+;; (it needs the torus `*w*`/`*h*` and `bitboard/place`). The sim calls this on a schedule
+;; both for visual variety and to revive a stagnant board (a gun lands eventually and
 ;; re-energises it).
 (defn inject-pattern (live s)
   "Sow a random known pattern — any of `*patterns*` — at a random torus position onto
@@ -78,15 +95,19 @@ bitboard `live`, threading the PRNG `s`; returns `[live' s']`."
     [(bitboard/place live pat x y) s3]))
 
 ;; The space before each unit and the ` · ` between fields keep the digits from running
-;; together, so the line reads at a glance: `gen 5 · 22 fps · 30 cells · 0 spikes · 12 MB`.
-;; (No GC field: `gc-stats` is a dev-only builtin, absent from `nest release`.)
+;; together, so the line reads at a glance: `gen 5 · 22/30 fps · 30 cells · spawn off · 12 MB`.
+;; The `cap`/`spawn` fields echo the live controls (`-`/`=` fps, `[`/`]` spawn) so the
+;; current settings are always visible. (No GC field: `gc-stats` is dev-only.)
 (defn status (gen cells per spikes)
   "The live status line for the bottom strip — spelled-out, gapped fields from one
-generation's measurement (`per` = nanoseconds since the previous frame)."
+generation's measurement (`per` = nanoseconds since the previous frame), plus the current
+fps cap and auto-spawn interval (read from the globals the keys adjust)."
   (str "gen "
     gen
     " · "
     (quot 1000 (max 1 (quot per 1000000)))
+    "/"
+    *target-fps*
     " fps"
     " · "
     cells
@@ -94,6 +115,8 @@ generation's measurement (`per` = nanoseconds since the previous frame)."
     " · "
     spikes
     " spikes"
+    " · spawn "
+    (if (> *inject-secs* 0) (str *inject-secs* "s") "off")
     " · "
     (quot (mem-bytes) 1048576)
     " MB"))
@@ -119,13 +142,15 @@ across the bottom rows."
   ;; row), no intermediate `[x y]` list, no clip (the bitboard IS the viewport), no
   ;; `apply`/`frame` nil-filter. `clear` first, status bar last.
   (let (rows (get live :rows))
-    (into (into [(clear)]
-            (mapcat (fn (y)
-                      (let (r (vector-ref rows y))
-                        ;; the display `:text` op literal (display/text without the
-                        ;; per-cell fn call + optional-face check) — this is the hot path
-                        (if (= r 0) nil (map (fn (x) [:text y x "▪"]) (bit-positions r)))))
-              (range (get live :h))))
+    (into
+      (into [(clear)]
+        (mapcat
+          (fn (y)
+            (let (r (vector-ref rows y))
+              ;; the display `:text` op literal (display/text without the
+              ;; per-cell fn call + optional-face check) — this is the hot path
+              (if (= r 0) nil (map (fn (x) [:text y x "▪"]) (bit-positions r)))))
+          (range (get live :h))))
       [(status-bar status vrows vcols)])))
 
 ;; ---- the actors: SIM (model + clock) → STATS → RENDERER (compositor) -------------
@@ -163,29 +188,40 @@ and writes a perf line to the `logger` every `*log-every*` gens."
                                       (perflog/log-line logger (log-fmt gen cells per spikes)))
                                     (stats-loop renderer logger)))))
 
-(defn sim-pace (clicks)
+(defn sim-pace (clicks held armed)
   "Wait for the renderer's `[:drawn]` ack — so the sim never runs more than one frame
-ahead of it (bounds the mailbox) — collecting any `[:click x y]` (a mouse drop the
-renderer forwards) that arrive meanwhile. Returns `:stop`, or the accumulated list of
-click `[x y]` cells to fold into the next generation. The frame-rate cap is REMOVED (go
-ham): it returns as soon as the renderer acks, with no sleep."
+ahead of it (bounds the mailbox) — collecting the `[x y kind]` cells to draw this frame
+and tracking the held button. A `[:press kind x y]` draws a `kind` pattern (`:shape` on
+left, `:gun` on right), sets the held cell, and ARMS the key-repeat delay; a `[:drag kind
+x y]` draws and moves the held cell but leaves the delay alone (drawing doesn't re-arm);
+`[:release]` clears the held cell. Returns `:stop`, or `[clicks held' armed?]` — the cells
+to fold in, the held `[x y kind]` (or nil), and whether a press happened this frame. The
+frame-rate cap is REMOVED (go ham): it returns as soon as the renderer acks, with no sleep."
   (receive (:stop :stop)
-    ([:drawn] clicks)
-    ([:click x y] (sim-pace (cons [x y] clicks)))))
+    ([:drawn] [clicks held armed])
+    ([:press kind x y] (sim-pace (cons [x y kind] clicks) [x y kind] true))
+    ([:drag kind x y] (sim-pace (cons [x y kind] clicks) [x y kind] armed))
+    ([:release] (sim-pace clicks nil armed))))
 
 (defn apply-clicks (board clicks s)
-  "Drop a random shape (`*shapes*`) at each click cell `[x y]`, threading the PRNG `s`;
-returns `[board' s']`. This is the only way cells enter the board — the app starts empty."
-  (reduce (fn ([b s] [x y])
-            (let ([shape s1] (sample s *shapes*))
-              [(bitboard/place b shape x y) s1]))
-    [board s] clicks))
+  "Drop a random pattern at each click cell `[x y kind]`, threading the PRNG `s`: a `:gun`
+cell samples a glider gun (`*shooters*`, right button), any other kind samples a shape
+(`*shapes*`, left button). Returns `[board' s']` — the only way cells enter the board
+(the app starts empty)."
+  (reduce (fn ([b s] [x y kind])
+            (let (catalog (if (= kind :gun) *shooters* *shapes*)
+                  [pat s1] (sample s catalog))
+              [(bitboard/place b pat x y) s1]))
+    [board s]
+    clicks))
 
-(defn sim-loop (renderer stats live gen prev spikes s)
+(defn sim-loop (renderer stats live gen prev spikes s held hn)
   "SIM: the model + the clock. Each frame it fits the board to the current window, pushes
 it to the renderer and a measurement to stats, computes the NEXT generation with
 `bitboard/step` (overlapping the renderer drawing this one), then waits for the ack —
-folding in any clicked-in shapes — and recurses. `:stop` ends it."
+folding in any drawn patterns (shapes on left, guns on right), plus a key-repeat drop at
+the HELD cell once it's been held past *hold-delay* — and recurses. `hn` counts gens since
+the last fresh PRESS (a drag draws but doesn't reset it). `:stop` ends it."
   (let (live (bitboard/fit live *w* *h*)
         now (now-ns)
         per (- now prev)
@@ -194,11 +230,33 @@ folding in any clicked-in shapes — and recurses. `:stop` ends it."
       (send renderer [:board live])
       (send stats [:meas gen (bitboard/live-count live) per spk])
       (let (nxt (bitboard/step live)  ; overlaps the renderer drawing `live`
-            paced (sim-pace []))
+            paced (sim-pace [] held false))
         (if (= :stop paced)
           :stopped
-          (let ([nxt2 s2] (apply-clicks nxt paced s))
-            (sim-loop renderer stats nxt2 (+ gen 1) now spk s2)))))))
+          (let ([clicks held2 armed] paced
+                ;; Only a fresh PRESS (`armed`) re-arms the delay (hn←0); a drag draws but
+                ;; lets hn keep climbing, so a stopped drag keeps auto-repeating instead of
+                ;; restarting the warm-up. Auto-repeat fires on idle frames (nothing drawn
+                ;; this frame) once hn passes *hold-delay*, then every *spawn-every* gens.
+                hn2 (if armed 0 (if held2 (+ hn 1) 0))
+                repeat? (and held2
+                          (= 0 (count clicks))
+                          (>= hn2 *hold-delay*)
+                          (= 0 (mod (- hn2 *hold-delay*) *spawn-every*)))
+                drops (if repeat? (cons held2 clicks) clicks)
+                [nxt2 s2] (apply-clicks nxt drops s)
+                ;; auto-inject: every *inject-secs* seconds (≈ secs×fps gens) sow a random
+                ;; pattern so the board keeps moving on its own (0 = never — skip entirely).
+                [nxt3 s3] (if (and (> *inject-secs* 0)
+                                (= 0 (mod gen (max 1 (* *inject-secs* *target-fps*)))))
+                            (inject-pattern nxt2 s2)
+                            [nxt2 s2]))
+            (do
+              ;; pace to the fps cap: sim-pace already blocked on the renderer's ack, so
+              ;; this just sleeps out the rest of this frame's *frame-ns* budget.
+              (let (nap (quot (- *frame-ns* (- (now-ns) now)) 1000000))
+                (when (> nap 0) (sleep nap)))
+              (sim-loop renderer stats nxt3 (+ gen 1) now spk s3 held2 hn2))))))))
 
 (defn quit-signal? (m)
   "Is `m` a quit signal? — the window's X (`:close`, a frontend signal distinct from the
@@ -223,18 +281,51 @@ in this SAME mailbox, so a quit signal stops the sim + stats and closes the wind
                             (send sim [:drawn])
                             (render-loop w sim stats nl status))))
     ([:status s] (render-loop w sim stats live s))
-    ;; A left-click drops a shape: forward the cell to the sim (col=x, row=y), which
-    ;; folds it into the next generation. Other mouse events fall through (ignored).
+    ;; Left button draws SHAPES, right button draws GUNS. A PRESS draws once and arms the
+    ;; key-repeat; a DRAG draws at each cell crossed without re-arming, so dragging is
+    ;; freehand drawing; release (either button) stops the auto-repeat. The scroll wheel
+    ;; zooms the board font. Cells forward as (col=x, row=y); other events fall through.
     ([:mouse :press :left row col mods] (do
-                                          (send sim [:click col row])
+                                          (send sim [:press :shape col row])
                                           (render-loop w sim stats live status)))
-    (m (if (quit-signal? m) (render-quit sim stats w) (render-loop w sim stats live status)))))
+    ([:mouse :drag :left row col mods] (do
+                                         (send sim [:drag :shape col row])
+                                         (render-loop w sim stats live status)))
+    ([:mouse :press :right row col mods] (do
+                                           (send sim [:press :gun col row])
+                                           (render-loop w sim stats live status)))
+    ([:mouse :drag :right row col mods] (do
+                                          (send sim [:drag :gun col row])
+                                          (render-loop w sim stats live status)))
+    ([:mouse :release _ row col mods] (do
+                                        (send sim [:release])
+                                        (render-loop w sim stats live status)))
+    ([:mouse :scroll-up _ row col mods] (do
+                                          (zoom w *zoom-step*)
+                                          (render-loop w sim stats live status)))
+    ([:mouse :scroll-down _ row col mods] (do
+                                            (zoom w (- 0 *zoom-step*))
+                                            (render-loop w sim stats live status)))
+    ;; Keyboard knobs (keys arrive as 1-char strings): `-`/`=` slower/faster fps cap,
+    ;; `[`/`]` rarer/more-often auto-spawn. They `def` the globals the sim + status read,
+    ;; then the loop continues; anything else that isn't a quit signal is ignored.
+    (m (if (quit-signal? m)
+         (render-quit sim stats w)
+         (do
+           (if (= m "-")
+             (set-fps -1)
+             (if (= m "=")
+               (set-fps 1)
+               (if (= m "[")
+                 (set-inject 1)
+                 (if (= m "]") (set-inject -1) nil))))
+           (render-loop w sim stats live status))))))
 
-;; `*w*`/`*h*` — the torus `step` wraps on — track the window area but are FLOORED at
-;; *grid-min*×*grid-min*: shrinking the window below the board then can't collapse the
-;; torus and wrap every cell onto itself; those cells stay live in memory, off-view, and
-;; reappear when the window grows back. Globals are image-wide, so the next `step` wraps on
-;; the new size too. The std `ui--loop` re-reads size the same way each frame (std/editor/ui.blsp).
+;; `*w*`/`*h*` — the torus `step` wraps on — track the window area (in cells, which the
+;; zoom font size also changes) but are FLOORED at *grid-min*×*grid-min* so a tiny window
+;; or deep zoom can't collapse the torus to nothing. Shrinking clips off-board cells
+;; (bitboard/refit), so they don't come back when it grows again. Globals are image-wide,
+;; so the next `step` wraps on the new size. The std `ui--loop` re-reads size the same way.
 (defn grid-fit (w)
   "Re-fit the sim torus to window `w` and return the visible board viewport `[vcols vrows]`
 for `render` to clip to (the board is the window less the bottom `*status-scale*`-row bar)."
@@ -245,17 +336,47 @@ for `render` to clip to (the board is the window less the bottom `*status-scale*
       (def *h* (max *grid-min* vrows))
       [cols vrows])))
 
+(defn apply-zoom! (w h)
+  "Set the board font to `h` px AND re-derive *status-scale* so the bottom bar keeps a
+fixed ≈*footer-px* pixel height — only the BOARD scales with zoom, the footer doesn't.
+Re-applies the font to window `w`; the next `grid-fit` refits the torus to the new grid."
+  (do
+    (def *board-height* h)
+    (def *status-scale* (max 1 (quot (+ *footer-px* (quot h 2)) h)))  ; rounded *footer-px*/h
+    (gui-font! w {:family :mono :height h})))
+
+(defn zoom (w dir)
+  "Step the board font size by `dir` px (+ zooms IN: bigger cells, fewer of them; − zooms
+out), clamped to [*zoom-min*, *zoom-max*]. The next `grid-fit` re-reads the cell grid and
+refits the torus, clipping any cells now off-board; the footer keeps its pixel height."
+  (apply-zoom! w (max *zoom-min* (min *zoom-max* (+ *board-height* dir)))))
+
+(defn set-fps (delta)
+  "Change the frame-rate cap by `delta` fps (clamped to [*fps-min*, *fps-max*]) and
+re-derive *frame-ns*; the sim re-reads it next frame. Behind the `-`/`=` keys."
+  (let (f (max *fps-min* (min *fps-max* (+ *target-fps* delta))))
+    (do (def *target-fps* f) (def *frame-ns* (quot 1000000000 f)))))
+
+(defn set-inject (dir)
+  "Adjust the auto-spawn interval. `dir` > 0 makes it RARER (interval +1 s; past *inject-max*
+it rolls back to never/0); `dir` < 0 makes it MORE OFTEN (−1 s, floored at 1; from 'never'
+it switches on at a sensible 5 s). Behind the `[`/`]` keys."
+  (def *inject-secs*
+    (if (> dir 0)
+      (if (>= *inject-secs* *inject-max*) 0 (+ *inject-secs* 1))
+      (if (= *inject-secs* 0) 5 (max 1 (- *inject-secs* 1))))))
+
 (defn run-life ()
   "Wire up and run the three actors. This root process becomes the RENDERER (it owns the
-window); only the board window is shrunk via per-window `gui-font!`. We `grid-fit` once to
-size `*w*`/`*h*`, start with an EMPTY board (click to drop shapes), then spawn stats + sim
-and hand them this process's pid so they can push `[:status]`/`[:board]` in."
-  (let (w (gui-open)
-        _ (gui-font! w {:family :mono :height *board-height*})  ; smaller blocks, board window ONLY
+window); the board window's font is set via `apply-zoom!` (which also fixes the footer
+height). We `grid-fit` once to size `*w*`/`*h*`, start with an EMPTY board (click to drop
+shapes), then spawn stats + sim and hand them this process's pid so they push in."
+  (let (w (gui-open "Brood Life")  ; the OS title-bar text (gui-title! could change it later)
+        _ (apply-zoom! w *board-height*)  ; board font + derived footer scale, board window ONLY
         _ (grid-fit w)  ; sizes *w*/*h* before we build the board
         start (now-ns)
         board (bitboard/make *w* *h*)  ; START EMPTY — clicks add random shapes
         me (self)  ; this root process is the renderer
         stats (spawn (stats-loop me (perflog/log-start *log-path*)))
-        sim (spawn (sim-loop me stats board 0 (- start *frame-ns*) 0 start)))
+        sim (spawn (sim-loop me stats board 0 (- start *frame-ns*) 0 start nil 0)))
     (render-loop w sim stats board "")))

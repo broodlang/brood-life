@@ -1,14 +1,152 @@
 (defmodule shapes
-  "Known Life patterns — still-lifes, oscillators, and spaceships — as `[dx dy]` cells
-from a local origin, sown at random by life (at seed time and via inject-pattern).
-Pure pattern GEOMETRY; torus placement (`*w*`/`*h*`, `shift`) stays in `life`, like
-the glider guns in `guns`.")
+  "Known Life patterns — still-lifes, oscillators, spaceships and methuselahs — as
+`[dx dy]` cells from a local origin, sown at random by life (at seed time, on a
+left click/drag, and via inject-pattern). Pure pattern GEOMETRY; torus placement
+(`*w*`/`*h*`, `bitboard/place`) stays in `life`, like the glider guns in `guns`.
 
-;; block, blinker, glider, toad, beacon, beehive, LWSS (in this order).
-(def *shapes*
-  [[[0 0] [1 0] [0 1] [1 1]] [[0 0] [1 0] [2 0]]
-    [[1 0] [2 1] [0 2] [1 2] [2 2]]
-    [[1 0] [2 0] [3 0] [0 1] [1 1] [2 1]]
-    [[0 0] [1 0] [0 1] [1 1] [2 2] [3 2] [2 3] [3 3]]
-    [[1 0] [2 0] [0 1] [3 1] [1 2] [2 2]]
-    [[0 0] [3 0] [4 1] [0 2] [4 2] [1 3] [2 3] [3 3] [4 3]]])
+Each base pattern below is named and drawn as a little ASCII map so the coordinates are
+checkable by eye. The bag the app actually samples (`*shapes*`) is every base in all of
+its distinct ORIENTATIONS — the four rotations and their mirrors — because Life's rules
+are isotropic, so a rotated/reflected pattern behaves identically (a glider just heads a
+different way). That turns ~26 bases into ~110 catalog entries and gives spaceships and
+guns travelling every direction. The base periods/lifespans are verified by stepping
+`bitboard/step` (a spaceship returns to its own shape translated, a still-life is fixed,
+diehard vanishes at gen 130).")
+
+;; ---- orientation generation: the isotropy that fans each base into the catalog --------
+(defn normalize (pat)
+  "`pat` shifted so its minimum x and y are 0, and sorted — a canonical form so equal
+shapes compare equal (lets `distinct` dedupe a symmetric pattern's repeated orientations)."
+  (let (mx (apply min (map (fn ([x y]) x) pat)) my (apply min (map (fn ([x y]) y) pat)))
+    (sort (map (fn ([x y]) [(- x mx) (- y my)]) pat))))
+
+(defn rotate (pat)
+  "`pat` rotated 90° (x,y) → (y,−x), re-normalized to a non-negative origin."
+  (normalize (map (fn ([x y]) [y (- 0 x)]) pat)))
+
+(defn mirror (pat)
+  "`pat` reflected across the y-axis (x,y) → (−x,y), re-normalized."
+  (normalize (map (fn ([x y]) [(- 0 x) y]) pat)))
+
+(defn orientations (pat)
+  "The distinct orientations of `pat`: its four rotations and each one mirrored (up to 8;
+fewer when the pattern is symmetric). All behave identically under Life's isotropic rules."
+  (let (r0 (normalize pat) r1 (rotate r0) r2 (rotate r1) r3 (rotate r2))
+    (distinct [r0 r1 r2 r3 (mirror r0) (mirror r1) (mirror r2) (mirror r3)])))
+
+;; ---- still-lifes: fixed under `step` -------------------------------------------
+(def block [[0 0] [1 0] [0 1] [1 1]])  ; OO / OO
+(def beehive [[1 0] [2 0] [0 1] [3 1] [1 2] [2 2]])  ; .OO. / O..O / .OO.
+(def loaf [[1 0] [2 0] [0 1] [3 1] [1 2] [3 2] [2 3]])  ; .OO. / O..O / .O.O / ..O.
+(def boat [[0 0] [1 0] [0 1] [2 1] [1 2]])  ; OO. / O.O / .O.
+(def tub [[1 0] [0 1] [2 1] [1 2]])  ; .O. / O.O / .O.
+(def ship [[0 0] [1 0] [0 1] [2 1] [1 2] [2 2]])  ; OO. / O.O / .OO
+(def pond [[1 0] [2 0] [0 1] [3 1] [0 2] [3 2] [1 3] [2 3]])  ; .OO. / O..O / O..O / .OO.
+(def barge [[1 0] [0 1] [2 1] [1 2] [3 2] [2 3]])  ; the long tub
+(def long-ship [[0 0] [1 0] [0 1] [2 1] [1 2] [3 2] [2 3] [3 3]])
+(def snake [[0 0] [1 0] [3 0] [0 1] [2 1] [3 1]])  ; OO.O / O.OO
+(def eater1 [[0 0] [1 0] [0 1] [2 1] [2 2] [2 3] [3 3]])  ; the fishhook eater
+
+;; ---- oscillators: return to themselves after `period` gens ----------------------
+(def blinker [[0 0] [1 0] [2 0]])  ; OOO     (period 2)
+(def toad [[1 0] [2 0] [3 0] [0 1] [1 1] [2 1]])  ; .OOO / OOO.   (period 2)
+(def beacon [[0 0] [1 0] [0 1] [1 1] [2 2] [3 2] [2 3] [3 3]])  ; two blocks    (period 2)
+(def clock [[2 0] [0 1] [2 1] [1 2] [3 2] [1 3]])  ; period 2
+;; the pulsar (period 3, 13×13) and pentadecathlon (period 15) — the big showy ones.
+(def pulsar
+  [[2 0] [3 0]
+    [4 0]
+    [8 0]
+    [9 0]
+    [10 0]
+    [0 2]
+    [5 2]
+    [7 2]
+    [12 2]
+    [0 3]
+    [5 3]
+    [7 3]
+    [12 3]
+    [0 4]
+    [5 4]
+    [7 4]
+    [12 4]
+    [2 5]
+    [3 5]
+    [4 5]
+    [8 5]
+    [9 5]
+    [10 5]
+    [2 7]
+    [3 7]
+    [4 7]
+    [8 7]
+    [9 7]
+    [10 7]
+    [0 8]
+    [5 8]
+    [7 8]
+    [12 8]
+    [0 9]
+    [5 9]
+    [7 9]
+    [12 9]
+    [0 10]
+    [5 10]
+    [7 10]
+    [12 10]
+    [2 12]
+    [3 12]
+    [4 12]
+    [8 12]
+    [9 12]
+    [10 12]])
+(def pentadecathlon
+  [[1 0] [1 1] [0 2] [2 2] [1 3] [1 4] [1 5] [1 6] [0 7] [2 7] [1 8] [1 9]])
+
+;; ---- spaceships: glide across the torus, period 4 -------------------------------
+;; LWSS / MWSS / HWSS — light-, middle- and heavy-weight, each one cell wider.
+(def lwss [[0 0] [3 0] [4 1] [0 2] [4 2] [1 3] [2 3] [3 3] [4 3]])
+(def mwss [[2 0] [0 1] [4 1] [5 2] [0 3] [5 3] [1 4] [2 4] [3 4] [4 4] [5 4]])
+(def hwss [[2 0] [3 0] [0 1] [5 1] [6 2] [0 3] [6 3] [1 4] [2 4] [3 4] [4 4] [5 4] [6 4]])
+(def glider [[1 0] [2 1] [0 2] [1 2] [2 2]])  ; .O. / ..O / OOO  (period 4)
+
+;; ---- methuselahs: small starts that erupt into long-lived chaos -----------------
+;; These don't settle — they're the energisers. R-pentomino runs ~1100 gens, acorn
+;; ~5200, diehard burns out at exactly gen 130. Perfect for clicking onto the board.
+(def r-pentomino [[1 0] [2 0] [0 1] [1 1] [1 2]])  ; .OO / OO. / .O.
+(def acorn [[1 0] [3 1] [0 2] [1 2] [4 2] [5 2] [6 2]])
+(def diehard [[6 0] [0 1] [1 1] [1 2] [5 2] [6 2] [7 2]])
+(def pi-heptomino [[0 0] [1 0] [2 0] [0 1] [2 1] [0 2] [2 2]])  ; OOO / O.O / O.O
+(def thunderbird [[0 0] [1 0] [2 0] [1 2] [1 3] [1 4]])  ; OOO / ... / .O. / .O. / .O.
+
+;; The named bases, one per shape. `*shapes*` fans each into all its orientations and
+;; dedupes, so a left click/drag (and `seed`/`inject-pattern`) samples the full ~110.
+(def *base-shapes*
+  [block beehive
+    loaf
+    boat
+    tub
+    ship
+    pond
+    barge
+    long-ship
+    snake
+    eater1
+    blinker
+    toad
+    beacon
+    clock
+    pulsar
+    pentadecathlon
+    lwss
+    mwss
+    hwss
+    glider
+    r-pentomino
+    acorn
+    diehard
+    pi-heptomino
+    thunderbird])
+
+(def *shapes* (distinct (mapcat orientations *base-shapes*)))

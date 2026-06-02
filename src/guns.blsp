@@ -1,12 +1,15 @@
 (defmodule guns
   "Glider GUNS for the Game of Life — patterns that, unlike the still-lifes and
-oscillators in life's `*shapes*`, emit a glider every period FOREVER, so dropping
-one onto a settled board re-energises it. Pure pattern GEOMETRY: cells as `[dx dy]`
-from a top-left origin, plus reflections. Torus placement (`*w*`/`*h*`, `shift`)
-and the schedule that sows them stay in `life` (life/inject-pattern).")
+oscillators in `shapes`, emit a glider every period FOREVER, so dropping one onto a
+settled board re-energises it. A right click/drag in the app drops one of these. Pure
+pattern GEOMETRY: cells as `[dx dy]` from a top-left origin. Torus placement (`*w*`/`*h*`)
+and the schedule that sows them stay in `life` (life/inject-pattern)."
+  (:use shapes))
+
+(require 'shapes)  ; the shared `orientations` generator (Life is isotropic, so do guns)
 
 ;; The Gosper glider gun (36×9, period 30), as `[dx dy]` cells from its top-left
-;; origin — the base pattern every shooter is built from.
+;; origin — the one gun every shooter is an orientation of.
 (def *gosper-gun*
   [[0 4] [0 5]
     [1 4]
@@ -44,21 +47,7 @@ and the schedule that sows them stay in `life` (life/inject-pattern).")
     [35 2]
     [35 3]])
 
-;; A reflection of a gun is itself a valid gun (Life's rules are reflection-symmetric),
-;; so the one Gosper definition yields more shooters — firing along different diagonals
-;; — for free.
-(defn flip-x (pat)
-  "`pat` mirrored across its own vertical mid-line."
-  (let (mx (apply max (map (fn ([x y]) x) pat)))
-    (map (fn ([x y]) [(- mx x) y]) pat)))
-
-(defn flip-y (pat)
-  "`pat` mirrored across its own horizontal mid-line."
-  (let (my (apply max (map (fn ([x y]) y) pat)))
-    (map (fn ([x y]) [x (- my y)]) pat)))
-
-;; The shooter set: the Gosper gun in all four reflections (each a working gun).
-(def *shooters*
-  [*gosper-gun* (flip-x *gosper-gun*)
-    (flip-y *gosper-gun*)
-    (flip-x (flip-y *gosper-gun*))])
+;; A rotation or reflection of a gun is itself a valid gun (Life's rules are isotropic),
+;; so the one Gosper definition yields all eight shooters — firing along every diagonal —
+;; for free. `orientations` (from `shapes`) dedupes the symmetric repeats.
+(def *shooters* (shapes/orientations *gosper-gun*))

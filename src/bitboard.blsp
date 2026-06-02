@@ -17,7 +17,8 @@ the torus) and `bit-positions` (so rendering is O(live), not O(area)).")
 (defn bset (board x y)
   "Set cell `(x,y)` live; returns the new board. Caller wraps `x`/`y` into range."
   (let (rows (get board :rows))
-    (assoc board :rows
+    (assoc board
+      :rows
       (vector-assoc rows y (bit-or (vector-ref rows y) (bit-shift-left 1 x))))))
 
 (defn place (board pat x y)
@@ -39,20 +40,30 @@ the torus) and `bit-positions` (so rendering is O(live), not O(area)).")
 ;; with full-adders, then a cell lives iff the count is 3, or 2 and it's already
 ;; live → `s1 & ~s2 & ~s3 & (s0 | cur)`, masked to w bits (`~` is `xor mask`).
 (defn bb--row-next (above cur below mask wm1)
-  (let (masks [(bb--west above mask wm1) above (bb--east above mask wm1)
-               (bb--west cur mask wm1) (bb--east cur mask wm1)
-               (bb--west below mask wm1) below (bb--east below mask wm1)]
+  (let (masks [(bb--west above mask wm1) above
+                (bb--east above mask wm1)
+                (bb--west cur mask wm1)
+                (bb--east cur mask wm1)
+                (bb--west below mask wm1)
+                below
+                (bb--east below mask wm1)]
         planes (reduce (fn ([s0 s1 s2 s3] m)
-                         (let (c (bit-and s0 m) s0b (bit-xor s0 m)
-                               c2 (bit-and s1 c) s1b (bit-xor s1 c)
-                               c3 (bit-and s2 c2) s2b (bit-xor s2 c2)
+                         (let (c (bit-and s0 m)
+                               s0b (bit-xor s0 m)
+                               c2 (bit-and s1 c)
+                               s1b (bit-xor s1 c)
+                               c3 (bit-and s2 c2)
+                               s2b (bit-xor s2 c2)
                                s3b (bit-or s3 c3))
                            [s0b s1b s2b s3b]))
-                 [0 0 0 0] masks)
-        s0 (vector-ref planes 0) s1 (vector-ref planes 1)
-        s2 (vector-ref planes 2) s3 (vector-ref planes 3))
+                 [0 0 0 0]
+                 masks)
+        s0 (vector-ref planes 0)
+        s1 (vector-ref planes 1)
+        s2 (vector-ref planes 2)
+        s3 (vector-ref planes 3))
     (bit-and (bit-and s1 (bit-and (bit-xor s2 mask) (bit-xor s3 mask)))
-             (bit-or s0 cur))))
+      (bit-or s0 cur))))
 
 (defn bb--step-row (y rows zero h mask wm1)
   "The next state of row `y`. An empty 3-row band (above/self/below all zero)
@@ -64,9 +75,13 @@ produces an empty row with no work, so a sparse board costs ~O(live rows)."
 
 (defn step (board)
   "Advance one generation. O(h) big-int neighbour sums, independent of population."
-  (let (h (get board :h) mask (get board :mask) wm1 (- (get board :w) 1) rows (get board :rows)
+  (let (h (get board :h)
+        mask (get board :mask)
+        wm1 (- (get board :w) 1)
+        rows (get board :rows)
         zero (into [] (map (fn (y) (= 0 (vector-ref rows y))) (range h))))
-    (assoc board :rows
+    (assoc board
+      :rows
       (into [] (map (fn (y) (bb--step-row y rows zero h mask wm1)) (range h))))))
 
 (defn cells (board)
@@ -78,8 +93,10 @@ produces an empty row with no work, so a sparse board costs ~O(live rows)."
       (range (get board :h)))))
 
 (defn refit (board w h)
-  "Rebuild `board` at new dims (a window resize), torus-wrapping out-of-range cells."
-  (reduce (fn (b [x y]) (bset b (mod x w) (mod y h))) (make w h) (cells board)))
+  "Rebuild `board` at new dims (a window resize / zoom), DROPPING cells that fall outside
+the new `w`×`h` — what's off the board is gone, not wrapped back on. Shrinking (zoom in,
+smaller window) clips; growing keeps every cell, since they were all already in range."
+  (reduce (fn (b [x y]) (if (and (< x w) (< y h)) (bset b x y) b)) (make w h) (cells board)))
 
 (defn fit (board w h)
   "`board` if it already has dims `w`×`h`, else `refit` to them."
