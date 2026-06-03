@@ -1,36 +1,39 @@
 (defmodule life
-  "Conway's Game of Life on a wrapping torus, animated in a native GUI window. The
-board is a packed BITBOARD (see `bitboard`) fit to the window. It starts EMPTY — LEFT
-click/drag drops random shapes, RIGHT click/drag drops glider guns, holding either
-auto-repeats (throttled), and the SCROLL wheel zooms the board. Keys: `-`/`=` lower/raise
-an (opt-in) fps cap, `[`/`]` make the auto-spawn rarer/more-often. It runs UNCAPPED by
-default (fast — instant drawing); the footer stays a fixed height while only the board zooms."
+  "Conway's Game of Life on a wrapping torus, animated in a native GUI window. The board is
+a packed BITBOARD (see `bitboard`) fit to the window. It starts EMPTY — LEFT click/drag
+drops random shapes, RIGHT click/drag drops glider guns, holding either auto-repeats. The
+SCROLL wheel is a VIEW zoom (a camera onto the mouse — the board is unchanged). Keys: `-`/`=`
+lower/raise an (opt-in) fps cap, `[`/`]` make the auto-spawn rarer/more-often. It runs
+UNCAPPED by default (fast). Three processes (ADR-058): a CLOCK that paces, a SIM that owns
+the board and never sleeps (so pastes are instant), and this RENDERER that draws + handles
+input."
   (:use editor/display))
 
 (require 'bitboard)  ; the packed-bitboard board: make / bset / place / step / cells / live-count
 (require 'shapes)  ; still-life / oscillator / spaceship / methuselah patterns (*shapes*) — left click
 (require 'guns)  ; glider-gun patterns (*shooters*) — right click, and sown by inject-pattern
-(require 'perflog)  ; tiny file logger — the stats process writes a perf line to life.log
+(require 'perflog)  ; tiny file logger — the SIM writes a perf line to life.log
 
 (def *w* 120)
 (def *h* 40)
-;; The frame-rate cap. DEFAULT 0 = UNCAPPED (go ham — steps as fast as it can draw, which
-;; keeps drawing/mouse feedback instant); a POSITIVE value paces the sim by sleeping out the
-;; rest of each frame's budget, to slow the sim down enough to watch. Adjustable live with
-;; `-`/`=` (slower/faster; `=` past *fps-max* rolls back to uncapped). *frame-ns* below is a
-;; FIXED nominal budget used ONLY for spike detection — independent of the cap.
+;; The frame-rate cap. DEFAULT 0 = UNCAPPED (go ham — steps as fast as it can draw); a
+;; POSITIVE value makes the CLOCK process sleep that much between ticks, to slow the sim down
+;; enough to watch. Adjustable live with `-`/`=` (slower/faster; `=` past *fps-max* rolls back
+;; to uncapped). *frame-ns* below is a FIXED nominal budget used ONLY for spike detection.
 (def *target-fps* 0)  ; 0 = uncapped (default); >0 = the fps cap
 (def *fps-min* 1)
 (def *fps-max* 120)
 (def *fps-step* 5)  ; fps per `-`/`=` press
 (def *frame-ns* (quot 1000000000 30))  ; nominal ~33ms frame budget — for spike counting only
 (def *board-height* 5)  ; the FIXED window cell-font px (set once) — small ⇒ dense board cells
-;; Scroll-wheel zoom is brood-edit's way (ADR-079): the WINDOW FONT never changes — so the
-;; status bar never reflows or jumps; the zoom is SEAMLESS — only the BOARD is drawn larger.
-;; Each board cell is rendered at per-op `:scale *board-zoom*` (a z×z screen-cell block), so
-;; the torus is cols/z × rows/z cells: zoom IN ⇒ bigger cells, fewer of them, the overflow
-;; dropped (bitboard/refit clips). Clamped to [*zoom-min*, *zoom-max*].
-(def *board-zoom* 1)  ; board-cell magnification (1 = native dense; higher = zoomed in)
+;; Scroll-wheel zoom is a VIEW (camera) zoom — purely for viewing. It does NOT change the
+;; board: the torus keeps its full window resolution and ALL its cells (the off-screen ones
+;; are still simulated). *view-zoom* magnifies a window of the board CENTRED ON THE MOUSE;
+;; *view-ox*/*view-oy* are the top-left board cell of that window (the pan, kept in range).
+;; At zoom 1 the whole board shows (pan 0,0). The window font/grid and the bar never change.
+(def *view-zoom* 1)  ; view magnification (1 = whole board; higher = zoomed in on the mouse)
+(def *view-ox* 0)  ; pan: leftmost visible board column
+(def *view-oy* 0)  ; pan: topmost visible board row
 (def *zoom-min* 1)
 (def *zoom-max* 10)
 (def *zoom-step* 1)
@@ -173,17 +176,18 @@ the previous frame). The renderer composes this after the buttons."
       [:text brow fx0 (fps-label (get ui :cap)) face]]))
 
 ;; The leading `clear` wipes the previous frame, so we paint only what's lit. ALL geometry
-;; comes from `live` itself (`:h`/`:w`) scaled by *board-zoom*, so the board and the bar
-;; below it are sized from ONE snapshot — the brood-edit anti-jitter rule: never composite a
-;; stale board under a freshly-measured bar position (that mismatch made the footer jump).
-;; Each live cell is one `:text` op magnified by `z` (a z×z block at z=*board-zoom*), the
-;; brood-edit `:scale` zoom (ADR-079): the window grid is fixed, so the bar never reflows.
+;; comes from `live` itself (`:h`/`:w`), so the board and the bar below it (at row `:h`) are
+;; sized from ONE snapshot — the brood-edit anti-jitter rule: never composite a stale board
+;; under a freshly-measured bar position (that mismatch made the footer jump on resize).
+;; *view-zoom* is a render-only camera (per-op `:scale`, ADR-079) over the SAME board, so
+;; zooming changes neither the board nor the bar — only which window of cells is magnified.
 (defn render (live ui info)
-  "A display frame from `live`: each live cell a `:text` op (magnified by *board-zoom*), then
-the bottom bar (buttons + `info`) at the board's scaled bottom. Geometry from `live` only.
-The z=1 path builds the op INLINE (no per-cell call) — this is the hot loop over every live
-cell, so an extra closure call here is a several-thousand-cell tax."
-  (let (z *board-zoom*
+  "A display frame from `live`: the live cells as `:text` ops, then the bottom bar at row
+`*h*`. At *view-zoom* 1 (the whole board) the op is built INLINE over every live cell — the
+hot loop, so no per-cell call. Zoomed in, only the visible board WINDOW (`*view-ox*`/`*oy*`,
+`w/z × h/z` cells) is drawn, magnified z×: each row is masked to that column range and shifted
+to the origin (still O(visible-live), and fewer cells show), each at `px*z`."
+  (let (z *view-zoom*
         rows (get live :rows)
         h (get live :h)
         wdt (get live :w))
@@ -193,17 +197,24 @@ cell, so an extra closure call here is a several-thousand-cell tax."
                         (let (r (vector-ref rows y))
                           (if (= r 0) nil (map (fn (x) [:text y x "▪"]) (bit-positions r)))))
                 (range h))
-              (mapcat (fn (y)
-                        (let (r (vector-ref rows y))
-                          (if (= r 0)
-                            nil
-                            (map (fn (x) [:text (* y z) (* x z) "▪" {:scale z}]) (bit-positions r)))))
-                (range h))))
-      (footer-ops ui info (* h z) (* wdt z)))))
+              (let (visw (max 1 (quot wdt z))
+                    vish (max 1 (quot h z))
+                    ox (max 0 (min *view-ox* (max 0 (- wdt visw))))
+                    oy (max 0 (min *view-oy* (max 0 (- h vish))))
+                    vismask (- (bit-shift-left 1 visw) 1))
+                (mapcat (fn (sy)
+                          (let (vr (bit-and (bit-shift-right (vector-ref rows (+ oy sy)) ox)
+                                     vismask))
+                            (if (= vr 0)
+                              nil
+                              (map (fn (px) [:text (* sy z) (* px z) "▪" {:scale z}])
+                                (bit-positions vr)))))
+                  (range vish)))))
+      (footer-ops ui info h wdt))))
 
-;; ---- the actors: SIM (model + clock) → STATS → RENDERER (compositor) -------------
-;; Each source is its own process that PUSHES updates to a thin renderer (ADR-058
-;; concurrency); the renderer owns the window and composites.
+;; ---- the actors: CLOCK (pacer) → SIM (board + log) → RENDERER (compositor) --------
+;; The CLOCK paces; the SIM owns the board and never sleeps; the RENDERER (root) owns the
+;; window and composites. (ADR-058 concurrency.)
 
 (defn log-fmt (gen cells per spikes)
   "A compact, tab-separated perf line for the debug log — one column per field, so it
@@ -388,7 +399,7 @@ Escape *key*), or the `q` / Esc / Ctrl-C keys."
   (do (send sim :stop) (send clock :stop) (gui-close w)))
 
 (defn draw! (w board info ui)
-  "Paint one frame: the board (each cell scaled by *board-zoom*) + the bar (the renderer's
+  "Paint one frame: the board (under the *view-zoom* camera) + the bar (the renderer's
 buttons from `ui` + the sim's `info` string). Geometry is read from the board only."
   (gui-draw w (render board ui info)))
 
@@ -413,13 +424,11 @@ buttons from `ui` + the sim's `info` string). Geometry is read from the board on
             (send sim [:drawn])
             (render-loop w sim clock nl2 st ui)))))
     ;; Resize from the EVENT's cell grid — refit the cached board to it and redraw now.
-    ([:resize cols rows] (let (z *board-zoom*
-                               vrows (max 1 (- rows *status-scale*)))
-                           (do
-                             (def *w* (max *grid-min* (quot cols z)))
-                             (def *h* (max *grid-min* (quot vrows z)))
-                             (let (nl (bitboard/fit board *w* *h*))
-                               (do (draw! w nl info ui) (render-loop w sim clock nl info ui))))))
+    ([:resize cols rows] (do
+                           (def *w* (max *grid-min* cols))
+                           (def *h* (max *grid-min* (max 1 (- rows *status-scale*))))
+                           (let (nl (bitboard/fit board *w* *h*))
+                             (do (draw! w nl info ui) (render-loop w sim clock nl info ui)))))
     ([:mouse action button row col mods] (let ([ui2 rd] (on-mouse sim
                                                           clock
                                                           w
@@ -438,33 +447,36 @@ buttons from `ui` + the sim's `info` string). Geometry is read from the board on
              (when rd (draw! w board info ui2))
              (render-loop w sim clock board info ui2)))))))
 
-;; `*w*`/`*h*` — the torus `step` wraps on — are the window's BOARD area in board-cells:
-;; the screen grid (less the bottom *status-scale* bar rows) divided by *board-zoom*, since
-;; each board cell is drawn z×z. FLOORED at *grid-min*² so a tiny window or deep zoom can't
-;; collapse the torus. Shrinking clips off-board cells (bitboard/refit). Globals are
-;; image-wide, so the next `step` wraps on the new size.
+;; `*w*`/`*h*` — the torus `step` wraps on — are the window's BOARD area in cells: the full
+;; screen grid, less the bottom *status-scale* bar rows (the VIEW zoom is a render-only
+;; magnification, so it does NOT change these). FLOORED at *grid-min*² so a tiny window can't
+;; collapse the torus. A resize clips/grows via bitboard/refit. Globals are image-wide.
 (defn grid-fit (w)
-  "Re-fit the sim torus to window `w`: set `*w*`/`*h*` to the board area (window cells, less
-the bar, divided by *board-zoom*). Only `def`s when a value actually CHANGED — runs every
-frame, and rebinding a global can invalidate caches, so skip it on the common no-op frame.
-Returns `[cols rows]` (the raw screen grid)."
+  "Re-fit the sim torus to window `w`: set `*w*`/`*h*` to the board area (the window cells,
+less the bar). Only `def`s when a value actually CHANGED — it runs every frame, and rebinding
+a global can invalidate caches, so skip it on the common no-op frame. Returns `[cols rows]`."
   (let ([cols rows] (gui-size w)
-        z *board-zoom*
-        vrows (max 1 (- rows *status-scale*))
-        nw (max *grid-min* (quot cols z))
-        nh (max *grid-min* (quot vrows z)))
+        nw (max *grid-min* cols)
+        nh (max *grid-min* (max 1 (- rows *status-scale*))))
     (do
       (when (not (= nw *w*)) (def *w* nw))
       (when (not (= nh *h*)) (def *h* nh))
       [cols rows])))
 
-(defn zoom! (w dir)
-  "Step the board magnification by `dir` (+ zooms IN), clamped to [*zoom-min*, *zoom-max*],
-and recompute `*w*`/`*h*` so the board refits at once. Only the BOARD scales — the window
-font/grid and the status bar are untouched (seamless)."
-  (do
-    (def *board-zoom* (max *zoom-min* (min *zoom-max* (+ *board-zoom* dir))))
-    (grid-fit w)))
+(defn view-zoom! (dir mx my)
+  "VIEW (camera) zoom by `dir` (+ in), clamped to [*zoom-min*, *zoom-max*] — the board is
+UNCHANGED. Keep the board cell under the mouse `(mx, my)` (screen cells) fixed by panning,
+then clamp the pan so the magnified window stays inside the board."
+  (let (z *view-zoom*
+        z2 (max *zoom-min* (min *zoom-max* (+ z dir)))
+        bx (+ *view-ox* (quot mx z))  ; board cell currently under the mouse
+        by (+ *view-oy* (quot my z))
+        ox (- bx (quot mx z2))  ; new pan keeps that cell under the mouse at z2
+        oy (- by (quot my z2)))
+    (do
+      (def *view-zoom* z2)
+      (def *view-ox* (max 0 (min ox (max 0 (- *w* (quot *w* z2))))))
+      (def *view-oy* (max 0 (min oy (max 0 (- *h* (quot *h* z2)))))))))
 
 ;; ---- PURE control math (no globals, no I/O): given a value, return the next one --------
 (defn fps-nudge (cap d)
@@ -492,9 +504,9 @@ in-between value from a drag rounds down to the next lower preset)."
 
 ;; ---- input → [ui' redraw?], sending the SIM throttled control messages -----------------
 (defn in-footer? (row)
-  "Is screen `row` in the bottom status bar? The board is `*h*` cells tall, each drawn z
-high, so the bar begins at screen row `*h*×*board-zoom*`."
-  (>= row (* *h* *board-zoom*)))
+  "Is screen `row` in the bottom status bar? The board area is the top `*h*` screen rows (the
+view zoom doesn't move the bar), so the bar begins at screen row `*h*`."
+  (>= row *h*))
 
 (defn in-range? (x [a b])
   "Is cell `x` inside the `[start end)` cell range?"
@@ -531,17 +543,19 @@ release with no movement is a CLICK (cycle a preset, told to the CLOCK) — and 
 in-progress fps drag scrubs (→ CLOCK); a footer press hits a button; anything else is on the
 board and pastes via the SIM (left = shapes, right = guns), drawn immediately by the sim."
   (cond
-    (= action :scroll-up) (do (zoom! w *zoom-step*) [ui true])
-    (= action :scroll-down) (do (zoom! w (- 0 *zoom-step*)) [ui true])
+    (= action :scroll-up) (do (view-zoom! *zoom-step* col row) [ui true])
+    (= action :scroll-down) (do (view-zoom! (- 0 *zoom-step*) col row) [ui true])
     (= action :release) (footer-release sim clock ui)
     (= (get ui :drag) :fps) (if (= action :drag) (fps-drag clock ui col) [ui false])
     (in-footer? row) (if (= action :press) (footer-press sim ui col) [ui false])
-    ;; on the board: map the screen cell to a BOARD cell (÷ *board-zoom*) before forwarding.
+    ;; on the board: map the screen cell THROUGH the view (pan + zoom) to a BOARD cell —
+    ;; board x = *view-ox* + col/z, y = *view-oy* + row/z — so a paste lands where you point
+    ;; even when zoomed in.
     :else (do
             (send sim
               [(if (= action :press) :press :drag) (if (= button :right) :gun :shape)
-                (quot col *board-zoom*)
-                (quot row *board-zoom*)])
+                (+ *view-ox* (quot col *view-zoom*))
+                (+ *view-oy* (quot row *view-zoom*))])
             [ui false])))
 
 (defn on-key (sim clock m ui)
@@ -561,8 +575,8 @@ auto-spawn interval (→ SIM). Updates the LOCAL mirror so the label changes at 
 (defn run-life ()
   "Wire up the three actors and become the RENDERER. The CLOCK paces (the only sleeper); the
 SIM owns the board and never sleeps (so pastes are instant); this process draws + handles
-input. The window cell font is set ONCE; zoom is the per-op `:scale` of *board-zoom*, so the
-bar never reflows. Spawn the SIM first (the CLOCK needs its pid)."
+input. The window cell font is set ONCE; the scroll wheel is a render-only *view-zoom*
+camera (the board is unchanged). Spawn the SIM first (the CLOCK needs its pid)."
   (let (w (gui-open "Brood Life")  ; the OS title-bar text (gui-title! could change it later)
         _ (gui-font! w {:family :mono :height *board-height*})  ; the FIXED window font (board only)
         _ (grid-fit w)  ; sizes *w*/*h* before we build the board
