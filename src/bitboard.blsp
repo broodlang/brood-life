@@ -1,25 +1,34 @@
 (defmodule bitboard
-  "Conway's Game of Life board as a WIDE-ROW bitboard: one arbitrary-precision
-integer per row, bit x = cell `(x,y)` alive. A board is a record `{:w :h :mask
-:rows}` — `:rows` a vector of `:h` big-ints, `:mask` = 2^w − 1.
+  "Conway's Game of Life board as a WHOLE-BOARD bitboard: ONE arbitrary-precision
+integer for the entire grid, bit `(y*w + x)` = cell `(x,y)` alive. A board is a record
+`{:w :h :mask :board :col0 :high :bits}` — `:bits` the grid integer, `:mask` = 2^w−1 (one
+row wide), `:board` = 2^(w*h)−1 (the whole grid), `:col0`/`:high` the x=0 / x=w−1 edge-
+column masks (every row's first/last bit) used for the torus wrap. The masks are
+precomputed once by `make` and carried on the record.
 
-`step` computes a whole generation as one bit-plane full-adder neighbour sum per
-row over the three torus-wrapped rows — O(h) big-int ops, INDEPENDENT of how many
-cells are live (a sparse map's step grows with population; a chunked bitboard's
-grows with board area; this is flat). Needs the kernel's arbitrary-precision
-integers + unrestricted shifts (one row is a w-bit number, shifted by w−1 to wrap
-the torus) and `bit-positions` (so rendering is O(live), not O(area)).")
+`step` advances a whole generation with a HANDFUL of whole-board big-int ops: the
+neighbour count is one bit-plane full-adder over the eight torus-shifted copies of the
+grid, so it's ~100 big-int ops PER GENERATION — not ~100 per ROW. This used to be a
+per-row loop (O(h) interpreter dispatches per step); folding the grid into a single
+integer cut the step ~100× (measured 35 ms → 0.3 ms on a 480×395 board), because the
+bignum math was always native — only the per-row *dispatch* was the cost. Needs the
+kernel's arbitrary-precision integers + unrestricted shifts (the grid is a w*h-bit
+number) and `bit-positions` (so rendering stays O(live), not O(area)).")
 
 (defn make (w h)
-  "An empty `w`×`h` bitboard."
-  {:w w :h h :mask (- (bit-shift-left 1 w) 1) :rows (into [] (map (fn (_) 0) (range h)))})
+  "An empty `w`×`h` whole-board bitboard, with the torus edge-column masks precomputed.
+`:col0` = Σ 2^(y*w) is a closed form of board/mask (the geometric series 1+2^w+2^2w+…)."
+  (let (mask (- (bit-shift-left 1 w) 1)  ; one row: w low bits
+        board (- (bit-shift-left 1 (* w h)) 1)  ; the whole grid: w*h bits
+        col0 (quot board mask)  ; the x=0 bit of every row (each row's low bit)
+        high (bit-shift-left col0 (- w 1)))
+    ; the x=w−1 bit of every row (each row's top bit)
+    {:w w :h h :mask mask :board board :col0 col0 :high high :bits 0}))
 
 (defn bset (board x y)
   "Set cell `(x,y)` live; returns the new board. Caller wraps `x`/`y` into range."
-  (let (rows (get board :rows))
-    (assoc board
-      :rows
-      (vector-assoc rows y (bit-or (vector-ref rows y) (bit-shift-left 1 x))))))
+  (let (w (get board :w))
+    (assoc board :bits (bit-or (get board :bits) (bit-shift-left 1 (+ x (* y w)))))))
 
 (defn place (board pat x y)
   "Set every cell of pattern `pat` (a list of `[dx dy]`) at origin `(x,y)`, wrapped."
@@ -27,26 +36,42 @@ the torus) and `bit-positions` (so rendering is O(live), not O(area)).")
     (reduce (fn (b [dx dy]) (bset b (mod (+ x dx) w) (mod (+ y dy) h))) board pat)))
 
 (defn live-count (board)
-  "Population: the number of live cells (popcount of every row, via `bit-count`)."
-  (reduce (fn (a r) (+ a (bit-count r))) 0 (get board :rows)))
+  "Population: the number of live cells — one `bit-count` of the whole-board integer."
+  (bit-count (get board :bits)))
 
-;; The west / east neighbour masks of a w-bit row, torus-wrapped: west shifts every
-;; cell one column up (bit x ← x−1), wrapping the top bit (x=w−1) round to bit 0;
-;; east is the mirror. `wm1` is w−1 (the wrap shift), `mask` keeps it w bits wide.
-(defn bb--west (r mask wm1) (bit-and (bit-or (bit-shift-left r 1) (bit-shift-right r wm1)) mask))
-(defn bb--east (r mask wm1) (bit-and (bit-or (bit-shift-right r 1) (bit-shift-left r wm1)) mask))
+;; The whole-board torus neighbour FIELDS. For a one-cell shift, the bits that cross a
+;; row boundary are the wrap: the WEST field (each cell sees its x−1 neighbour) is the
+;; grid shifted up one bit, with each row's x=0 bit cleared (it came from the previous
+;; row's top bit — the bleed) and replaced by that row's OWN top bit shifted down to x=0.
+;; EAST is the mirror. UP/DOWN shift by a whole row (w bits); the row that falls off one
+;; end wraps to the other. `~m` (clear those bits) is `(bit-xor m board)`, since the mask
+;; ⊆ board. `up`/`dn` are closures over the dims inside `step`.
 
-;; The next state of a whole row: sum its 8 neighbour-row-masks into 4 bit-planes
-;; with full-adders, then a cell lives iff the count is 3, or 2 and it's already
-;; live → `s1 & ~s2 & ~s3 & (s0 | cur)`, masked to w bits (`~` is `xor mask`).
-(defn bb--row-next (above cur below mask wm1)
-  (let (masks [(bb--west above mask wm1) above
-                (bb--east above mask wm1)
-                (bb--west cur mask wm1)
-                (bb--east cur mask wm1)
-                (bb--west below mask wm1)
-                below
-                (bb--east below mask wm1)]
+(defn step (board)
+  "Advance one generation. A fixed handful of whole-board big-int ops (a bit-plane
+full-adder over the eight torus-shifted neighbour fields), independent of population.
+A cell lives iff it has exactly 3 live neighbours, or 2 and it is already live —
+`s1 & ~s2 & ~s3 & (s0 | cur)` over the 4-bit neighbour count `[s0 s1 s2 s3]`."
+  (let (w (get board :w)
+        h (get board :h)
+        mask (get board :mask)
+        brd (get board :board)
+        col0 (get board :col0)
+        high (get board :high)
+        b (get board :bits)
+        wm1 (- w 1)
+        hm1w (* (- h 1) w)
+        ;; west / east neighbour fields (torus-wrapped within each row)
+        l (bit-or (bit-and (bit-shift-left b 1) (bit-xor col0 brd))
+            (bit-shift-right (bit-and b high) wm1))
+        r (bit-or (bit-and (bit-shift-right b 1) (bit-xor high brd))
+            (bit-shift-left (bit-and b col0) wm1))
+        ;; lift a field one row up / down, the off-board row wrapping round (torus)
+        up (fn (f) (bit-or (bit-and (bit-shift-left f w) brd) (bit-shift-right f hm1w)))
+        dn (fn (f) (bit-or (bit-shift-right f w) (bit-shift-left (bit-and f mask) hm1w)))
+        ;; the eight neighbours: the three columns (west / centre / east) × the three rows
+        ns [(up l) (up b) (up r) l r (dn l) (dn b) (dn r)]
+        ;; full-adder: sum the eight 1-bit-per-cell fields into a 4-bit count per cell
         planes (reduce (fn ([s0 s1 s2 s3] m)
                          (let (c (bit-and s0 m)
                                s0b (bit-xor s0 m)
@@ -57,40 +82,21 @@ the torus) and `bit-positions` (so rendering is O(live), not O(area)).")
                                s3b (bit-or s3 c3))
                            [s0b s1b s2b s3b]))
                  [0 0 0 0]
-                 masks)
+                 ns)
         s0 (vector-ref planes 0)
         s1 (vector-ref planes 1)
         s2 (vector-ref planes 2)
         s3 (vector-ref planes 3))
-    (bit-and (bit-and s1 (bit-and (bit-xor s2 mask) (bit-xor s3 mask)))
-      (bit-or s0 cur))))
-
-(defn bb--step-row (y rows zero h mask wm1)
-  "The next state of row `y`. An empty 3-row band (above/self/below all zero)
-produces an empty row with no work, so a sparse board costs ~O(live rows)."
-  (let (a (mod (- y 1) h) b (mod (+ y 1) h))
-    (if (and (vector-ref zero a) (vector-ref zero y) (vector-ref zero b))
-      0
-      (bb--row-next (vector-ref rows a) (vector-ref rows y) (vector-ref rows b) mask wm1))))
-
-(defn step (board)
-  "Advance one generation. O(h) big-int neighbour sums, independent of population."
-  (let (h (get board :h)
-        mask (get board :mask)
-        wm1 (- (get board :w) 1)
-        rows (get board :rows)
-        zero (into [] (map (fn (y) (= 0 (vector-ref rows y))) (range h))))
     (assoc board
-      :rows
-      (into [] (map (fn (y) (bb--step-row y rows zero h mask wm1)) (range h))))))
+      :bits
+      (bit-and (bit-and s1 (bit-and (bit-xor s2 brd) (bit-xor s3 brd)))
+        (bit-or s0 b)))))
 
 (defn cells (board)
-  "A list of live `[x y]` cells — O(live), via `bit-positions` per non-empty row."
-  (let (rows (get board :rows))
-    (mapcat (fn (y)
-              (let (r (vector-ref rows y))
-                (if (= r 0) nil (map (fn (x) [x y]) (bit-positions r)))))
-      (range (get board :h)))))
+  "A list of live `[x y]` cells — O(live), via one `bit-positions` over the whole board
+(bit `i` ⇒ cell `(i mod w, i div w)`)."
+  (let (w (get board :w))
+    (map (fn (i) [(mod i w) (quot i w)]) (bit-positions (get board :bits)))))
 
 (defn refit (board w h)
   "Rebuild `board` at new dims (a window resize / zoom), DROPPING cells that fall outside

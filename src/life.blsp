@@ -230,39 +230,38 @@ the previous frame). The renderer composes this after the buttons."
 ;; zooming changes neither the board nor the bar — only which window of cells is magnified.
 (defn render (live ui info)
   "A display frame from `live`: the live cells as `:text` ops, then the bottom bar at row
-`*h*`. At *view-zoom* 1 (the whole board) the op is built INLINE over every live cell — the
-hot loop, so no per-cell call. Zoomed in, only the visible board WINDOW (`*view-ox*`/`*oy*`,
-`w/z × h/z` cells) is drawn, magnified z×: each row is masked to that column range and shifted
-to the origin (still O(visible-live), and fewer cells show), each at `px*z`."
+`*h*`. At *view-zoom* 1 (the whole board) it's ONE `bit-positions` over the whole-board
+integer — bit `i` is cell `(i mod w, i div w)` — so the hot loop is a single enumeration
+with no per-row scan. Zoomed in, only the visible board WINDOW (`*view-ox*`/`*oy*`,
+`w/z × h/z` cells) is drawn, magnified z×: each row's window is shifted to the origin and
+masked to the column range (still O(visible-live), and fewer cells show), each at `px*z`."
   (let (z *view-zoom*
         a *cell-aspect*
         fill (string-repeat " " a)  ; an `a`-wide blank; *cell-face* bg fills its cell box
-        rows (get live :rows)
+        bits (get live :bits)
         h (get live :h)
         wdt (get live :w))
-    (into (into [(clear)]
-            (if (= z 1)
-              (mapcat (fn (y)
-                        (let (r (vector-ref rows y))
-                          (if (= r 0)
-                            nil
-                            (map (fn (x) [:text y (* x a) fill *cell-face*]) (bit-positions r)))))
-                (range h))
-              (let (visw (max 1 (quot wdt z))
-                    vish (max 1 (quot h z))
-                    ox (max 0 (min *view-ox* (max 0 (- wdt visw))))
-                    oy (max 0 (min *view-oy* (max 0 (- h vish))))
-                    vismask (- (bit-shift-left 1 visw) 1)
-                    zface (assoc *cell-face* :scale z)
-                    az (* a z))
-                (mapcat (fn (sy)
-                          (let (vr (bit-and (bit-shift-right (vector-ref rows (+ oy sy)) ox)
-                                     vismask))
-                            (if (= vr 0)
-                              nil
-                              (map (fn (px) [:text (* sy z) (* px az) fill zface])
-                                (bit-positions vr)))))
-                  (range vish)))))
+    (into
+      (into [(clear)]
+        (if (= z 1)
+          (map (fn (i) [:text (quot i wdt) (* (mod i wdt) a) fill *cell-face*])
+            (bit-positions bits))
+          (let (visw (max 1 (quot wdt z))
+                vish (max 1 (quot h z))
+                ox (max 0 (min *view-ox* (max 0 (- wdt visw))))
+                oy (max 0 (min *view-oy* (max 0 (- h vish))))
+                vismask (- (bit-shift-left 1 visw) 1)
+                zface (assoc *cell-face* :scale z)
+                az (* a z))
+            (mapcat
+              (fn (sy)
+                ;; the visible window of row (oy+sy): shift it to bit 0, mask to visw
+                (let (vr (bit-and (bit-shift-right bits (+ (* (+ oy sy) wdt) ox)) vismask))
+                  (if (= vr 0)
+                    nil
+                    (map (fn (px) [:text (* sy z) (* px az) fill zface])
+                      (bit-positions vr)))))
+              (range vish)))))
       ;; the bar spans the full SCREEN width (board cols × *cell-aspect*), at screen row *h*.
       (footer-ops ui info h (* wdt a)))))
 

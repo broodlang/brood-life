@@ -12,6 +12,44 @@ bullet.
 
 ## Findings
 
+### WIN 2026-06-03 — whole-board bignum step (per-row → one integer), ~57× faster
+
+Smaller display blocks grew the torus to 480×395 (~190K cells), and the **per-row**
+bignum step (`O(h)` rows × ~90 big-int ops each ≈ 19K interpreter dispatches/gen)
+became the framerate floor: **~36 ms/step**, population-independent. The fix was a
+pure-Brood representation change, NOT a kernel builtin: fold the whole grid into **one
+`w*h`-bit integer** and compute a generation as a handful of whole-board ops — the same
+bit-plane full-adder over the eight torus-shifted copies, but ~100 big-int ops *per
+generation* instead of *per row*. The bignum math was always native; only the per-row
+dispatch was the cost.
+
+- **step: 35.7 ms → 0.6 ms** (steady state on 480×395; 0.29 ms one-shot) — ~57×.
+- **live-count: 0.8 ms → ~0** (one `bit-count` of the grid integer vs a per-row reduce).
+- Torus wrap on one integer needs edge-column masks: `col0 = Σ 2^(y*w)` (a closed form
+  of `board/mask`, the geometric series) and `high = col0 << (w−1)`; the within-row
+  horizontal wrap is `(b<<1 & ~col0) | ((b & high) >> (w−1))`. Verified bit-identical to
+  the old per-row step on blinker / glider / top-edge / left-right-edge cases.
+- **Lesson (general):** in an interpreted language the per-op *dispatch* dominates a
+  bignum hot loop, so restructure to do more per native op. Not transferable to
+  editing/terminal work (those aren't bignum-bound), but the mindset is.
+- The lone remaining Brood-side cost is now `render` (~23 ms, O(live) op-build) — the
+  next target if more is wanted.
+
+This supersedes the "wide-row bignum bitboard" note below (which was the per-row form).
+
+### STILL OPEN 2026-06-03 — the GC "slab out of bounds" crash recurs on big-bignum churn
+
+The collector bug logged under "CRASH — GC slab out of bounds" below is **still live**.
+Hit it three times today via `nest mcp` while prototyping the whole-board step: a tight
+`reduce` over ~190K-bit integers, and twice when **re-loading** `life.blsp` into an image
+already churned by big-bignum evals (`bigint handle … out of bounds`, `map handle …`,
+`vector handle …`). The earlier "RESOLVED — stale-binary recurrence" note was too
+optimistic: this is a genuine missed-rooting/use-after-GC bug, and big integers make it
+much easier to trip. **The compiled app does NOT hit it** — `nest test` (11/11) and an
+8 s `nest run` plus a 200-generation step stress all run clean; it's the long-lived
+incremental-load image that corrupts. Worth a real kernel fix (it would help any project
+that allocates big integers hard).
+
 ### RESOLVED 2026-06-02 — most of the below is now fixed
 
 - **Arbitrary-precision integers + unrestricted bit-shifts: DONE.** The kernel now
