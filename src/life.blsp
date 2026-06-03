@@ -195,7 +195,7 @@ to the origin (still O(visible-live), and fewer cells show), each at `px*z`."
             (if (= z 1)
               (mapcat (fn (y)
                         (let (r (vector-ref rows y))
-                          (if (= r 0) nil (map (fn (x) [:text y x "▪"]) (bit-positions r)))))
+                          (if (= r 0) nil (map (fn (x) [:text y x "█"]) (bit-positions r)))))
                 (range h))
               (let (visw (max 1 (quot wdt z))
                     vish (max 1 (quot h z))
@@ -207,7 +207,7 @@ to the origin (still O(visible-live), and fewer cells show), each at `px*z`."
                                      vismask))
                             (if (= vr 0)
                               nil
-                              (map (fn (px) [:text (* sy z) (* px z) "▪" {:scale z}])
+                              (map (fn (px) [:text (* sy z) (* px z) "█" {:scale z}])
                                 (bit-positions vr)))))
                   (range vish)))))
       (footer-ops ui info h wdt))))
