@@ -25,7 +25,14 @@ input."
 (def *fps-max* 120)
 (def *fps-step* 5)  ; fps per `-`/`=` press
 (def *frame-ns* (quot 1000000000 30))  ; nominal ~33ms frame budget — for spike counting only
-(def *board-height* 5)  ; the FIXED window cell-font px (set once) — small ⇒ dense board cells
+(def *board-height* 8)  ; the FIXED window cell-font px (set once) — the board "canvas" cell size
+;; A live cell is drawn as a SOLID CELL BACKGROUND (a space with *cell-face*'s `:bg`), not a
+;; glyph — the kernel paints the bg as the whole cell rectangle, so neighbours TOUCH with no
+;; font gaps. And each board cell spans *cell-aspect* screen columns so it comes out SQUARE
+;; (a mono screen cell is ~1:2 wide:tall; 2 cols ≈ square). Raise/lower it if cells look
+;; tall/wide. (So the board is `cols/*cell-aspect*` × `rows` cells.)
+(def *cell-aspect* 2)  ; screen columns per board cell (compensates the font's cell aspect)
+(def *cell-face* {:bg :white})  ; a live cell: a solid filled square
 ;; Scroll-wheel zoom is a VIEW (camera) zoom — purely for viewing. It does NOT change the
 ;; board: the torus keeps its full window resolution and ALL its cells (the off-screen ones
 ;; are still simulated). *view-zoom* magnifies a window of the board CENTRED ON THE MOUSE;
@@ -188,6 +195,8 @@ hot loop, so no per-cell call. Zoomed in, only the visible board WINDOW (`*view-
 `w/z × h/z` cells) is drawn, magnified z×: each row is masked to that column range and shifted
 to the origin (still O(visible-live), and fewer cells show), each at `px*z`."
   (let (z *view-zoom*
+        a *cell-aspect*
+        fill (string-repeat " " a)  ; an `a`-wide blank; *cell-face* bg fills its cell box
         rows (get live :rows)
         h (get live :h)
         wdt (get live :w))
@@ -195,22 +204,27 @@ to the origin (still O(visible-live), and fewer cells show), each at `px*z`."
             (if (= z 1)
               (mapcat (fn (y)
                         (let (r (vector-ref rows y))
-                          (if (= r 0) nil (map (fn (x) [:text y x "█"]) (bit-positions r)))))
+                          (if (= r 0)
+                            nil
+                            (map (fn (x) [:text y (* x a) fill *cell-face*]) (bit-positions r)))))
                 (range h))
               (let (visw (max 1 (quot wdt z))
                     vish (max 1 (quot h z))
                     ox (max 0 (min *view-ox* (max 0 (- wdt visw))))
                     oy (max 0 (min *view-oy* (max 0 (- h vish))))
-                    vismask (- (bit-shift-left 1 visw) 1))
+                    vismask (- (bit-shift-left 1 visw) 1)
+                    zface (assoc *cell-face* :scale z)
+                    az (* a z))
                 (mapcat (fn (sy)
                           (let (vr (bit-and (bit-shift-right (vector-ref rows (+ oy sy)) ox)
                                      vismask))
                             (if (= vr 0)
                               nil
-                              (map (fn (px) [:text (* sy z) (* px z) "█" {:scale z}])
+                              (map (fn (px) [:text (* sy z) (* px az) fill zface])
                                 (bit-positions vr)))))
                   (range vish)))))
-      (footer-ops ui info h wdt))))
+      ;; the bar spans the full SCREEN width (board cols × *cell-aspect*), at screen row *h*.
+      (footer-ops ui info h (* wdt a)))))
 
 ;; ---- the actors: CLOCK (pacer) → SIM (board + log) → RENDERER (compositor) --------
 ;; The CLOCK paces; the SIM owns the board and never sleeps; the RENDERER (root) owns the
@@ -425,7 +439,7 @@ buttons from `ui` + the sim's `info` string). Geometry is read from the board on
             (render-loop w sim clock nl2 st ui)))))
     ;; Resize from the EVENT's cell grid — refit the cached board to it and redraw now.
     ([:resize cols rows] (do
-                           (def *w* (max *grid-min* cols))
+                           (def *w* (max *grid-min* (quot cols *cell-aspect*)))
                            (def *h* (max *grid-min* (max 1 (- rows *status-scale*))))
                            (let (nl (bitboard/fit board *w* *h*))
                              (do (draw! w nl info ui) (render-loop w sim clock nl info ui)))))
@@ -456,7 +470,7 @@ buttons from `ui` + the sim's `info` string). Geometry is read from the board on
 less the bar). Only `def`s when a value actually CHANGED — it runs every frame, and rebinding
 a global can invalidate caches, so skip it on the common no-op frame. Returns `[cols rows]`."
   (let ([cols rows] (gui-size w)
-        nw (max *grid-min* cols)
+        nw (max *grid-min* (quot cols *cell-aspect*))  ; board cols = screen cols ÷ cell aspect
         nh (max *grid-min* (max 1 (- rows *status-scale*))))
     (do
       (when (not (= nw *w*)) (def *w* nw))
@@ -466,12 +480,14 @@ a global can invalidate caches, so skip it on the common no-op frame. Returns `[
 (defn view-zoom! (dir mx my)
   "VIEW (camera) zoom by `dir` (+ in), clamped to [*zoom-min*, *zoom-max*] — the board is
 UNCHANGED. Keep the board cell under the mouse `(mx, my)` (screen cells) fixed by panning,
-then clamp the pan so the magnified window stays inside the board."
+then clamp the pan so the magnified window stays inside the board. A board cell is
+`*cell-aspect*` screen cols wide, so the x map divides by `aspect × zoom`; y by zoom only."
   (let (z *view-zoom*
+        a *cell-aspect*
         z2 (max *zoom-min* (min *zoom-max* (+ z dir)))
-        bx (+ *view-ox* (quot mx z))  ; board cell currently under the mouse
+        bx (+ *view-ox* (quot mx (* a z)))  ; board cell currently under the mouse
         by (+ *view-oy* (quot my z))
-        ox (- bx (quot mx z2))  ; new pan keeps that cell under the mouse at z2
+        ox (- bx (quot mx (* a z2)))  ; new pan keeps that cell under the mouse at z2
         oy (- by (quot my z2)))
     (do
       (def *view-zoom* z2)
@@ -548,13 +564,13 @@ board and pastes via the SIM (left = shapes, right = guns), drawn immediately by
     (= action :release) (footer-release sim clock ui)
     (= (get ui :drag) :fps) (if (= action :drag) (fps-drag clock ui col) [ui false])
     (in-footer? row) (if (= action :press) (footer-press sim ui col) [ui false])
-    ;; on the board: map the screen cell THROUGH the view (pan + zoom) to a BOARD cell —
-    ;; board x = *view-ox* + col/z, y = *view-oy* + row/z — so a paste lands where you point
-    ;; even when zoomed in.
+    ;; on the board: map the screen cell THROUGH the view to a BOARD cell — x = *view-ox* +
+    ;; col/(aspect·z), y = *view-oy* + row/z (a board cell is *cell-aspect* screen cols wide)
+    ;; — so a paste lands where you point, zoomed in or not.
     :else (do
             (send sim
               [(if (= action :press) :press :drag) (if (= button :right) :gun :shape)
-                (+ *view-ox* (quot col *view-zoom*))
+                (+ *view-ox* (quot col (* *cell-aspect* *view-zoom*)))
                 (+ *view-oy* (quot row *view-zoom*))])
             [ui false])))
 
