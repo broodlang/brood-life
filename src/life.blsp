@@ -3,8 +3,8 @@
 a packed BITBOARD (see `bitboard`) fit to the window. It starts EMPTY — LEFT click/drag
 drops random shapes, RIGHT click/drag drops glider guns, holding either auto-repeats. The
 SCROLL wheel is a VIEW zoom (a camera onto the mouse — the board is unchanged). Keys: `-`/`=`
-lower/raise an (opt-in) fps cap, `[`/`]` make the auto-spawn rarer/more-often. It runs
-UNCAPPED by default (fast). Three processes (ADR-058): a CLOCK that paces, a SIM that owns
+lower/raise the fps cap, `[`/`]` cycle the auto-spawn preset; a bottom-right `clear` empties
+the board. Starts at a 10 fps cap. Three processes (ADR-058): a CLOCK that paces, a SIM that owns
 the board and never sleeps (so pastes are instant), and this RENDERER that draws + handles
 input."
   (:use editor/display))
@@ -19,12 +19,11 @@ input."
 ;; The frame-rate cap. DEFAULT 0 = UNCAPPED (go ham — steps as fast as it can draw); a
 ;; POSITIVE value makes the CLOCK process sleep that much between ticks, to slow the sim down
 ;; enough to watch. Adjustable live with `-`/`=` (slower/faster; `=` past *fps-max* rolls back
-;; to uncapped). *frame-ns* below is a FIXED nominal budget used ONLY for spike detection.
+;; to uncapped).
 (def *target-fps* 10)  ; the fps cap to START at (0 = uncapped; >0 = paced)
 (def *fps-min* 1)
 (def *fps-max* 120)
 (def *fps-step* 5)  ; fps per `-`/`=` press
-(def *frame-ns* (quot 1000000000 30))  ; nominal ~33ms frame budget — for spike counting only
 (def *board-height* 5)  ; the FIXED window cell-font px (set once) — the board "canvas" cell size
 ;; A live cell is drawn as a SOLID CELL BACKGROUND (a space with *cell-face*'s `:bg`), not a
 ;; glyph — the kernel paints the bg as the whole cell rectangle, so neighbours TOUCH with no
@@ -152,10 +151,9 @@ width, so the CLEAR key can sit at the bottom-RIGHT (the spawn/fps keys lead at 
      :clear [cx0 cx1]
      :info-char (quot (+ infocell (- *status-scale* 1)) *status-scale*)}))
 
-;; The INFO half of the bar (gen / measured fps / cells / spikes / memory). The two buttons
-;; are prepended by the renderer (`footer-ops`), not here — STATS only knows the
-;; measurement; the renderer owns the control values. (No GC field: `gc-stats` is dev-only.)
-(defn status (gen cells per spikes)
+;; The INFO half of the bar (gen / measured fps / live cells / memory). The two buttons are
+;; prepended by the renderer (`footer-ops`), not here. (No GC field: `gc-stats` is dev-only.)
+(defn status (gen cells per)
   "The info fields of the bottom strip from one generation's measurement (`per` = ns since
 the previous frame). The renderer composes this after the buttons."
   (str "gen "
@@ -165,8 +163,6 @@ the previous frame). The renderer composes this after the buttons."
     " fps · "
     cells
     " cells · "
-    spikes
-    " spikes · "
     (quot (mem-bytes) 1048576)
     " MB"))
 
@@ -239,10 +235,10 @@ to the origin (still O(visible-live), and fewer cells show), each at `px*z`."
 ;; The CLOCK paces; the SIM owns the board and never sleeps; the RENDERER (root) owns the
 ;; window and composites. (ADR-058 concurrency.)
 
-(defn log-fmt (gen cells per spikes)
+(defn log-fmt (gen cells per)
   "A compact, tab-separated perf line for the debug log — one column per field, so it
-greps/plots cleanly (`cells` and `fps` are the headline; `ms`/gen, `spikes` and `mb`
-tie a frame-rate dip to rising population or memory churn)."
+greps/plots cleanly (`cells` and `fps` are the headline; `ms`/gen and `mb` tie a frame-rate
+dip to rising population or memory churn)."
   (str "gen "
     gen
     "\tcells "
@@ -251,8 +247,6 @@ tie a frame-rate dip to rising population or memory churn)."
     (quot 1000 (max 1 (quot per 1000000)))
     "\tms "
     (quot per 1000000)
-    "\tspikes "
-    spikes
     "\tmb "
     (quot (mem-bytes) 1048576)))
 
@@ -300,7 +294,7 @@ cell samples a glider gun (`*shooters*`, right button), any other kind samples a
     [board s]
     clicks))
 
-(defn sim-tick (renderer clk board s gen prev spikes held hn inject last-inj st logger)
+(defn sim-tick (renderer clk board s gen prev held hn inject last-inj st logger)
   "Advance ONE generation for a `[:tick clk]`: fit to the window (`*w*`/`*h*`, set by the
 renderer), fold in the held-cell auto-repeat + the wall-clock auto-inject, step, DRAW it,
 ack the clock `clk`, and recurse. The held-cell repeat fires every *spawn-every* gens past
@@ -308,7 +302,6 @@ ack the clock `clk`, and recurse. The held-cell repeat fires every *spawn-every*
   (let (board (bitboard/fit board *w* *h*)
         now (now-ns)
         per (- now prev)
-        spk (if (> per (quot (* *frame-ns* 3) 2)) (+ spikes 1) spikes)
         hn2 (if held (+ hn 1) 0)
         repeat? (and held (>= hn2 *hold-delay*) (= 0 (mod (- hn2 *hold-delay*) *spawn-every*)))
         [b1 s1] (if repeat? (apply-clicks board [held] s) [board s])
@@ -317,16 +310,16 @@ ack the clock `clk`, and recurse. The held-cell repeat fires every *spawn-every*
         last-inj2 (if inj? now last-inj)
         nxt (bitboard/step b2)
         cells (bitboard/live-count nxt)
-        st2 (status gen cells per spk))
+        st2 (status gen cells per))
     (do
-      (when (= 0 (mod gen *log-every*)) (perflog/log-line logger (log-fmt gen cells per spk)))
+      (when (= 0 (mod gen *log-every*)) (perflog/log-line logger (log-fmt gen cells per)))
       (if (= :stop (sim-draw renderer nxt st2))
         (perflog/log-stop logger)
         (do
           (send clk [:ticked])
-          (sim-loop renderer nxt s2 (+ gen 1) now spk held hn2 inject last-inj2 st2 logger))))))
+          (sim-loop renderer nxt s2 (+ gen 1) now held hn2 inject last-inj2 st2 logger))))))
 
-(defn sim-paste (renderer board s gen prev spikes held hn inject last-inj st logger kind x y newhn)
+(defn sim-paste (renderer board s gen prev held hn inject last-inj st logger kind x y newhn)
   "Apply ONE pasted pattern; if more paste events are ALREADY queued (a fast drag), apply
 those too BEFORE redrawing — so a burst is ONE O(live) redraw, not one per cell crossed (the
 fix for spawning tanking the fps). A `[:tick]` waiting in the mailbox isn't consumed here, so
@@ -337,7 +330,6 @@ it's drawn right after. Then draw once and carry on with the latest held cell."
                                s2
                                gen
                                prev
-                               spikes
                                held
                                hn
                                inject
@@ -353,7 +345,6 @@ it's drawn right after. Then draw once and carry on with the latest held cell."
                        s2
                        gen
                        prev
-                       spikes
                        held
                        hn
                        inject
@@ -368,21 +359,20 @@ it's drawn right after. Then draw once and carry on with the latest held cell."
       (after 0
         (if (= :stop (sim-draw renderer b2 st))
           (perflog/log-stop logger)
-          (sim-loop renderer b2 s2 gen prev spikes [x y kind] newhn inject last-inj st logger))))))
+          (sim-loop renderer b2 s2 gen prev [x y kind] newhn inject last-inj st logger))))))
 
-(defn sim-loop (renderer board s gen prev spikes held hn inject last-inj st logger)
+(defn sim-loop (renderer board s gen prev held hn inject last-inj st logger)
   "SIM: owns the board; NEVER sleeps — it just reacts to its mailbox. A `[:tick clk]` from
 the CLOCK advances + draws a generation (acking `clk`); a `[:press]`/`[:drag]` pastes + draws
 AT ONCE (so a paste never waits for the cap); `[:release]` clears the held cell;
 `[:set-inject]` retunes auto-spawn; `[:clear]` empties the board. `:stop` ends it."
   (receive (:stop (perflog/log-stop logger))
-    ([:tick clk] (sim-tick renderer clk board s gen prev spikes held hn inject last-inj st logger))
+    ([:tick clk] (sim-tick renderer clk board s gen prev held hn inject last-inj st logger))
     ([:press kind x y] (sim-paste renderer
                          board
                          s
                          gen
                          prev
-                         spikes
                          held
                          hn
                          inject
@@ -398,7 +388,6 @@ AT ONCE (so a paste never waits for the cap); `[:release]` clears the held cell;
                         s
                         gen
                         prev
-                        spikes
                         held
                         hn
                         inject
@@ -409,13 +398,13 @@ AT ONCE (so a paste never waits for the cap); `[:release]` clears the held cell;
                         x
                         y
                         hn))
-    ([:release] (sim-loop renderer board s gen prev spikes nil hn inject last-inj st logger))
-    ([:set-inject n] (sim-loop renderer board s gen prev spikes held hn n last-inj st logger))
+    ([:release] (sim-loop renderer board s gen prev nil hn inject last-inj st logger))
+    ([:set-inject n] (sim-loop renderer board s gen prev held hn n last-inj st logger))
     ;; the clear button: swap in a fresh EMPTY board (at the current dims) and draw it now.
     ([:clear] (let (empty (bitboard/make *w* *h*))
                 (if (= :stop (sim-draw renderer empty st))
                   (perflog/log-stop logger)
-                  (sim-loop renderer empty s gen prev spikes nil hn inject last-inj st logger))))))
+                  (sim-loop renderer empty s gen prev nil hn inject last-inj st logger))))))
 
 (defn quit-signal? (m)
   "Is `m` a quit signal? — the window's X (`:close`, a frontend signal distinct from the
@@ -611,25 +600,14 @@ auto-spawn interval (→ SIM). Updates the LOCAL mirror so the label changes at 
 SIM owns the board and never sleeps (so pastes are instant); this process draws + handles
 input. The window cell font is set ONCE; the scroll wheel is a render-only *view-zoom*
 camera (the board is unchanged). Spawn the SIM first (the CLOCK needs its pid)."
-  (let (w (gui-open "Brood Life" 2835 1890)  ; title + a big window (840x560 default + 50% ×3)
+  (let (w (gui-open "Brood Life" 1920 1200)  ; title + a big (screen-filling) window
         _ (gui-font! w {:family :mono :height *board-height*})  ; the FIXED window font (board only)
         _ (grid-fit w)  ; sizes *w*/*h* before we build the board
         start (now-ns)
         board (bitboard/make *w* *h*)  ; START EMPTY — clicks add random shapes
         me (self)  ; this root process is the renderer
         logger (perflog/log-start *log-path*)
-        sim (spawn (sim-loop me
-                     board
-                     start
-                     0
-                     (- start *frame-ns*)
-                     0
-                     nil
-                     0
-                     *inject-secs*
-                     start
-                     ""
-                     logger))
+        sim (spawn (sim-loop me board start 0 start nil 0 *inject-secs* start "" logger))
         clock (spawn (clock-loop sim *target-fps*)))
     ;; the renderer keeps a LOCAL mirror of cap/inject (for instant button labels) + drag state.
     (render-loop w
