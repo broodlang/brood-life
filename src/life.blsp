@@ -24,7 +24,10 @@ input."
 (def *fps-min* 1)
 (def *fps-max* 120)
 (def *fps-step* 5)  ; fps per `-`/`=` press
-(def *board-height* 5)  ; the FIXED window cell-font px (set once) — the board "canvas" cell size
+(def *board-height* 3)  ; the FIXED window cell-font px (set once) — the board "canvas" cell SIZE.
+;; Smaller ⇒ smaller blocks ⇒ MORE cells in the same window (a bigger X×Y board); larger ⇒
+;; chunkier blocks, fewer cells. This is the knob for board "dimensions" — the window size
+;; stays put. More cells is heavier to draw once they're live, so trade it against framerate.
 ;; A live cell is drawn as a SOLID CELL BACKGROUND (a space with *cell-face*'s `:bg`), not a
 ;; glyph — the kernel paints the bg as the whole cell rectangle, so neighbours TOUCH with no
 ;; font gaps. And each board cell spans *cell-aspect* screen columns so it comes out SQUARE
@@ -81,6 +84,38 @@ input."
 ;; this uniformly, so any known shape can drop onto the board for variety, and a gun
 ;; lands often enough to keep re-energising a settling board.
 (def *patterns* (concat *shapes* *shooters*))
+
+;; ---- the app icon: the iconic Life GLIDER, generated from the pattern itself ----------
+;; A small RGBA tile handed to the kernel's `gui-icon!` at startup — the OS taskbar /
+;; title-bar icon. The glider (Life's hacker emblem) is drawn bright on a dark tile, sized
+;; from the pattern so the window always wears the app's own motif, not a baked-in image.
+(def *icon-size* 32)  ; the icon edge in px (a 32×32 RGBA tile)
+(def *icon-glider* [[1 0] [2 1] [0 2] [1 2] [2 2]])  ; .X. / ..X / XXX — the emblem
+(def *icon-bg* [16 18 28 255])  ; the tile: dark navy, opaque
+(def *icon-fg* [70 230 150 255])  ; a live cell: bright green, opaque
+
+(defn icon-rgba ()
+  "The app icon as a flat row-major RGBA byte vector — *icon-size*² pixels, 4 bytes each
+(red, green, blue, alpha). The 3×3 glider is scaled to *icon-size*/5 px cells and centred
+(≈one cell of margin), bright green on dark — built straight from *icon-glider*."
+  (let (n *icon-size*
+        cell (quot n 5)  ; 3 glider cells across ~3/5 of the tile, the rest a margin
+        off (quot (- n (* 3 cell)) 2))
+    ; centre the 3-cell glider in the tile
+    (into []
+      (mapcat (fn (py)
+                (mapcat (fn (px)
+                          (let (gx (quot (- px off) cell)
+                                gy (quot (- py off) cell))
+                            (if (and (>= px off)
+                                  (>= py off)
+                                  (< gx 3)
+                                  (< gy 3)
+                                  (includes? *icon-glider* [gx gy]))
+                              *icon-fg*
+                              *icon-bg*)))
+                  (range n)))
+        (range n)))))
 
 ;; The generation step is `bitboard/step` (one bit-plane neighbour sum over the packed
 ;; rows — cost independent of population); torus wrapping lives entirely in `bitboard`
@@ -601,6 +636,7 @@ SIM owns the board and never sleeps (so pastes are instant); this process draws 
 input. The window cell font is set ONCE; the scroll wheel is a render-only *view-zoom*
 camera (the board is unchanged). Spawn the SIM first (the CLOCK needs its pid)."
   (let (w (gui-open "Brood Life" 1920 1200)  ; title + a big (screen-filling) window
+        _ (gui-icon! w (icon-rgba) *icon-size* *icon-size*)  ; the taskbar/title-bar glider icon
         _ (gui-font! w {:family :mono :height *board-height*})  ; the FIXED window font (board only)
         _ (grid-fit w)  ; sizes *w*/*h* before we build the board
         start (now-ns)
