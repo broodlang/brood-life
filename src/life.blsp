@@ -73,6 +73,7 @@ input."
 ;; CLOCK for the fps cap, the SIM for the spawn interval) on every change.
 (def *btn-inset* 1)  ; how many scale-steps smaller the keys are than the bar (1 ⇒ a shelf below)
 (def *btn-face* {:bg :white :fg :black :bold true})  ; a light raised KEY on the reverse bar
+(def *clear-label* " clear ")  ; the bottom-RIGHT key — click it to empty the board
 (def *log-every* 30)  ; the SIM writes a perf line to life.log every N gens (~1 Hz at 30 fps)
 (def *log-path* "life.log")  ; where the perf log is written (cwd; truncated each run)
 
@@ -129,20 +130,26 @@ bitboard `live`, threading the PRNG `s`; returns `[live' s']`."
 ;; each char is `bs` cells; `m`-cell bar margins sit around/between them; `voff` drops the
 ;; (shorter) key to sit in the bar with a shelf below; `info-char` is where the full-scale
 ;; info text starts, clear of the keys (in bar-chars, ceil'd).
-(defn footer-layout ()
+(defn footer-layout (vcols)
+  "Cell layout of the footer's keys for the renderer + hit-test. `vcols` is the bar's screen
+width, so the CLEAR key can sit at the bottom-RIGHT (the spawn/fps keys lead at the left)."
   (let (bs (max 1 (- *status-scale* *btn-inset*))
         m bs
         sw (* (string-length (spawn-label 0)) bs)
         fw (* (string-length (fps-label 0)) bs)
+        cw (* (string-length *clear-label*) bs)
         sx0 m
         sx1 (+ sx0 sw)
         fx0 (+ sx1 m m)
         fx1 (+ fx0 fw)
-        infocell (+ fx1 m m))
+        infocell (+ fx1 m m)
+        cx1 (max fx1 (- vcols m))  ; clear key: right-aligned, an `m` margin off the edge
+        cx0 (- cx1 cw))
     {:bs bs
      :voff (quot (- *status-scale* bs) 2)
      :spawn [sx0 sx1]
      :fps [fx0 fx1]
+     :clear [cx0 cx1]
      :info-char (quot (+ infocell (- *status-scale* 1)) *status-scale*)}))
 
 ;; The INFO half of the bar (gen / measured fps / cells / spikes / memory). The two buttons
@@ -169,18 +176,20 @@ the previous frame). The renderer composes this after the buttons."
 ;; them. `top`/`vcols` come from the board being drawn (`render`), so the bar is always
 ;; positioned consistently with the board — no resize jump.
 (defn footer-ops (ui info top vcols)
-  (let (l (footer-layout)
+  (let (l (footer-layout vcols)
         bs (get l :bs)
         face (assoc *btn-face* :scale bs)
         [sx0 _] (get l :spawn)
         [fx0 _] (get l :fps)
+        [cx0 _] (get l :clear)
         brow (+ top (get l :voff))
         bg (bar top
              vcols
              (str (string-repeat " " (get l :info-char)) info)
              {:face *status-face* :align :left :scale *status-scale*}))
     [bg [:text brow sx0 (spawn-label (get ui :inject)) face]
-      [:text brow fx0 (fps-label (get ui :cap)) face]]))
+      [:text brow fx0 (fps-label (get ui :cap)) face]
+      [:text brow cx0 *clear-label* face]]))
 
 ;; The leading `clear` wipes the previous frame, so we paint only what's lit. ALL geometry
 ;; comes from `live` itself (`:h`/`:w`), so the board and the bar below it (at row `:h`) are
@@ -365,7 +374,7 @@ it's drawn right after. Then draw once and carry on with the latest held cell."
   "SIM: owns the board; NEVER sleeps — it just reacts to its mailbox. A `[:tick clk]` from
 the CLOCK advances + draws a generation (acking `clk`); a `[:press]`/`[:drag]` pastes + draws
 AT ONCE (so a paste never waits for the cap); `[:release]` clears the held cell;
-`[:set-inject]` retunes auto-spawn. `:stop` stops the logger and ends it."
+`[:set-inject]` retunes auto-spawn; `[:clear]` empties the board. `:stop` ends it."
   (receive (:stop (perflog/log-stop logger))
     ([:tick clk] (sim-tick renderer clk board s gen prev spikes held hn inject last-inj st logger))
     ([:press kind x y] (sim-paste renderer
@@ -401,7 +410,12 @@ AT ONCE (so a paste never waits for the cap); `[:release]` clears the held cell;
                         y
                         hn))
     ([:release] (sim-loop renderer board s gen prev spikes nil hn inject last-inj st logger))
-    ([:set-inject n] (sim-loop renderer board s gen prev spikes held hn n last-inj st logger))))
+    ([:set-inject n] (sim-loop renderer board s gen prev spikes held hn n last-inj st logger))
+    ;; the clear button: swap in a fresh EMPTY board (at the current dims) and draw it now.
+    ([:clear] (let (empty (bitboard/make *w* *h*))
+                (if (= :stop (sim-draw renderer empty st))
+                  (perflog/log-stop logger)
+                  (sim-loop renderer empty s gen prev spikes nil hn inject last-inj st logger))))))
 
 (defn quit-signal? (m)
   "Is `m` a quit signal? — the window's X (`:close`, a frontend signal distinct from the
@@ -532,12 +546,13 @@ view zoom doesn't move the bar), so the bar begins at screen row `*h*`."
   (and (>= x a) (< x b)))
 
 (defn footer-press (sim ui col)
-  "A press in the footer: hit-test the cell `col` against the keys' cell ranges. Spawn
-toggles (tell the SIM the new interval); the fps key arms a drag (tracked in `ui`)."
-  (let (l (footer-layout))
+  "A press in the footer: hit-test the cell `col` against the keys (the bar's screen width is
+`*w*×*cell-aspect*`). Spawn cycles its preset, clear empties the board, the fps key arms a drag."
+  (let (l (footer-layout (* *w* *cell-aspect*)))
     (cond
       (in-range? col (get l :spawn)) (let (j (inject-cycle (get ui :inject)))
                                        (do (send sim [:set-inject j]) [(assoc ui :inject j) true]))
+      (in-range? col (get l :clear)) (do (send sim [:clear]) [ui false])
       (in-range? col (get l :fps)) [(assoc ui :drag :fps :dcol col :moved false) true]
       :else [ui false])))
 
@@ -596,7 +611,7 @@ auto-spawn interval (→ SIM). Updates the LOCAL mirror so the label changes at 
 SIM owns the board and never sleeps (so pastes are instant); this process draws + handles
 input. The window cell font is set ONCE; the scroll wheel is a render-only *view-zoom*
 camera (the board is unchanged). Spawn the SIM first (the CLOCK needs its pid)."
-  (let (w (gui-open "Brood Life" 1890 1260)  ; title + a big window (the 840x560 default + 50% twice)
+  (let (w (gui-open "Brood Life" 2835 1890)  ; title + a big window (840x560 default + 50% ×3)
         _ (gui-font! w {:family :mono :height *board-height*})  ; the FIXED window font (board only)
         _ (grid-fit w)  ; sizes *w*/*h* before we build the board
         start (now-ns)
