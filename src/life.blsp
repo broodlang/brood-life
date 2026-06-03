@@ -24,7 +24,7 @@ input."
 (def *fps-min* 1)
 (def *fps-max* 120)
 (def *fps-step* 5)  ; fps per `-`/`=` press
-(def *board-height* 3)  ; the FIXED window cell-font px (set once) — the board "canvas" cell SIZE.
+(def *board-height* 4)  ; the FIXED window cell-font px (set once) — the board "canvas" cell SIZE.
 ;; Smaller ⇒ smaller blocks ⇒ MORE cells in the same window (a bigger X×Y board); larger ⇒
 ;; chunkier blocks, fewer cells. This is the knob for board "dimensions" — the window size
 ;; stays put. More cells is heavier to draw once they're live, so trade it against framerate.
