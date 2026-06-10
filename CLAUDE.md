@@ -1,10 +1,12 @@
 # life — guidance for Claude
 
 Conway's Game of Life on a wrapping torus, animated in a native GUI window.
-Written in Brood (`.blsp`). The architecture is three processes (ADR-058): a
-**SIM** (model + clock), a **STATS** formatter/logger, and the **RENDERER** (the
-root process, which owns the window and composites). The sim steps the board
-serially. See `README.md` for the design notes and `src/` layout.
+Written in Brood (`.blsp`). The architecture is two processes (ADR-058): a
+**SIM** (owns the model, steps it, formats/logs, and paces itself with a
+self-resetting `(after)` timer that input preempts — the ADR-101 timer
+mechanism), and the **RENDERER** (the root process, which owns the window and
+composites). The sim steps the board serially. See `README.md` for the design
+notes and `src/` layout.
 
 Conventions worth knowing here:
 

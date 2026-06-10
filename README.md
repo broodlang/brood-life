@@ -69,17 +69,20 @@ nest format         # format the source
   population (and an all-zero band is skipped). `render` enumerates live cells with the
   `bit-positions` builtin (O(live)) and emits one draw op each over a leading `clear`.
   Relies on the kernel's bignums + unrestricted shifts + `bit-positions`.
-- The program is **three processes** (ADR-058): a **SIM** owns the model + clock
-  and pushes each board to the renderer; a **STATS** actor formats the status
-  line and writes the perf log off the hot path; the **RENDERER** (the root
-  process) owns the window and is a thin compositor.
+- The program is **two processes** (ADR-058): a **SIM** owns the model, steps it,
+  formats the status line, writes the perf log, and pushes each board to the
+  renderer; the **RENDERER** (the root process) owns the window and is a thin
+  compositor.
 - The SIM steps the board **serially** — `step` is the bulk of the CPU, and on
   these board sizes a serial recompute beats the copy-on-send overhead of fanning
   it across processes.
-- The SIM **paces to a frame-rate cap** (`*target-fps*`, default 30, live-adjustable with
-  `-`/`=`): after drawing it sleeps out the rest of the frame budget. It also waits for the
-  renderer's `[:drawn]` ack each frame, bounding the mailbox so it never runs more than one
-  frame ahead.
+- The SIM **paces ITSELF to a frame-rate cap** (`*target-fps*`, default 10, live-adjustable
+  with `-`/`=`): its `receive` parks on an `(after period)` timeout — a self-resetting timer
+  (the same mechanism as ADR-101's `ui-run` timers) whose `period` subtracts the work already
+  spent, so the cap is a true target. Any input message **preempts** the timeout, so a paste
+  is applied + drawn at once, never blocked behind the cap (the old separate CLOCK process is
+  gone). It also waits for the renderer's `[:drawn]` ack each frame, bounding the mailbox so it
+  never runs more than one frame ahead.
 - The renderer **only ever acts on a received message**, so GUI input (including a
   quit signal and **mouse clicks**) is drained no matter how long a frame takes — the
   window stays responsive even when a frame runs over budget.
