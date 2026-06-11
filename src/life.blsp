@@ -333,56 +333,75 @@ repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag 
         (perflog/log-stop logger)
         (sim-loop renderer nxt s2 (+ gen 1) now held hn2 inject last-inj2 st2 logger cap)))))
 
+(defn step-due? (prev cap)
+  "Is a generation step OVERDUE — has a full cap frame-period elapsed since the last step
+(`prev`)? UNCAPPED (cap 0) uses *fps-max* as the target here, so a continuous drag still
+BATCHES a few cells per step rather than stepping per cell, while never going longer than one
+*fps-max* frame without animating. This is what keeps the world from freezing while you DRAW:
+Brood's `receive` serves queued input before any `(after)` timeout, so under a steady drag
+stream the paced step timer never fires — `sim-paste` consults this to fold a step in anyway."
+  (let (fps (if (= cap 0) *fps-max* cap))
+    (>= (- (now-ns) prev) (* (quot 1000 fps) 1000000))))
+
 (defn sim-paste (renderer board s gen prev held hn inject last-inj st logger cap kind x y newhn)
-  "Apply ONE pasted pattern; if more paste events are ALREADY queued (a fast drag), apply
-those too BEFORE redrawing — so a burst is ONE O(live) redraw, not one per cell crossed (the
-fix for spawning tanking the fps). Other messages (a `[:set-fps]`, the paced step) wait in the
-mailbox and are served right after. Then draw once and carry on with the latest held cell."
-  (let ([b2 s2] (apply-clicks board [[x y kind]] s))
-    (receive ([:press k a b] (sim-paste renderer
-                               b2
-                               s2
-                               gen
-                               prev
-                               held
-                               hn
-                               inject
-                               last-inj
-                               st
-                               logger
-                               cap
-                               k
-                               a
-                               b
-                               0))
-      ([:drag k a b] (sim-paste renderer
-                       b2
-                       s2
-                       gen
-                       prev
-                       held
-                       hn
-                       inject
-                       last-inj
-                       st
-                       logger
-                       cap
-                       k
-                       a
-                       b
-                       newhn))
-      (:stop (perflog/log-stop logger))
-      (after 0
-        (if (= :stop (sim-draw renderer b2 st))
-          (perflog/log-stop logger)
-          (sim-loop renderer b2 s2 gen prev [x y kind] newhn inject last-inj st logger cap))))))
+  "Apply ONE pasted pattern, then EITHER step or keep draining, so a continuous drag can't
+starve the world. If a generation is overdue (`step-due?`), fold the burst-so-far through a
+real `sim-step` (advance + draw + back to the paced loop) — input alone would otherwise pin
+the SIM's mailbox and the `(after)` step timer would never fire. Otherwise, if more paste
+events are ALREADY queued (a fast drag), apply those too BEFORE redrawing — so a burst is ONE
+O(live) redraw, not one per cell crossed (the fix for spawning tanking the fps) — else draw
+once and carry on with the latest held cell. The pasted cell becomes the held cell either way."
+  (let ([b2 s2] (apply-clicks board [[x y kind]] s)
+        held2 [x y kind])
+    (if (step-due? prev cap)
+      (sim-step renderer b2 s2 gen prev held2 newhn inject last-inj st logger cap)
+      (receive ([:press k a b] (sim-paste renderer
+                                 b2
+                                 s2
+                                 gen
+                                 prev
+                                 held
+                                 hn
+                                 inject
+                                 last-inj
+                                 st
+                                 logger
+                                 cap
+                                 k
+                                 a
+                                 b
+                                 0))
+        ([:drag k a b] (sim-paste renderer
+                         b2
+                         s2
+                         gen
+                         prev
+                         held
+                         hn
+                         inject
+                         last-inj
+                         st
+                         logger
+                         cap
+                         k
+                         a
+                         b
+                         newhn))
+        (:stop (perflog/log-stop logger))
+        (after 0
+          (if (= :stop (sim-draw renderer b2 st))
+            (perflog/log-stop logger)
+            (sim-loop renderer b2 s2 gen prev held2 newhn inject last-inj st logger cap)))))))
 
 (defn sim-loop (renderer board s gen prev held hn inject last-inj st logger cap)
   "SIM: owns the board and PACES ITSELF. Its `receive` carries an `(after wait)` timeout that
 advances + draws one generation when it fires — but any input message PREEMPTS it, so a paste
 never waits for the cap. `wait` is `1000/cap` ms measured from the last step, less the work
 already spent, so the cap is a true TARGET frame time (no extra delay tacked on); `cap` 0 =
-UNCAPPED — `(after 0)` steps as fast as it can draw. `[:press]`/`[:drag]` paste; `[:release]`
+UNCAPPED — `(after 0)` steps as fast as it can draw. A steady drag stream would otherwise pin
+the mailbox and starve this `(after)` (input is served first), freezing the world while you
+draw — `sim-paste` guards against that by folding a step in once one is overdue (`step-due?`).
+`[:press]`/`[:drag]` paste; `[:release]`
 clears the held cell; `[:set-fps]` retunes the cap; `[:set-inject]` retunes auto-spawn;
 `[:clear]` empties the board; `:stop` ends it."
   (let (wait (if (= cap 0) 0 (max 0 (- (quot 1000 cap) (quot (- (now-ns) prev) 1000000)))))
