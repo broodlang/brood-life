@@ -310,28 +310,49 @@ cell samples a glider gun (`*shooters*`, right button), any other kind samples a
     [board s]
     clicks))
 
-(defn sim-step (renderer board s gen prev held hn inject last-inj st logger cap)
+;; The SIM threads ONE state map `m` (see `run-life` for its keys) — board, PRNG `s`, `gen`,
+;; the last-step time `prev`, the `held` cell + its age `hn`, the `inject` interval + its last
+;; fire `last-inj`, the cached status `st`, the fps `cap`, plus the never-changing `renderer`
+;; and `logger`. Every loop function takes `m` and recurses with just the keys it changed.
+(defn sim-step (m)
   "Advance ONE generation (the self-paced `(after)` timer fired): fit to the window
 (`*w*`/`*h*`, set by the renderer), fold in the held-cell auto-repeat + the wall-clock
 auto-inject, step, DRAW it, and recurse. No clock to ack — the SIM paces itself. The held-cell
 repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag already drew)."
-  (let (board (bitboard/fit board *w* *h*)
+  (let (board (bitboard/fit (get m :board) *w* *h*)
         now (now-ns)
-        per (- now prev)
-        hn2 (if held (+ hn 1) 0)
+        per (- now (get m :prev))
+        held (get m :held)
+        hn2 (if held (+ (get m :hn) 1) 0)
         repeat? (and held (>= hn2 *hold-delay*) (= 0 (mod (- hn2 *hold-delay*) *spawn-every*)))
-        [b1 s1] (if repeat? (apply-clicks board [held] s) [board s])
-        inj? (and (> inject 0) (>= (- now last-inj) (* inject 1000000000)))
+        [b1 s1] (if repeat? (apply-clicks board [held] (get m :s)) [board (get m :s)])
+        inject (get m :inject)
+        inj? (and (> inject 0) (>= (- now (get m :last-inj)) (* inject 1000000000)))
         [b2 s2] (if inj? (inject-pattern b1 s1) [b1 s1])
-        last-inj2 (if inj? now last-inj)
+        last-inj2 (if inj? now (get m :last-inj))
         nxt (bitboard/step b2)
         cells (bitboard/live-count nxt)
+        gen (get m :gen)
         st2 (status gen cells per))
     (do
-      (when (= 0 (mod gen *log-every*)) (perflog/log-line logger (log-fmt gen cells per)))
-      (if (= :stop (sim-draw renderer nxt st2))
-        (perflog/log-stop logger)
-        (sim-loop renderer nxt s2 (+ gen 1) now held hn2 inject last-inj2 st2 logger cap)))))
+      (when (= 0 (mod gen *log-every*)) (perflog/log-line (get m :logger) (log-fmt gen cells per)))
+      (if (= :stop (sim-draw (get m :renderer) nxt st2))
+        (perflog/log-stop (get m :logger))
+        (sim-loop (assoc m
+                    :board
+                    nxt
+                    :s
+                    s2
+                    :gen
+                    (+ gen 1)
+                    :prev
+                    now
+                    :hn
+                    hn2
+                    :last-inj
+                    last-inj2
+                    :st
+                    st2))))))
 
 (defn step-due? (prev cap)
   "Is a generation step OVERDUE — has a full cap frame-period elapsed since the last step
@@ -342,57 +363,29 @@ rate — a step costs far more than a paste, so stepping per paste would lag the
   (let (fps (if (= cap 0) *fps-max* cap))
     (>= (- (now-ns) prev) (* (quot 1000 fps) 1000000))))
 
-(defn sim-paste (renderer board s gen prev held hn inject last-inj st logger cap kind x y newhn)
+(defn sim-paste (m kind x y newhn)
   "Apply ONE pasted pattern; if more paste events are ALREADY queued (a fast drag), apply
 those too BEFORE redrawing — so a burst is ONE O(live) redraw, not one per cell crossed (the
 fix for spawning tanking the fps). When the queue drains (`after 0` — the mailbox is now
 provably empty), draw the stroke, then fold in a generation step IF one is due (`step-due?`):
 doing it HERE, not back in `sim-loop`, is the fix for the world freezing while you draw — a
 fresh `[:drag]` arriving in `sim-loop` would preempt its `(after wait)` and starve the step,
-but here the queue is already clear. Not due yet ⇒ just draw and hand back to the paced loop."
-  (let ([b2 s2] (apply-clicks board [[x y kind]] s)
-        held2 [x y kind])
-    (receive ([:press k a b] (sim-paste renderer
-                               b2
-                               s2
-                               gen
-                               prev
-                               held
-                               hn
-                               inject
-                               last-inj
-                               st
-                               logger
-                               cap
-                               k
-                               a
-                               b
-                               0))
-      ([:drag k a b] (sim-paste renderer
-                       b2
-                       s2
-                       gen
-                       prev
-                       held
-                       hn
-                       inject
-                       last-inj
-                       st
-                       logger
-                       cap
-                       k
-                       a
-                       b
-                       newhn))
-      (:stop (perflog/log-stop logger))
+but here the queue is already clear. Not due yet ⇒ just draw and hand back to the paced loop.
+`newhn` is the held-cell age to carry once the burst settles (0 on a fresh press, kept on a
+drag); the just-pasted cell becomes `:held`."
+  (let ([b2 s2] (apply-clicks (get m :board) [[x y kind]] (get m :s))
+        m2 (assoc m :board b2 :s s2 :held [x y kind]))
+    (receive ([:press k a b] (sim-paste m2 k a b 0))
+      ([:drag k a b] (sim-paste m2 k a b newhn))
+      (:stop (perflog/log-stop (get m :logger)))
       (after 0
-        (if (step-due? prev cap)
-          (sim-step renderer b2 s2 gen prev held2 newhn inject last-inj st logger cap)
-          (if (= :stop (sim-draw renderer b2 st))
-            (perflog/log-stop logger)
-            (sim-loop renderer b2 s2 gen prev held2 newhn inject last-inj st logger cap)))))))
+        (if (step-due? (get m :prev) (get m :cap))
+          (sim-step (assoc m2 :hn newhn))
+          (if (= :stop (sim-draw (get m :renderer) b2 (get m :st)))
+            (perflog/log-stop (get m :logger))
+            (sim-loop (assoc m2 :hn newhn))))))))
 
-(defn sim-loop (renderer board s gen prev held hn inject last-inj st logger cap)
+(defn sim-loop (m)
   "SIM: owns the board and PACES ITSELF. Its `receive` carries an `(after wait)` timeout that
 advances + draws one generation when it fires — but any input message PREEMPTS it, so a paste
 never waits for the cap. `wait` is `1000/cap` ms measured from the last step, less the work
@@ -400,52 +393,23 @@ already spent, so the cap is a true TARGET frame time (no extra delay tacked on)
 UNCAPPED — `(after 0)` steps as fast as it can draw. A steady drag stream would otherwise pin
 the mailbox and starve this `(after)` (input is served first), freezing the world while you
 draw — `sim-paste` does the due step at its own drain-idle point instead (`step-due?`), where
-the queue is provably clear and a fresh drag can't preempt it. `[:press]`/`[:drag]`
-clears the held cell; `[:set-fps]` retunes the cap; `[:set-inject]` retunes auto-spawn;
-`[:clear]` empties the board; `:stop` ends it."
-  (let (wait (if (= cap 0) 0 (max 0 (- (quot 1000 cap) (quot (- (now-ns) prev) 1000000)))))
-    (receive (:stop (perflog/log-stop logger))
-      ([:press kind x y] (sim-paste renderer
-                           board
-                           s
-                           gen
-                           prev
-                           held
-                           hn
-                           inject
-                           last-inj
-                           st
-                           logger
-                           cap
-                           kind
-                           x
-                           y
-                           0))
-      ([:drag kind x y] (sim-paste renderer
-                          board
-                          s
-                          gen
-                          prev
-                          held
-                          hn
-                          inject
-                          last-inj
-                          st
-                          logger
-                          cap
-                          kind
-                          x
-                          y
-                          hn))
-      ([:release] (sim-loop renderer board s gen prev nil hn inject last-inj st logger cap))
-      ([:set-fps n] (sim-loop renderer board s gen prev held hn inject last-inj st logger n))
-      ([:set-inject n] (sim-loop renderer board s gen prev held hn n last-inj st logger cap))
+the queue is provably clear and a fresh drag can't preempt it. `[:press]`/`[:drag]` paste;
+`[:release]` clears the held cell; `[:set-fps]` retunes the cap; `[:set-inject]` retunes
+auto-spawn; `[:clear]` empties the board; `:stop` ends it."
+  (let (cap (get m :cap)
+        wait (if (= cap 0) 0 (max 0 (- (quot 1000 cap) (quot (- (now-ns) (get m :prev)) 1000000)))))
+    (receive (:stop (perflog/log-stop (get m :logger)))
+      ([:press kind x y] (sim-paste m kind x y 0))
+      ([:drag kind x y] (sim-paste m kind x y (get m :hn)))
+      ([:release] (sim-loop (assoc m :held nil)))
+      ([:set-fps n] (sim-loop (assoc m :cap n)))
+      ([:set-inject n] (sim-loop (assoc m :inject n)))
       ;; the clear button: swap in a fresh EMPTY board (at the current dims) and draw it now.
       ([:clear] (let (empty (bitboard/make *w* *h*))
-                  (if (= :stop (sim-draw renderer empty st))
-                    (perflog/log-stop logger)
-                    (sim-loop renderer empty s gen prev nil hn inject last-inj st logger cap))))
-      (after wait (sim-step renderer board s gen prev held hn inject last-inj st logger cap)))))
+                  (if (= :stop (sim-draw (get m :renderer) empty (get m :st)))
+                    (perflog/log-stop (get m :logger))
+                    (sim-loop (assoc m :board empty :held nil)))))
+      (after wait (sim-step m)))))
 
 (defn quit-signal? (m)
   "Is `m` a quit signal? — the window's X (`:close`, a frontend signal distinct from the
@@ -660,19 +624,21 @@ render-only *view-zoom* camera (the board is unchanged)."
         board (bitboard/make *w* *h*)  ; START EMPTY — clicks add random shapes
         me (self)  ; this root process is the renderer
         logger (perflog/log-start *log-path*)
-        ;; the SIM carries the fps cap (*target-fps*) as its last arg — it paces itself.
-        sim (spawn (sim-loop me
-                     board
-                     start
-                     0
-                     start
-                     nil
-                     0
-                     *inject-secs*
-                     start
-                     ""
-                     logger
-                     *target-fps*)))
+        ;; the SIM's whole state in ONE map (see `sim-step`) — the PRNG seed is the start
+        ;; timestamp, `prev`/`last-inj` start there too, and it carries the fps `cap` and paces
+        ;; itself. Every loop function takes this map and recurses with only the keys it changed.
+        sim (spawn (sim-loop {:renderer me
+                              :logger logger
+                              :board board
+                              :s start
+                              :gen 0
+                              :prev start
+                              :held nil
+                              :hn 0
+                              :inject *inject-secs*
+                              :last-inj start
+                              :st ""
+                              :cap *target-fps*})))
     ;; the renderer keeps a LOCAL mirror of cap/inject (for instant button labels) + drag state.
     (render-loop w
       sim
