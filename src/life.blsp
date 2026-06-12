@@ -339,20 +339,13 @@ repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag 
       (if (= :stop (sim-draw (get m :renderer) nxt st2))
         (perflog/log-stop (get m :logger))
         (sim-loop (assoc m
-                    :board
-                    nxt
-                    :s
-                    s2
-                    :gen
-                    (+ gen 1)
-                    :prev
-                    now
-                    :hn
-                    hn2
-                    :last-inj
-                    last-inj2
-                    :st
-                    st2))))))
+                    :board nxt
+                    :s s2
+                    :gen (+ gen 1)
+                    :prev now
+                    :hn hn2
+                    :last-inj last-inj2
+                    :st st2))))))
 
 (defn step-due? (prev cap)
   "Is a generation step OVERDUE — has a full cap frame-period elapsed since the last step
@@ -375,7 +368,8 @@ but here the queue is already clear. Not due yet ⇒ just draw and hand back to 
 drag); the just-pasted cell becomes `:held`."
   (let ([b2 s2] (apply-clicks (get m :board) [[x y kind]] (get m :s))
         m2 (assoc m :board b2 :s s2 :held [x y kind]))
-    (receive ([:press k a b] (sim-paste m2 k a b 0))
+    (receive
+      ([:press k a b] (sim-paste m2 k a b 0))
       ([:drag k a b] (sim-paste m2 k a b newhn))
       (:stop (perflog/log-stop (get m :logger)))
       (after 0
@@ -398,7 +392,8 @@ the queue is provably clear and a fresh drag can't preempt it. `[:press]`/`[:dra
 auto-spawn; `[:clear]` empties the board; `:stop` ends it."
   (let (cap (get m :cap)
         wait (if (= cap 0) 0 (max 0 (- (quot 1000 cap) (quot (- (now-ns) (get m :prev)) 1000000)))))
-    (receive (:stop (perflog/log-stop (get m :logger)))
+    (receive
+      (:stop (perflog/log-stop (get m :logger)))
       ([:press kind x y] (sim-paste m kind x y 0))
       ([:drag kind x y] (sim-paste m kind x y (get m :hn)))
       ([:release] (sim-loop (assoc m :held nil)))
