@@ -36,12 +36,13 @@ this RENDERER that draws + handles input."
 (def *cell-aspect* 2)  ; screen columns per board cell (compensates the font's cell aspect)
 (def *cell-face* {:bg :white})  ; a live cell: a solid filled square (the :bg is overridden per cell)
 ;; SPAWN COLOURS. Each spawn — a click/drag drop or an auto-inject — gets a fresh vivid colour,
-;; and that colour is CARRIED ACROSS generations so you can see which spawn a region descends
-;; from: a surviving cell keeps its colour, a newborn inherits the DOMINANT colour of its 3 live
-;; parents (the colour layer lives in `life`, parallel to the pure bitboard). Hue walks the wheel
-;; by ~the golden angle per spawn id, so consecutive spawns land far apart — a "big range" of
-;; distinct colours — at fixed high saturation/value. An UNCOLOURED live cell (no spawn id: a
-;; birth with no coloured parent, or a cell kept across a resize) falls back to *default-cell-bg*.
+;; and that colour is CARRIED ACROSS generations so you can see where a region came from: a
+;; surviving cell keeps its colour, a newborn is the BLEND (channel average) of its live parents'
+;; colours (the colour layer lives in `life`, parallel to the pure bitboard). Hue walks the wheel
+;; by ~the golden angle per spawn, so consecutive spawns land far apart — a "big range" of
+;; distinct colours — at fixed high saturation/value; where two colonies meet, the births between
+;; them mix into gradients. An UNCOLOURED live cell (no parent carried a colour, or one kept
+;; across a resize) falls back to *default-cell-bg*.
 (def *default-cell-bg* :white)  ; an uncoloured live cell — the original all-white look
 (def *spawn-hue-step* 137)  ; degrees of hue between consecutive spawn ids (≈ the golden angle)
 (def *spawn-sat* 0.85)  ; spawn-colour saturation (0–1): high ⇒ vivid, not washed out
@@ -161,9 +162,11 @@ bitboard `live`, threading the PRNG `s`; returns `[live' s']`."
     [(bitboard/place live pat x y) s3]))
 
 ;; ---- the SPAWN-COLOUR layer (parallel to the pure bitboard) -------------------------------
-;; `colors` maps a live cell `[x y]` → a spawn id; `palette` maps that id → an `[r g b]` byte
-;; vector. Keyed by `[x y]` (not a bit index) so it survives a resize unchanged. The bitboard
-;; stays pure (alive/dead only); the SIM threads this layer through spawns and the step.
+;; `colors` maps a live cell `[x y]` → its `[r g b]` byte vector. Keyed by `[x y]` (not a bit
+;; index) so it survives a resize unchanged. The bitboard stays pure (alive/dead only); the SIM
+;; threads this layer through spawns and the step. A NEWBORN's colour is the BLEND (channel
+;; average) of its live parents' colours, so where two colonies meet their colours mix — which
+;; is why the colour is stored as raw RGB per cell, not a spawn id (a blend names no one spawn).
 
 (defn hsv->rgb (h s v)
   "An HSV colour (`h` 0–360°, `s`/`v` 0–1) as an `[r g b]` byte vector (0–255) — the kernel
@@ -184,60 +187,61 @@ and `f` its fraction (no float `mod`, which the kernel's `mod` doesn't take)."
                   else [v p q]))
     [(round (* 255 r)) (round (* 255 g)) (round (* 255 b))]))
 
-(defn spawn-rgb (id)
-  "The vivid `[r g b]` for spawn `id`: hue walks the wheel by *spawn-hue-step* per id, so
-consecutive spawns are far apart on the colour wheel — a big range of distinct colours."
-  (hsv->rgb (mod (* id *spawn-hue-step*) 360) *spawn-sat* *spawn-val*))
+(defn spawn-rgb (n)
+  "The vivid `[r g b]` for the `n`-th spawn: hue walks the wheel by *spawn-hue-step* per spawn,
+so consecutive spawns are far apart on the colour wheel — a big range of distinct colours."
+  (hsv->rgb (mod (* n *spawn-hue-step*) 360) *spawn-sat* *spawn-val*))
 
-(defn color-spawn (colors palette next-id old-bits new-bits w)
-  "Give every cell the latest placement turned on (bits in `new` not in `old`) a FRESH spawn
-id, so each spawn is its own colour. Returns `[colors' palette' next-id']`. A placement only
+(defn blend-rgb (rgbs)
+  "The channel-wise average of `rgbs` (a non-empty list of `[r g b]`) — the colour a newborn
+gets from its parents. Integer mean per channel."
+  (let (n (length rgbs))
+    [(quot (reduce (fn (a c) (+ a (vector-ref c 0))) 0 rgbs) n) (quot (reduce (fn (a c)
+                                                                                (+ a
+                                                                                  (vector-ref c 1)))
+                                                                        0
+                                                                        rgbs)
+                                                                  n)
+      (quot (reduce (fn (a c) (+ a (vector-ref c 2))) 0 rgbs) n)]))
+
+(defn color-spawn (colors next-id old-bits new-bits w)
+  "Give every cell the latest placement turned on (bits in `new` not in `old`) the next spawn's
+fresh colour, so each spawn is its own colour. Returns `[colors' next-id']`. A placement only
 OR-s bits in, so `new ⊇ old` and the added cells are exactly `new XOR old`."
   (let (added (bit-positions (bit-xor new-bits old-bits)))
     (if (nil? added)
-      [colors palette next-id]
-      [(reduce (fn (c i) (assoc c [(mod i w) (quot i w)] next-id)) colors added) (assoc palette
-                                                                                   next-id
-                                                                                   (spawn-rgb next-id))
-        (+ next-id 1)])))
+      [colors next-id]
+      [(reduce (fn (c i) (assoc c [(mod i w) (quot i w)] (spawn-rgb next-id))) colors added) (+ next-id
+                                                                                               1)])))
 
-(defn birth-color (oldlive colors w h x y)
-  "The colour a NEWBORN at `(x,y)` inherits: the DOMINANT id among its live parents — the OLD
-cells in its 8 torus neighbours (a birth has exactly 3). `nil` if none carry a colour."
-  (let (ids (filter (fn (id) (not (nil? id)))
-              (map (fn ([dx dy]) (get colors [(mod (+ x dx) w) (mod (+ y dy) h)]))
-                (filter (fn ([dx dy]) (get oldlive [(mod (+ x dx) w) (mod (+ y dy) h)]))
-                  [[-1 -1] [0 -1] [1 -1] [-1 0] [1 0] [-1 1] [0 1] [1 1]]))))
-    (if (nil? ids)
-      nil
-      (let (freq (frequencies ids)) (max-by (fn (k) (get freq k)) (keys freq))))))
+(defn birth-blend (oldlive colors w h x y)
+  "The colour a NEWBORN at `(x,y)` takes: the BLEND (channel average) of its live parents'
+colours — the OLD cells in its 8 torus neighbours (a birth has exactly 3). `nil` if none carry
+a colour."
+  (let (rgbs (filter (fn (c) (not (nil? c)))
+               (map (fn ([dx dy]) (get colors [(mod (+ x dx) w) (mod (+ y dy) h)]))
+                 (filter (fn ([dx dy]) (get oldlive [(mod (+ x dx) w) (mod (+ y dy) h)]))
+                   [[-1 -1] [0 -1] [1 -1] [-1 0] [1 0] [-1 1] [0 1] [1 1]]))))
+    (if (nil? rgbs) nil (blend-rgb rgbs))))
 
-(defn prune-palette (palette colors)
-  "Keep only the palette entries whose id is still in use by a live cell, so a long run doesn't
-accrete dead colonies' colours."
-  (into {}
-    (map (fn (id) [id (get palette id)])
-      (filter (fn (id) (not (nil? id))) (distinct (vals colors))))))
-
-(defn recolor (colors palette old-bits new-bits w h)
+(defn recolor (colors old-bits new-bits w h)
   "Carry the colour layer across ONE generation. A SURVIVOR (live in both boards) keeps its
-colour; a NEWBORN takes `birth-color` (its dominant parent); dead cells drop out. Returns
-`[colors' palette']`, the palette pruned to ids still present."
+colour; a NEWBORN takes `birth-blend` (the average of its live parents); dead cells drop out.
+Returns the new `colors`."
   (let (oldlive (reduce (fn (s i) (assoc s [(mod i w) (quot i w)] true))
                   {}
-                  (bit-positions old-bits))
-        colors2 (reduce (fn (acc i)
-                          (let (x (mod i w)
-                                y (quot i w)
-                                xy [x y])
-                            (assoc acc
-                              xy
-                              (if (get oldlive xy)
-                                (get colors xy)
-                                (birth-color oldlive colors w h x y)))))
-                  {}
-                  (bit-positions new-bits)))
-    [colors2 (prune-palette palette colors2)]))
+                  (bit-positions old-bits)))
+    (reduce (fn (acc i)
+              (let (x (mod i w)
+                    y (quot i w)
+                    xy [x y])
+                (assoc acc
+                  xy
+                  (if (get oldlive xy)
+                    (get colors xy)
+                    (birth-blend oldlive colors w h x y)))))
+      {}
+      (bit-positions new-bits))))
 
 ;; The two CLICKABLE button labels — fixed width (11 + 9 chars) so the layout/hit ranges
 ;; stay put as the numbers change; `pad-left` holds the value column. They take the value to
@@ -318,11 +322,11 @@ the previous frame). The renderer composes this after the buttons."
 ;; under a freshly-measured bar position (that mismatch made the footer jump on resize).
 ;; *view-zoom* is a render-only camera (per-op `:scale`, ADR-079) over the SAME board, so
 ;; zooming changes neither the board nor the bar — only which window of cells is magnified.
-(defn cell-bg (colors palette x y)
-  "The `:bg` for live board cell `(x,y)`: its spawn colour (`[r g b]`), or *default-cell-bg*
-for an uncoloured cell (no spawn id — a birth with no coloured parent, or one kept past a resize)."
-  (let (id (get colors [x y]))
-    (if (nil? id) *default-cell-bg* (get palette id))))
+(defn cell-bg (colors x y)
+  "The `:bg` for live board cell `(x,y)`: its `[r g b]` colour, or *default-cell-bg* for an
+uncoloured cell (no parent carried a colour, or one kept past a resize)."
+  (let (rgb (get colors [x y]))
+    (if (nil? rgb) *default-cell-bg* rgb)))
 
 (defn render (live ui info)
   "A display frame from `live`: the live cells as `:text` ops, then the bottom bar at row
@@ -334,8 +338,7 @@ masked to the column range (still O(visible-live), and fewer cells show), each a
   (let (z *view-zoom*
         a *cell-aspect*
         fill (string-repeat " " a)  ; an `a`-wide blank; the face's bg fills its cell box
-        colors (get ui :colors)  ; the spawn-colour layer, keyed by [x y]
-        palette (get ui :palette)  ; spawn id → [r g b]
+        colors (get ui :colors)  ; the spawn-colour layer: [x y] → [r g b]
         bits (get live :bits)
         h (get live :h)
         wdt (get live :w))
@@ -344,7 +347,7 @@ masked to the column range (still O(visible-live), and fewer cells show), each a
         (if (= z 1)
           (map (fn (i)
                  (let (x (mod i wdt) y (quot i wdt))
-                   [:text y (* x a) fill (assoc *cell-face* :bg (cell-bg colors palette x y))]))
+                   [:text y (* x a) fill (assoc *cell-face* :bg (cell-bg colors x y))]))
             (bit-positions bits))
           (let (visw (max 1 (quot wdt z))
                 vish (max 1 (quot h z))
@@ -363,7 +366,7 @@ masked to the column range (still O(visible-live), and fewer cells show), each a
                            [:text (* sy z)
                              (* px az)
                              fill
-                             (assoc zface :bg (cell-bg colors palette (+ ox px) (+ oy sy)))])
+                             (assoc zface :bg (cell-bg colors (+ ox px) (+ oy sy)))])
                       (bit-positions vr)))))
               (range vish)))))
       ;; the bar spans the full SCREEN width (board cols × *cell-aspect*), at screen row *h*.
@@ -395,12 +398,12 @@ dip to rising population or memory churn)."
 ;; invariant, now with one fewer process (the old CLOCK and its [:tick]/[:ticked] handshake are
 ;; gone). The RENDERER owns the window + input.
 
-(defn sim-draw (renderer board st colors palette)
-  "Send `board` + status string `st` + the spawn-colour layer (`colors`/`palette`) to the
-renderer and wait for its `[:drawn]` ack (bounds the renderer's mailbox to one frame). Returns
-`:ok`, or `:stop` if torn down while waiting."
+(defn sim-draw (renderer board st colors)
+  "Send `board` + status string `st` + the spawn-colour layer (`colors`) to the renderer and
+wait for its `[:drawn]` ack (bounds the renderer's mailbox to one frame). Returns `:ok`, or
+`:stop` if torn down while waiting."
   (do
-    (send renderer [:board board st colors palette])
+    (send renderer [:board board st colors])
     (receive ([:drawn] :ok) (:stop :stop) (after 2000 :ok))))
 
 (defn apply-clicks (board clicks s)
@@ -434,28 +437,23 @@ repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag 
         repeat? (and held (>= hn2 *hold-delay*) (= 0 (mod (- hn2 *hold-delay*) *spawn-every*)))
         [b1 s1] (if repeat? (apply-clicks board [held] (get m :s)) [board (get m :s)])
         ;; colour each spawn (held-repeat, then auto-inject) as it lands, then carry the layer
-        ;; across the step — survivors keep their colour, newborns inherit the dominant parent.
-        [c1 p1 n1] (if repeat?
-                     (color-spawn (get m :colors)
-                       (get m :palette)
-                       (get m :next-id)
-                       (get board :bits)
-                       (get b1 :bits)
-                       w)
-                     [(get m :colors) (get m :palette) (get m :next-id)])
+        ;; across the step — survivors keep their colour, newborns blend their live parents'.
+        [c1 n1] (if repeat?
+                  (color-spawn (get m :colors) (get m :next-id) (get board :bits) (get b1 :bits) w)
+                  [(get m :colors) (get m :next-id)])
         inject (get m :inject)
         inj? (and (> inject 0) (>= (- now (get m :last-inj)) (* inject 1000000000)))
         [b2 s2] (if inj? (inject-pattern b1 s1) [b1 s1])
-        [c2 p2 n2] (if inj? (color-spawn c1 p1 n1 (get b1 :bits) (get b2 :bits) w) [c1 p1 n1])
+        [c2 n2] (if inj? (color-spawn c1 n1 (get b1 :bits) (get b2 :bits) w) [c1 n1])
         last-inj2 (if inj? now (get m :last-inj))
         nxt (bitboard/step b2)
-        [c3 p3] (recolor c2 p2 (get b2 :bits) (get nxt :bits) w h)
+        c3 (recolor c2 (get b2 :bits) (get nxt :bits) w h)
         cells (bitboard/live-count nxt)
         gen (get m :gen)
         st2 (status gen cells per))
     (do
       (when (= 0 (mod gen *log-every*)) (perflog/log-line (get m :logger) (log-fmt gen cells per)))
-      (if (= :stop (sim-draw (get m :renderer) nxt st2 c3 p3))
+      (if (= :stop (sim-draw (get m :renderer) nxt st2 c3))
         (perflog/log-stop (get m :logger))
         (sim-loop (assoc m
                     :board
@@ -474,8 +472,6 @@ repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag 
                     st2
                     :colors
                     c3
-                    :palette
-                    p3
                     :next-id
                     n2))))))
 
@@ -501,20 +497,19 @@ drag); the just-pasted cell becomes `:held`."
   (let ([b2 s2] (apply-clicks (get m :board) [[x y kind]] (get m :s))
         ;; each pasted cell is its own spawn — give it a fresh colour (sim-paste always pastes
         ;; ONE click, so a drag's crossed cells each get a distinct colour).
-        [c2 p2 n2] (color-spawn (get m :colors)
-                     (get m :palette)
-                     (get m :next-id)
-                     (get (get m :board) :bits)
-                     (get b2 :bits)
-                     (get b2 :w))
-        m2 (assoc m :board b2 :s s2 :held [x y kind] :colors c2 :palette p2 :next-id n2))
+        [c2 n2] (color-spawn (get m :colors)
+                  (get m :next-id)
+                  (get (get m :board) :bits)
+                  (get b2 :bits)
+                  (get b2 :w))
+        m2 (assoc m :board b2 :s s2 :held [x y kind] :colors c2 :next-id n2))
     (receive ([:press k a b] (sim-paste m2 k a b 0))
       ([:drag k a b] (sim-paste m2 k a b newhn))
       (:stop (perflog/log-stop (get m :logger)))
       (after 0
         (if (step-due? (get m :prev) (get m :cap))
           (sim-step (assoc m2 :hn newhn))
-          (if (= :stop (sim-draw (get m :renderer) b2 (get m :st) c2 p2))
+          (if (= :stop (sim-draw (get m :renderer) b2 (get m :st) c2))
             (perflog/log-stop (get m :logger))
             (sim-loop (assoc m2 :hn newhn))))))))
 
@@ -539,9 +534,9 @@ auto-spawn; `[:clear]` empties the board; `:stop` ends it."
       ([:set-inject n] (sim-loop (assoc m :inject n)))
       ;; the clear button: swap in a fresh EMPTY board (at the current dims) and draw it now.
       ([:clear] (let (empty (bitboard/make *w* *h*))
-                  (if (= :stop (sim-draw (get m :renderer) empty (get m :st) {} {}))
+                  (if (= :stop (sim-draw (get m :renderer) empty (get m :st) {}))
                     (perflog/log-stop (get m :logger))
-                    (sim-loop (assoc m :board empty :held nil :colors {} :palette {} :next-id 0)))))
+                    (sim-loop (assoc m :board empty :held nil :colors {} :next-id 0)))))
       (after wait (sim-step m)))))
 
 (defn quit-signal? (m)
@@ -573,7 +568,7 @@ the renderer's two `[:mouse …]` arities (press carries a 7th click-count eleme
 ;; fps cap and everything else go to the one owner now). This loop never sleeps.
 (defn render-loop (w sim board info ui)
   (receive
-    ([:board nl st colors palette]
+    ([:board nl st colors]
       (do
         ;; Re-read the window each frame into *w*/*h*: the cell grid grows
         ;; after the async gui-font! applies (and a font change sends no
@@ -584,7 +579,7 @@ the renderer's two `[:mouse …]` arities (press carries a 7th click-count eleme
         ;; cache the sim's spawn-colour layer in the local ui mirror, so input
         ;; redraws (which use the cached ui) paint the right colours too.
         (let (nl2 (bitboard/fit nl *w* *h*)
-              ui2 (assoc ui :colors colors :palette palette))
+              ui2 (assoc ui :colors colors))
           (do
             (draw! w nl2 st ui2)
             (send sim [:drawn])
@@ -776,7 +771,6 @@ render-only *view-zoom* camera (the board is unchanged)."
                               :st ""
                               :cap *target-fps*
                               :colors {}
-                              :palette {}
                               :next-id 0})))
     ;; the renderer keeps a LOCAL mirror of cap/inject (for instant button labels) + drag state,
     ;; plus the spawn-colour layer the sim sends with each frame (for input redraws).
@@ -789,5 +783,4 @@ render-only *view-zoom* camera (the board is unchanged)."
        :drag nil
        :dcol 0
        :moved false
-       :colors {}
-       :palette {}})))
+       :colors {}})))
