@@ -168,6 +168,11 @@ bitboard `live`, threading the PRNG `s`; returns `[live' s']`."
 ;; average) of its live parents' colours, so where two colonies meet their colours mix — which
 ;; is why the colour is stored as raw RGB per cell, not a spawn id (a blend names no one spawn).
 
+(defn bit->xy (i w)
+  "The board cell `[x y]` for whole-board bit index `i` — bit `i` is cell `(i mod w, i div w)`,
+the same layout `bitboard` uses. The colour layer's one place for this decode."
+  [(mod i w) (quot i w)])
+
 (defn hsv->rgb (h s v)
   "An HSV colour (`h` 0–360°, `s`/`v` 0–1) as an `[r g b]` byte vector (0–255) — the kernel
 takes `[r g b]` for a face `:bg`. Standard sextant conversion; the sextant is `floor (h/60)`
@@ -187,22 +192,17 @@ and `f` its fraction (no float `mod`, which the kernel's `mod` doesn't take)."
                   else [v p q]))
     [(round (* 255 r)) (round (* 255 g)) (round (* 255 b))]))
 
-(defn spawn-rgb (n)
-  "The vivid `[r g b]` for the `n`-th spawn: hue walks the wheel by *spawn-hue-step* per spawn,
-so consecutive spawns are far apart on the colour wheel — a big range of distinct colours."
-  (hsv->rgb (mod (* n *spawn-hue-step*) 360) *spawn-sat* *spawn-val*))
+(defn spawn-rgb (id)
+  "The vivid `[r g b]` for spawn `id`: hue walks the wheel by *spawn-hue-step* per spawn, so
+consecutive spawns are far apart on the colour wheel — a big range of distinct colours."
+  (hsv->rgb (mod (* id *spawn-hue-step*) 360) *spawn-sat* *spawn-val*))
 
 (defn blend-rgb (rgbs)
-  "The channel-wise average of `rgbs` (a non-empty list of `[r g b]`) — the colour a newborn
-gets from its parents. Integer mean per channel."
-  (let (n (length rgbs))
-    [(quot (reduce (fn (a c) (+ a (vector-ref c 0))) 0 rgbs) n) (quot (reduce (fn (a c)
-                                                                                (+ a
-                                                                                  (vector-ref c 1)))
-                                                                        0
-                                                                        rgbs)
-                                                                  n)
-      (quot (reduce (fn (a c) (+ a (vector-ref c 2))) 0 rgbs) n)]))
+  "The channel-wise integer average of `rgbs` (a non-empty list of `[r g b]`) — a newborn's
+colour from its parents."
+  (let (n (length rgbs)
+        chan (fn (k) (quot (reduce (fn (a c) (+ a (vector-ref c k))) 0 rgbs) n)))
+    [(chan 0) (chan 1) (chan 2)]))
 
 (defn color-spawn (colors next-id old-bits new-bits w)
   "Give every cell the latest placement turned on (bits in `new` not in `old`) the next spawn's
@@ -211,35 +211,30 @@ OR-s bits in, so `new ⊇ old` and the added cells are exactly `new XOR old`."
   (let (added (bit-positions (bit-xor new-bits old-bits)))
     (if (nil? added)
       [colors next-id]
-      [(reduce (fn (c i) (assoc c [(mod i w) (quot i w)] (spawn-rgb next-id))) colors added) (+ next-id
-                                                                                               1)])))
+      (let (rgb (spawn-rgb next-id))
+        ; one colour for the whole spawn — compute it once
+        [(reduce (fn (c i) (assoc c (bit->xy i w) rgb)) colors added) (+ next-id 1)]))))
 
-(defn birth-blend (oldlive colors w h x y)
-  "The colour a NEWBORN at `(x,y)` takes: the BLEND (channel average) of its live parents'
-colours — the OLD cells in its 8 torus neighbours (a birth has exactly 3). `nil` if none carry
-a colour."
-  (let (rgbs (filter (fn (c) (not (nil? c)))
+(defn birth-blend (colors w h xy)
+  "The colour a NEWBORN at `xy` takes: the BLEND (channel average) of its parents' colours —
+its 8 torus neighbours that carry one. A colour means the neighbour was a live cell last gen,
+so this is exactly the live parents (a birth has 3); `nil` if none is coloured."
+  (let ([x y] xy
+        rgbs (filter (fn (c) (not (nil? c)))
                (map (fn ([dx dy]) (get colors [(mod (+ x dx) w) (mod (+ y dy) h)]))
-                 (filter (fn ([dx dy]) (get oldlive [(mod (+ x dx) w) (mod (+ y dy) h)]))
-                   [[-1 -1] [0 -1] [1 -1] [-1 0] [1 0] [-1 1] [0 1] [1 1]]))))
+                 [[-1 -1] [0 -1] [1 -1] [-1 0] [1 0] [-1 1] [0 1] [1 1]])))
     (if (nil? rgbs) nil (blend-rgb rgbs))))
 
-(defn recolor (colors old-bits new-bits w h)
-  "Carry the colour layer across ONE generation. A SURVIVOR (live in both boards) keeps its
-colour; a NEWBORN takes `birth-blend` (the average of its live parents); dead cells drop out.
-Returns the new `colors`."
-  (let (oldlive (reduce (fn (s i) (assoc s [(mod i w) (quot i w)] true))
-                  {}
-                  (bit-positions old-bits)))
-    (reduce (fn (acc i)
-              (let (x (mod i w)
-                    y (quot i w)
-                    xy [x y])
-                (assoc acc
-                  xy
-                  (if (get oldlive xy)
-                    (get colors xy)
-                    (birth-blend oldlive colors w h x y)))))
+(defn recolor (colors new-bits w h)
+  "Carry the colour layer across ONE generation, rebuilt from the live cells of `new-bits` (so
+dead cells drop out). A SURVIVOR already has an entry in `colors` (every live cell carries a
+colour, so a colour ⇔ it was live last gen) and keeps it; a NEWBORN (no prior colour) takes
+`birth-blend`, the average of its live parents."
+  (let (recolour-cell (fn (acc i)
+                        (let (xy (bit->xy i w)
+                              prev (get colors xy))
+                          (assoc acc xy (if (nil? prev) (birth-blend colors w h xy) prev)))))
+    (reduce recolour-cell
       {}
       (bit-positions new-bits))))
 
@@ -325,8 +320,7 @@ the previous frame). The renderer composes this after the buttons."
 (defn cell-bg (colors x y)
   "The `:bg` for live board cell `(x,y)`: its `[r g b]` colour, or *default-cell-bg* for an
 uncoloured cell (no parent carried a colour, or one kept past a resize)."
-  (let (rgb (get colors [x y]))
-    (if (nil? rgb) *default-cell-bg* rgb)))
+  (get colors [x y] *default-cell-bg*))
 
 (defn render (live ui info)
   "A display frame from `live`: the live cells as `:text` ops, then the bottom bar at row
@@ -346,7 +340,7 @@ masked to the column range (still O(visible-live), and fewer cells show), each a
       (into [(clear)]
         (if (= z 1)
           (map (fn (i)
-                 (let (x (mod i wdt) y (quot i wdt))
+                 (let ([x y] (bit->xy i wdt))
                    [:text y (* x a) fill (assoc *cell-face* :bg (cell-bg colors x y))]))
             (bit-positions bits))
           (let (visw (max 1 (quot wdt z))
@@ -447,7 +441,7 @@ repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag 
         [c2 n2] (if inj? (color-spawn c1 n1 (get b1 :bits) (get b2 :bits) w) [c1 n1])
         last-inj2 (if inj? now (get m :last-inj))
         nxt (bitboard/step b2)
-        c3 (recolor c2 (get b2 :bits) (get nxt :bits) w h)
+        c3 (recolor c2 (get nxt :bits) w h)
         cells (bitboard/live-count nxt)
         gen (get m :gen)
         st2 (status gen cells per))
@@ -456,24 +450,15 @@ repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag 
       (if (= :stop (sim-draw (get m :renderer) nxt st2 c3))
         (perflog/log-stop (get m :logger))
         (sim-loop (assoc m
-                    :board
-                    nxt
-                    :s
-                    s2
-                    :gen
-                    (+ gen 1)
-                    :prev
-                    now
-                    :hn
-                    hn2
-                    :last-inj
-                    last-inj2
-                    :st
-                    st2
-                    :colors
-                    c3
-                    :next-id
-                    n2))))))
+                    :board nxt
+                    :s s2
+                    :gen (+ gen 1)
+                    :prev now
+                    :hn hn2
+                    :last-inj last-inj2
+                    :st st2
+                    :colors c3
+                    :next-id n2))))))
 
 (defn step-due? (prev cap)
   "Is a generation step OVERDUE — has a full cap frame-period elapsed since the last step
@@ -503,7 +488,8 @@ drag); the just-pasted cell becomes `:held`."
                   (get b2 :bits)
                   (get b2 :w))
         m2 (assoc m :board b2 :s s2 :held [x y kind] :colors c2 :next-id n2))
-    (receive ([:press k a b] (sim-paste m2 k a b 0))
+    (receive
+      ([:press k a b] (sim-paste m2 k a b 0))
       ([:drag k a b] (sim-paste m2 k a b newhn))
       (:stop (perflog/log-stop (get m :logger)))
       (after 0
@@ -526,7 +512,8 @@ the queue is provably clear and a fresh drag can't preempt it. `[:press]`/`[:dra
 auto-spawn; `[:clear]` empties the board; `:stop` ends it."
   (let (cap (get m :cap)
         wait (if (= cap 0) 0 (max 0 (- (quot 1000 cap) (quot (- (now-ns) (get m :prev)) 1000000)))))
-    (receive (:stop (perflog/log-stop (get m :logger)))
+    (receive
+      (:stop (perflog/log-stop (get m :logger)))
       ([:press kind x y] (sim-paste m kind x y 0))
       ([:drag kind x y] (sim-paste m kind x y (get m :hn)))
       ([:release] (sim-loop (assoc m :held nil)))
