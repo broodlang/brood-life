@@ -88,9 +88,8 @@ A cell lives iff it has exactly 3 live neighbours, or 2 and it is already live â
         s2 (vector-ref planes 2)
         s3 (vector-ref planes 3))
     (assoc board
-      :bits
-      (bit-and (bit-and s1 (bit-and (bit-xor s2 brd) (bit-xor s3 brd)))
-        (bit-or s0 b)))))
+      :bits (bit-and (bit-and s1 (bit-and (bit-xor s2 brd) (bit-xor s3 brd)))
+              (bit-or s0 b)))))
 
 (defn cells (board)
   "A list of live `[x y]` cells â€” O(live), via one `bit-positions` over the whole board

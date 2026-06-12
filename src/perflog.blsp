@@ -9,7 +9,8 @@ to finish. (If Brood gains an append/handle API, swap the re-spit for a real app
 (defn perflog--loop (path buf)
   "The logger loop: `path` is the file, `buf` the text written so far. `[:line s]` appends
 `s` + newline and re-writes the whole buffer to `path`; `:stop` ends it."
-  (receive (:stop nil)
+  (receive
+    (:stop nil)
     ([:line s] (let (buf2 (str buf s "\n")) (do (spit path buf2) (perflog--loop path buf2))))))
 
 (defn log-start (path)
