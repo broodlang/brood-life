@@ -92,28 +92,23 @@ this RENDERER that draws + handles input."
 (def *clear-label* " clear ")  ; the bottom-RIGHT key — click it to empty the board
 (def *log-every* 30)  ; the SIM writes a perf line to life.log every N gens (~0.3 Hz at the 10 fps default)
 (def *log-path* "life.log")  ; where the perf log is written (cwd; truncated each run)
-;; PARALLEL RECOLOUR. The per-frame hot spot is the spawn-colour layer (`recolor`), whose cost
-;; is the per-birth blend (8 neighbour lookups + a channel average). Births are independent and
-;; write disjoint keys, so the SIM can fan them across a pool of persistent worker processes
-;; (spawned once in `run-life`) and merge the results — measured ~2.7–3.2× on a moderate board
-;; with HIGH churn (lots of births, ~3k live cells).
-;;
-;; But it only wins in that regime. Each worker is sent the WHOLE colour map every frame (a
-;; birth reads neighbours anywhere on the board), and that O(population) copy — done once per
-;; worker — overtakes the blend savings on a DENSE or LOW-CHURN board: measured a NET LOSS by
-;; ~8k live cells (par 125ms vs serial 68ms), worsening with size (40k: 429 vs 324). So
-;; `recolor-par` is GUARDED: above *recolor-par-max-cells* live cells it just runs serial, which
-;; is exactly the right choice there. (The unconditional win needs a different shape — persistent
-;; workers that OWN a board band and exchange only halo rows, so per-frame traffic is O(halo) not
-;; O(population); that is a larger re-architecture, deferred.)
-(def *recolor-workers* (min 4 (max 0 (- (worker-threads) 1))))  ; pool size, capped at the knee
-;; the fan-out/merge serial overhead outweighs more workers past ~4 (8 measured slower than 4);
-;; sized from `worker-threads` ≈ nproc, leaving one thread for the SIM. 0 ⇒ pool empty ⇒ serial.
-(def *recolor-par-max-cells* 4000)  ; above this live-cell count, recolor-par falls back to serial
-;; (the map-copy-per-worker overtakes the win on bigger boards — see the note above). Heuristic:
-;; the crossover also depends on churn, so this is a conservative guard, not an exact threshold.
-(def *recolor-timeout-ms* 1000)  ; if a worker doesn't reply within this, abandon the fan-out and
-;; recompute serially — keeps a dead/stuck worker from wedging the SIM (there is no supervisor).
+;; PARALLEL RECOLOUR (sharded). The per-frame hot spot is the spawn-colour layer (`recolor`); its
+;; cost is the per-birth blend (8 neighbour lookups + a channel average). The SIM SHARDS it across
+;; a fixed pool of persistent worker processes, each OWNING one horizontal row-BAND's colour slice
+;; ACROSS generations — so the full colour map is never re-copied to workers each frame (that whole-
+;; map copy is what made a naive per-frame fan-out lose on dense boards). Each gen the SIM hands
+;; every worker its band's bits (shifted to band width, so per-worker bit-ops are O(band) not
+;; O(board)) plus this gen's spawn delta; workers exchange one halo ROW with each neighbour (a
+;; torus RING), recolour their band, and return the slice; the SIM merges into the full map it
+;; sends the renderer. Workers stay in sync via the per-gen delta + the merge; a paste between
+;; steps pushes its delta with `shard-add!`, and a resize/clear re-shards with `shard-reslice!`.
+;; Measured vs serial: dense 30k board 324ms → ~200ms; a 3k board 117ms → ~18ms.
+(def *recolor-workers* (max 1 (min 8 (- (worker-threads) 1))))  ; band/worker count (≥1). 8 was the
+;; dense sweet spot on a 12-core box; more bands regress (halo + merge overhead). The ring is FIXED
+;; at this size — on a window far SHORTER than this (h < workers, i.e. a tiny window) some bands go
+;; empty and edge colours can glitch for a frame, but it never crashes; normal boards are exact.
+(def *recolor-timeout-ms* 1000)  ; defensive: if a worker never replies (it shouldn't — blends are
+;; pure, and there is no supervisor), the merge proceeds with what arrived rather than hang the SIM.
 
 ;; Everything sowable mid-run: the still-lifes / oscillators / spaceships of `*shapes*`
 ;; plus the glider guns of `*shooters*` (both required above). `inject-pattern` samples
@@ -305,66 +300,146 @@ descends from a coloured spawn, so colour reaches everywhere. Verified identical
         live-colors (reduce (fn (c i) (dissoc c i)) colors dead))
     (reduce (fn (c i) (assoc c i (birth-blend colors w h i))) live-colors born)))
 
-;; ---- PARALLEL recolour: fan the birth blends across a persistent worker pool ---------------
-;; `recolor` above is the serial reference (and the test/correctness oracle). `recolor-par` is
-;; its parallel twin: it keeps the cheap set-up (the dead-removal and the bit math) on the SIM,
-;; but shards the births — the hot per-cell blend — across `*recolor-workers*` persistent
-;; processes. A birth's colour reads its 8 torus neighbours from the WHOLE colour map and writes
-;; the single key `i`, so every worker gets the full `colors` map and a disjoint slice of birth
-;; indices; the disjoint keys merge with no conflict. The pool is spawned ONCE (no per-frame
-;; spawn cost) and reused every generation; the collect is a SELECTIVE receive, so queued input
-;; messages are left untouched for the SIM loop. The full-map copy is what bounds the win to
-;; smaller boards — see *recolor-par-max-cells* and the config note for the guard and why.
+;; ---- SHARDED recolour: persistent per-band workers, halo exchange, one merge ----------------
+;; `recolor` above is the serial reference (the test/correctness oracle). The live SIM uses the
+;; sharded path below: K persistent workers, each owning one row-BAND's colour slice, recolour
+;; their band in parallel each generation and the SIM merges the slices. See the config note.
 
-(defn blend-worker-loop ()
-  "A persistent recolour worker: blend the births in `idxs` against the sent colour map and send
-the `[i packed]` pairs back to `from`. Loops until `:stop` (sent at SIM teardown by `sim-stop`)."
+(defn band-ranges (h k)
+  "The `k` contiguous row-bands tiling rows `[0,h)`, by floor-distribution so each is non-empty
+whenever `h >= k` (normal boards). For `h < k` (a tiny window) the tail bands come out empty —
+harmless: an empty band is a no-op worker, though its neighbours' edge colours may glitch a frame."
+  (map (fn (j) [(quot (* j h) k) (quot (* (+ j 1) h) k)]) (range k)))
+
+(defn rows-subset (colors w lo hi)
+  "The entries of colour map `colors` whose cell lies in rows `[lo,hi)` (bit index ÷ `w`)."
+  (reduce (fn (m p)
+            (let (y (quot (nth p 0) w))
+              (if (and (>= y lo) (< y hi)) (assoc m (nth p 0) (nth p 1)) m)))
+    {}
+    colors))
+
+(defn row-at (colors w r)
+  "The colour entries on row `r` — the halo a neighbour needs."
+  (rows-subset colors w r (+ r 1)))
+
+(defn band-subset (m w r0 r1)
+  "Entries of `m` in band rows `[r0,r1)` — a spawn delta sliced to one band."
+  (rows-subset m w r0 r1))
+
+(defn spawn-delta (next-id old-bits new-bits)
+  "The colour entries a spawn adds: the cells turned on (`new XOR old`, since a placement only
+OR-s bits in) all get spawn `next-id`'s one fresh packed colour. Returns `[delta next-id']` — the
+sharded twin of `color-spawn`, handing back just the DELTA map (to push to workers), not a merge."
+  (let (added (bit-positions (bit-xor new-bits old-bits)))
+    (if (nil? added)
+      [{} next-id]
+      (let (packed (pack-rgb (spawn-rgb next-id)))
+        [(reduce (fn (m i) (assoc m i packed)) {} added) (+ next-id 1)]))))
+
+(defn shard-worker-init ()
+  "A recolour worker before its first assignment: park until the SIM sends `[:init …]` with this
+worker's band (range, dims, slice), its ring neighbours `up`/`dn`, and the coordinator pid."
   (receive
-    ([:blend colors w h idxs from] (do
-                                     (send from
-                                       [:blended (map (fn (i) [i (birth-blend colors w h i)]) idxs)])
-                                     (blend-worker-loop)))
+    ([:init idx r0 r1 w h slice up dn coord] (shard-worker idx r0 r1 w h slice up dn coord (* r0 w)))))
+
+(defn shard-worker (idx r0 r1 w h slice up dn coord off)
+  "A persistent recolour worker owning rows `[r0,r1)` (its colour `slice`, bit-index `off` = r0·w).
+`[:reslice …]` swaps in a new band (resize/clear); `[:add …]` folds in a between-step spawn delta;
+`[:gen band-ob band-nb delta]` recolours one generation — it folds in this gen's delta, trades one
+halo ROW with each ring neighbour (`up`/`dn`), then keeps survivors, drops deaths, blends births
+(against its slice + the two halo rows), returns its new slice as `[:slice idx …]`, and loops."
+  (receive
+    ([:reslice nr0 nr1 nw nh ns] (shard-worker idx nr0 nr1 nw nh ns up dn coord (* nr0 nw)))
+    ([:add entries] (shard-worker idx r0 r1 w h (into slice entries) up dn coord off))
+    ([:gen band-ob band-nb delta]
+      (let (slice2 (if (empty? delta) slice (into slice delta)))
+        (do
+          (send up [:halo-below (row-at slice2 w r0)])  ; my top row → up neighbour's halo-below
+          (send dn [:halo-above (row-at slice2 w (- r1 1))])  ; my bottom row → dn neighbour's halo-above
+          (let (ha (receive ([:halo-above x] x))
+                hb (receive ([:halo-below x] x))
+                read (into (into slice2 ha) hb)
+                surv (bit-and band-ob band-nb)
+                born (map (fn (i) (+ i off)) (bit-positions (bit-xor band-nb surv)))
+                dead (map (fn (i) (+ i off)) (bit-positions (bit-xor band-ob surv)))
+                s1 (reduce (fn (c i) (dissoc c i)) slice2 dead)
+                s2 (reduce (fn (c i)
+                             (let (p (birth-blend read w h i)) (if (nil? p) c (assoc c i p))))
+                     s1
+                     born))
+            (do (send coord [:slice idx s2]) (shard-worker idx r0 r1 w h s2 up dn coord off))))))
     (:stop :ok)))
 
-(defn recolor--chunk (xs k)
-  "Split list `xs` into at most `k` roughly-equal contiguous chunks, dropping any empties (so a
-births list shorter than `k` just spreads over fewer workers)."
-  (let (len (count xs)
-        sz (max 1 (quot (+ len (- k 1)) k)))
-    (filter (fn (c) (not (empty? c)))
-      (map (fn (j) (take sz (drop (* j sz) xs))) (range k)))))
-
-(defn recolor--collect (got total acc)
-  "Fan-in: gather `total` `[:blended pairs]` replies into one pairs list (selective receive — it
-ignores any non-`[:blended]` mail, leaving it queued for the SIM loop). Returns `:timeout` if a
-reply doesn't arrive within *recolor-timeout-ms* (a dead/stuck worker), so the caller can recover."
+(defn shard-merge (got total acc)
+  "Fan-in: merge the `total` workers' returned slices into the full colour map. Selective receive,
+so queued input is left for the SIM loop. On *recolor-timeout-ms* (a dead worker — none should,
+blends are pure) it returns what arrived rather than hanging; those cells just fall back a frame."
   (if (= got total)
     acc
     (receive
-      ([:blended pairs] (recolor--collect (+ got 1) total (concat acc pairs)))
-      (after *recolor-timeout-ms* :timeout))))
+      ([:slice _ s] (shard-merge (+ got 1) total (into acc s)))
+      (after *recolor-timeout-ms* acc))))
 
-(defn recolor-par (workers colors old-bits new-bits w h)
-  "Parallel `recolor` — byte-identical result, but the per-birth blends are fanned across the
-persistent `workers` pool and merged. Runs serial when the pool is empty, when the board is
-larger than *recolor-par-max-cells* (the full-map copy per worker would outweigh the win — see
-the config note), or as a fallback if the collect times out on a stuck worker."
-  (if (or (empty? workers) (> (bit-count new-bits) *recolor-par-max-cells*))
-    (recolor colors old-bits new-bits w h)
-    (let (surv (bit-and old-bits new-bits)
-          born (bit-positions (bit-xor new-bits surv))  ; new & ~old — births this gen
-          dead (bit-positions (bit-xor old-bits surv))  ; old & ~new — deaths this gen
-          live-colors (reduce (fn (c i) (dissoc c i)) colors dead)
-          chunks (recolor--chunk born (count workers))
-          me (self)
-          nc (count chunks))
-      (do
-        (dotimes (j nc) (send (nth workers j) [:blend colors w h (nth chunks j) me]))
-        (let (pairs (recolor--collect 0 nc nil))
-          (if (= pairs :timeout)
-            ;; a worker stalled/died — recompute serially rather than block the SIM
-            (recolor colors old-bits new-bits w h)
-            (reduce (fn (c [i p]) (if (nil? p) c (assoc c i p))) live-colors pairs)))))))
+(defn shard-recolor (workers bands w h old-bits new-bits delta)
+  "Sharded `recolor`: hand each worker its band's bits (shifted to band-width, so its bit-ops are
+O(band) not O(board)) and this gen's spawn `delta` sliced to the band, then merge the K returned
+slices into the full next-gen colour map. Result is identical to serial `recolor`."
+  (let (kk (count workers))
+    (do
+      (dotimes (b kk)
+        (let (r (nth bands b)
+              r0 (nth r 0)
+              r1 (nth r 1)
+              off (* r0 w)
+              bw (* (- r1 r0) w)
+              low (- (bit-shift-left 1 bw) 1))
+          (send (nth workers b)
+            [:gen (bit-and (bit-shift-right old-bits off) low)
+              (bit-and (bit-shift-right new-bits off) low)
+              (band-subset delta w r0 r1)])))
+      (shard-merge 0 kk {}))))
+
+(defn shard-spawn-workers (coord colors w h k)
+  "Spawn the fixed pool of `k` recolour workers and assign each its band of `colors` (`band-ranges`
+slice) plus its ring neighbours (`up`/`dn`, a torus ring), all reporting to `coord`. Returns
+`[workers bands]`."
+  (let (bands (band-ranges h k)
+        ws (into [] (map (fn (_) (spawn (shard-worker-init))) (range k))))
+    (do
+      (dotimes (b k)
+        (let (r (nth bands b))
+          (send (nth ws b)
+            [:init b
+              (nth r 0)
+              (nth r 1)
+              w
+              h
+              (rows-subset colors w (nth r 0) (nth r 1))
+              (nth ws (mod (- b 1) k))
+              (nth ws (mod (+ b 1) k))
+              coord])))
+      [ws bands])))
+
+(defn shard-reslice! (workers colors w h)
+  "Re-partition `colors` into row-band slices for new dims and hand each worker its new band — for
+a window resize or a clear. The ring is FIXED, so only each worker's range/dims/slice change.
+Returns the new bands."
+  (let (bands (band-ranges h (count workers)))
+    (do
+      (dotimes (b (count workers))
+        (let (r (nth bands b))
+          (send (nth workers b)
+            [:reslice (nth r 0) (nth r 1) w h (rows-subset colors w (nth r 0) (nth r 1))])))
+      bands)))
+
+(defn shard-add! (workers bands delta w)
+  "Push spawn `delta` to the workers whose bands hold its cells (a paste between steps), so their
+slices stay in sync with the SIM's colour map. Cheap — a spawn is a few cells."
+  (when (not (empty? delta))
+    (dotimes (b (count workers))
+      (let (r (nth bands b) bd (band-subset delta w (nth r 0) (nth r 1)))
+        (when (not (empty? bd)) (send (nth workers b) [:add bd]))))))
 
 (defn colors-refit (colors old-w new-w new-h)
   "Rekey the colour layer from board width `old-w` to a `new-w`×`new-h` board, DROPPING cells
@@ -550,10 +625,17 @@ wait for its `[:drawn]` ack (bounds the renderer's mailbox to one frame). Return
 
 (defn sim-stop (m)
   "Tear the SIM down at every exit path: stop the persistent recolour workers, then close the
-perf log. The workers are spawned in `run-life` and carried on `m` as `:workers`."
+perf log. The workers are spawned by `sim-start` and carried on `m` as `:workers`."
   (do
     (dolist (w (get m :workers)) (send w :stop))
     (perflog/log-stop (get m :logger))))
+
+(defn sim-start (m)
+  "The SIM process entry point. Spawns its OWN recolour worker pool (so the workers' `[:slice]`
+replies come back HERE, to the SIM) and shards the initial — empty — colour layer across them,
+then adds `:workers`/`:bands` to the state and enters the paced loop."
+  (let ([ws bands] (shard-spawn-workers (self) (get m :colors) *w* *h* *recolor-workers*))
+    (sim-loop (assoc m :workers ws :bands bands))))
 
 (defn apply-clicks (board clicks s)
   "Drop a random pattern at each click cell `[x y kind]`, threading the PRNG `s`: a `:gun`
@@ -580,29 +662,30 @@ repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag 
         board (bitboard/fit ob *w* *h*)
         w (get board :w)
         h (get board :h)
-        ;; a window resize changed *w*/*h*: the colour keys are bit indices, so rekey the layer
-        ;; to the new width (drops off-board cells) — mirrors the board's `bitboard/fit` above.
-        colors0 (if (= (get ob :w) w)
-                  (get m :colors)
-                  (colors-refit (get m :colors) (get ob :w) w h))
+        ;; a window resize changed *w*/*h*: the colour keys are bit indices, so rekey the SIM's
+        ;; mirror to the new width (drops off-board cells) and RE-SHARD the workers to new bands.
+        resized? (not (= (get ob :w) w))
+        colors0 (if resized? (colors-refit (get m :colors) (get ob :w) w h) (get m :colors))
+        bands (if resized? (shard-reslice! (get m :workers) colors0 w h) (get m :bands))
         now (now-ns)
         per (- now (get m :prev))
         held (get m :held)
         hn2 (if held (+ (get m :hn) 1) 0)
         repeat? (and held (>= hn2 *hold-delay*) (= 0 (mod (- hn2 *hold-delay*) *spawn-every*)))
         [b1 s1] (if repeat? (apply-clicks board [held] (get m :s)) [board (get m :s)])
-        ;; colour each spawn (held-repeat, then auto-inject) as it lands, then carry the layer
-        ;; across the step — survivors keep their colour, newborns blend their live parents'.
-        [c1 n1] (if repeat?
-                  (color-spawn colors0 (get m :next-id) (get board :bits) (get b1 :bits))
-                  [colors0 (get m :next-id)])
+        ;; each spawn (held-repeat, then auto-inject) gets a fresh colour as a DELTA the workers
+        ;; fold into their slices this gen; survivors then keep colour, newborns blend live parents.
+        [d1 n1] (if repeat?
+                  (spawn-delta (get m :next-id) (get board :bits) (get b1 :bits))
+                  [{} (get m :next-id)])
         inject (get m :inject)
         inj? (and (> inject 0) (>= (- now (get m :last-inj)) (* inject 1000000000)))
         [b2 s2] (if inj? (inject-pattern b1 s1) [b1 s1])
-        [c2 n2] (if inj? (color-spawn c1 n1 (get b1 :bits) (get b2 :bits)) [c1 n1])
+        [d2 n2] (if inj? (spawn-delta n1 (get b1 :bits) (get b2 :bits)) [{} n1])
+        delta (into d1 d2)
         last-inj2 (if inj? now (get m :last-inj))
         nxt (bitboard/step b2)
-        c3 (recolor-par (get m :workers) c2 (get b2 :bits) (get nxt :bits) w h)
+        c3 (shard-recolor (get m :workers) bands w h (get b2 :bits) (get nxt :bits) delta)
         cells (bitboard/live-count nxt)
         gen (get m :gen)
         st2 (status gen cells per))
@@ -619,7 +702,8 @@ repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag 
                     :last-inj last-inj2
                     :st st2
                     :colors c3
-                    :next-id n2))))))
+                    :next-id n2
+                    :bands bands))))))
 
 (defn step-due? (prev cap)
   "Is a generation step OVERDUE — has a full cap frame-period elapsed since the last step
@@ -641,12 +725,12 @@ but here the queue is already clear. Not due yet ⇒ just draw and hand back to 
 `newhn` is the held-cell age to carry once the burst settles (0 on a fresh press, kept on a
 drag); the just-pasted cell becomes `:held`."
   (let ([b2 s2] (apply-clicks (get m :board) [[x y kind]] (get m :s))
-        ;; each pasted cell is its own spawn — give it a fresh colour (sim-paste always pastes
-        ;; ONE click, so a drag's crossed cells each get a distinct colour).
-        [c2 n2] (color-spawn (get m :colors)
-                  (get m :next-id)
-                  (get (get m :board) :bits)
-                  (get b2 :bits))
+        ;; each pasted cell is its own spawn — give it a fresh colour (sim-paste always pastes ONE
+        ;; click, so a drag's crossed cells each get a distinct colour). Fold the delta into the
+        ;; SIM's mirror (for this draw) AND push it to the workers, keeping their slices in sync.
+        [delta n2] (spawn-delta (get m :next-id) (get (get m :board) :bits) (get b2 :bits))
+        c2 (into (get m :colors) delta)
+        _ (shard-add! (get m :workers) (get m :bands) delta *w*)
         m2 (assoc m :board b2 :s s2 :held [x y kind] :colors c2 :next-id n2))
     (receive
       ([:press k a b] (sim-paste m2 k a b 0))
@@ -679,11 +763,13 @@ auto-spawn; `[:clear]` empties the board; `:stop` ends it."
       ([:release] (sim-loop (assoc m :held nil)))
       ([:set-fps n] (sim-loop (assoc m :cap n)))
       ([:set-inject n] (sim-loop (assoc m :inject n)))
-      ;; the clear button: swap in a fresh EMPTY board (at the current dims) and draw it now.
-      ([:clear] (let (empty (bitboard/make *w* *h*))
+      ;; the clear button: swap in a fresh EMPTY board (at the current dims), empty the workers'
+      ;; slices to match, and draw it now.
+      ([:clear] (let (empty (bitboard/make *w* *h*)
+                      bands (shard-reslice! (get m :workers) {} *w* *h*))
                   (if (= :stop (sim-draw (get m :renderer) empty (get m :st) {}))
                     (sim-stop m)
-                    (sim-loop (assoc m :board empty :held nil :colors {} :next-id 0)))))
+                    (sim-loop (assoc m :board empty :held nil :colors {} :next-id 0 :bands bands)))))
       (after wait (sim-step m)))))
 
 (defn quit-signal? (m)
@@ -912,28 +998,25 @@ render-only *view-zoom* camera (the board is unchanged)."
         board (bitboard/make *w* *h*)  ; START EMPTY — clicks add random shapes
         me (self)  ; this root process is the renderer
         logger (perflog/log-start *log-path*)
-        ;; the persistent recolour worker pool (see *recolor-workers*): spawned ONCE here and
-        ;; carried on the SIM state, the SIM fans each generation's births across them. Empty
-        ;; (0 on a 1-core box) ⇒ recolor-par runs serial. Stopped by `sim-stop` at SIM teardown.
-        workers (into [] (map (fn (_) (spawn (blend-worker-loop))) (range *recolor-workers*)))
         ;; the SIM's whole state in ONE map (see `sim-step`) — the PRNG seed is the start
         ;; timestamp, `prev`/`last-inj` start there too, and it carries the fps `cap` and paces
         ;; itself. Every loop function takes this map and recurses with only the keys it changed.
-        sim (spawn (sim-loop {:renderer me
-                              :logger logger
-                              :workers workers
-                              :board board
-                              :s start
-                              :gen 0
-                              :prev start
-                              :held nil
-                              :hn 0
-                              :inject *inject-secs*
-                              :last-inj start
-                              :st ""
-                              :cap *target-fps*
-                              :colors {}
-                              :next-id 0})))
+        ;; `sim-start` (the SIM entry) spawns the recolour worker pool ITSELF so their `[:slice]`
+        ;; replies come back to the SIM, then adds `:workers`/`:bands` and enters the loop.
+        sim (spawn (sim-start {:renderer me
+                               :logger logger
+                               :board board
+                               :s start
+                               :gen 0
+                               :prev start
+                               :held nil
+                               :hn 0
+                               :inject *inject-secs*
+                               :last-inj start
+                               :st ""
+                               :cap *target-fps*
+                               :colors {}
+                               :next-id 0})))
     ;; the renderer keeps a LOCAL mirror of cap/inject (for instant button labels) + drag state,
     ;; plus the spawn-colour layer the sim sends with each frame (for input redraws).
     (render-loop w
