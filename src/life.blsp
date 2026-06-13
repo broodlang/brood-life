@@ -162,20 +162,16 @@ bitboard `live`, threading the PRNG `s`; returns `[live' s']`."
     [(bitboard/place live pat x y) s3]))
 
 ;; ---- the SPAWN-COLOUR layer (parallel to the pure bitboard) -------------------------------
-;; `colors` maps a live cell's whole-board BIT INDEX `i` → its `[r g b]` byte vector. Keyed by
-;; the integer index (not an `[x y]` vector) because `recolor` REBUILDS this map every frame and
-;; the colour layer — not the bitboard step — is the per-frame hot spot: integer hashing is ~2×
-;; cheaper than hashing a 2-element vector key (measured). The board width is baked into the index
-;; (`i` = `y*w + x`), so a resize rekeys the layer with `colors-refit`. The bitboard stays pure
-;; (alive/dead only); the SIM threads this layer through spawns and the step. A NEWBORN's colour
-;; is the BLEND (channel average) of its live parents' colours, so where two colonies meet their
-;; colours mix — which is why the colour is stored as raw RGB per cell, not a spawn id (a blend
-;; names no one spawn).
-
-(defn bit->xy (i w)
-  "The board cell `[x y]` for whole-board bit index `i` — bit `i` is cell `(i mod w, i div w)`,
-the same layout `bitboard` uses. Used by the renderer to place a lit cell."
-  [(mod i w) (quot i w)])
+;; `colors` maps a live cell's whole-board BIT INDEX `i` → its colour as ONE PACKED INTEGER (see
+;; `pack-rgb` below). Keyed by the integer index (not an `[x y]` vector) because `recolor`
+;; REBUILDS this map every frame and the colour layer — not the bitboard step — is the per-frame
+;; hot spot: integer hashing is ~2× cheaper than hashing a 2-element vector key (measured). The
+;; board width is baked into the index (`i` = `y*w + x`), so a resize rekeys the layer with
+;; `colors-refit`. The bitboard stays pure (alive/dead only); the SIM threads this layer through
+;; spawns and the step. A NEWBORN's colour is the BLEND (channel average) of its live parents'
+;; colours, so where two colonies meet their colours mix — which is why the colour is stored per
+;; cell, not as a spawn id (a blend names no one spawn). It's PACKED so that blend is one integer
+;; add per parent rather than a per-channel vector fold (profiling: that fold was ~⅓ of the cost).
 
 (defn hsv->rgb (h s v)
   "An HSV colour (`h` 0–360°, `s`/`v` 0–1) as an `[r g b]` byte vector (0–255) — the kernel
@@ -201,12 +197,27 @@ and `f` its fraction (no float `mod`, which the kernel's `mod` doesn't take)."
 consecutive spawns are far apart on the colour wheel — a big range of distinct colours."
   (hsv->rgb (mod (* id *spawn-hue-step*) 360) *spawn-sat* *spawn-val*))
 
-(defn blend-rgb (rgbs)
-  "The channel-wise integer average of `rgbs` (a non-empty list of `[r g b]`) — a newborn's
-colour from its parents."
-  (let (n (length rgbs)
-        chan (fn (k) (quot (reduce (fn (a c) (+ a (vector-ref c k))) 0 rgbs) n)))
-    [(chan 0) (chan 1) (chan 2)]))
+;; ---- PACKED colour storage (the per-frame hot-path representation) -------------------------
+;; A cell's `[r g b]` is stored as ONE machine-word integer, because the per-frame cost is
+;; `recolor`, and a newborn's colour is the sum of its live parents' colours: on a packed int that
+;; is a single ADD per parent — no per-channel `vector-ref`, no 8-wide accumulator vector (which
+;; profiling showed was ~⅓ of the blend cost). Each channel sits in its own 12-bit field so the
+;; sums don't carry into each other, and a CELL COUNT rides in the bits above: bits 0-11 = r,
+;; 12-23 = g, 24-35 = b, 36+ = count (1 per stored colour). A channel is 0-255, so summing the ≤8
+;; neighbours of a cell stays < 4096 and never overflows its field; the count of those neighbours
+;; then falls out as `value >> 36`. Values stay well under 2^40 (never a bignum). The kernel wants
+;; an `[r g b]` for a face `:bg`, so `cell-bg` unpacks at draw time.
+(def *rgb-count* (bit-shift-left 1 36))  ; the "one cell" unit summed in the high bits
+
+(defn pack-rgb ([r g b])
+  "Pack an `[r g b]` (channels 0-255) into the single integer the colour layer stores — bits 0-11
+r, 12-23 g, 24-35 b, plus one count unit in bits 36+ (see the packed-colour scheme above)."
+  (+ r (bit-shift-left g 12) (bit-shift-left b 24) *rgb-count*))
+
+(defn unpack-rgb (p)
+  "The `[r g b]` of packed colour `p` — the inverse of `pack-rgb`; the high-bit count is dropped
+(a stored colour always counts one cell)."
+  [(bit-and p 4095) (bit-and (bit-shift-right p 12) 4095) (bit-and (bit-shift-right p 24) 4095)])
 
 (defn color-spawn (colors next-id old-bits new-bits)
   "Give every cell the latest placement turned on (bits in `new` not in `old`) the next spawn's
@@ -216,28 +227,50 @@ hands them back as the bit INDICES the colour layer keys on, so no decode is nee
   (let (added (bit-positions (bit-xor new-bits old-bits)))
     (if (nil? added)
       [colors next-id]
-      (let (rgb (spawn-rgb next-id))
-        ; one colour for the whole spawn — compute it once
-        [(reduce (fn (c i) (assoc c i rgb)) colors added) (+ next-id 1)]))))
+      (let (packed (pack-rgb (spawn-rgb next-id)))
+        ; one colour for the whole spawn — compute + pack it once
+        [(reduce (fn (c i) (assoc c i packed)) colors added) (+ next-id 1)]))))
 
 (defn birth-blend (colors w h i)
-  "The colour a NEWBORN at bit index `i` takes: the BLEND (channel average) of its parents'
-colours — its 8 torus neighbours that carry one. A colour means the neighbour was a live cell
-last gen, so this is exactly the live parents (a birth has 3); `nil` if none is coloured. Each
-neighbour's own bit index is `(y+dy mod h)*w + (x+dx mod w)`."
+  "The PACKED colour a NEWBORN at bit index `i` takes: the BLEND (channel average) of its parents'
+colours — its 8 torus neighbours that carry one. A stored colour means the neighbour was live last
+gen, so this is exactly the live parents (a birth has 3); `nil` if none is coloured. Summing the
+eight neighbour words (absent ⇒ 0) accumulates the parents' three channel fields AND their count
+(bits 36+) in ONE integer — one add per parent, no accumulator vector (see the packed-colour
+scheme above; this runs once per birth and births are the per-frame hot spot — see `recolor`).
+The eight neighbour bit indices come from three row bases and two wrapped columns, so the torus
+wrap costs five `mod`s, not sixteen."
   (let (x (mod i w)
         y (quot i w)
-        rgbs (filter (fn (c) (not (nil? c)))
-               (map (fn ([dx dy]) (get colors (+ (* (mod (+ y dy) h) w) (mod (+ x dx) w))))
-                 [[-1 -1] [0 -1] [1 -1] [-1 0] [1 0] [-1 1] [0 1] [1 1]])))
-    (if (nil? rgbs) nil (blend-rgb rgbs))))
+        rn (* (mod (+ y -1) h) w)  ; bit-index base of the row above (torus-wrapped)
+        rc (* y w)  ; this row
+        rs (* (mod (+ y 1) h) w)  ; the row below
+        cl (mod (+ x -1) w)  ; column to the left (wrapped)
+        cr (mod (+ x 1) w)  ; column to the right (wrapped)
+        acc (+ (or (get colors (+ rn cl)) 0)
+              (or (get colors (+ rn x)) 0)
+              (or (get colors (+ rn cr)) 0)
+              (or (get colors (+ rc cl)) 0)
+              (or (get colors (+ rc cr)) 0)
+              (or (get colors (+ rs cl)) 0)
+              (or (get colors (+ rs x)) 0)
+              (or (get colors (+ rs cr)) 0))
+        n (bit-shift-right acc 36))
+    ; how many neighbours carried a colour
+    (if (= n 0)
+      nil
+      ;; average each 12-bit channel field over the parent count, then re-pack (count back to 1)
+      (+ (quot (bit-and acc 4095) n)
+        (bit-shift-left (quot (bit-and (bit-shift-right acc 12) 4095) n) 12)
+        (bit-shift-left (quot (bit-and (bit-shift-right acc 24) 4095) n) 24)
+        *rgb-count*))))
 
 (defn recolor (colors new-bits w h)
   "Carry the colour layer across ONE generation, rebuilt from the live cells of `new-bits` (so
 dead cells drop out). A SURVIVOR already has an entry in `colors` (every live cell carries a
-colour, so a colour ⇔ it was live last gen) and keeps it; a NEWBORN (no prior colour) takes
-`birth-blend`, the average of its live parents. Both the source bits and the map keys are bit
-indices, so this is a straight index→colour rebuild with no `[x y]` decode."
+colour, so a colour ⇔ it was live last gen) and keeps its packed colour; a NEWBORN (no prior
+colour) takes `birth-blend`, the packed average of its live parents. Both the source bits and the
+map keys are bit indices, so this is a straight index→colour rebuild with no `[x y]` decode."
   (let (recolour-cell (fn (acc i)
                         (let (prev (get colors i))
                           (assoc acc i (if (nil? prev) (birth-blend colors w h i) prev)))))
@@ -249,10 +282,11 @@ indices, so this is a straight index→colour rebuild with no `[x y]` decode."
   "Rekey the colour layer from board width `old-w` to a `new-w`×`new-h` board, DROPPING cells
 that fall outside the new bounds — the colour-layer twin of `bitboard/refit` (the keys are bit
 indices, so the width is baked in). Run on a resize so a survivor keeps its colour at its new
-index. A no-op caller-side when the width is unchanged."
-  (reduce (fn (acc [i rgb])
+index. A no-op caller-side when the width is unchanged. The packed colour value is opaque here —
+only its key (the bit index) changes with the width."
+  (reduce (fn (acc [i packed])
             (let (x (mod i old-w) y (quot i old-w))
-              (if (and (< x new-w) (< y new-h)) (assoc acc (+ (* y new-w) x) rgb) acc)))
+              (if (and (< x new-w) (< y new-h)) (assoc acc (+ (* y new-w) x) packed) acc)))
     {}
     colors))
 
@@ -336,30 +370,36 @@ the previous frame). The renderer composes this after the buttons."
 ;; *view-zoom* is a render-only camera (per-op `:scale`, ADR-079) over the SAME board, so
 ;; zooming changes neither the board nor the bar — only which window of cells is magnified.
 (defn cell-bg (colors i)
-  "The `:bg` for the live board cell with whole-board bit index `i`: its `[r g b]` colour, or
-*default-cell-bg* for an uncoloured cell (no parent carried a colour, or one kept past a resize)."
-  (get colors i *default-cell-bg*))
+  "The `:bg` for the live board cell with whole-board bit index `i`: its `[r g b]` colour
+(unpacked from the stored packed integer), or *default-cell-bg* for an uncoloured cell (no parent
+carried a colour, or one kept past a resize)."
+  (let (p (get colors i))
+    (if (nil? p) *default-cell-bg* (unpack-rgb p))))
 
 (defn render (live ui info)
   "A display frame from `live`: the live cells as `:text` ops, then the bottom bar at row
 `*h*`. At *view-zoom* 1 (the whole board) it's ONE `bit-positions` over the whole-board
-integer — bit `i` is cell `(i mod w, i div w)` — so the hot loop is a single enumeration
-with no per-row scan. Zoomed in, only the visible board WINDOW (`*view-ox*`/`*oy*`,
-`w/z × h/z` cells) is drawn, magnified z×: each row's window is shifted to the origin and
-masked to the column range (still O(visible-live), and fewer cells show), each at `px*z`."
+integer — bit `i` is cell `(i mod w, i div w)`, decoded INLINE here (no `bit->xy` tuple per
+cell) — so the hot loop is a single enumeration with no per-row scan. Zoomed in, only the
+visible board WINDOW (`*view-ox*`/`*oy*`, `w/z × h/z` cells) is drawn, magnified z×: each
+row's window is shifted to the origin and masked to the column range (still O(visible-live),
+and fewer cells show), each at `px*z`. The cell ops and the footer are spliced with one lazy
+`concat` poured into a SINGLE vector (`into`), so the O(live) ops vector is built once, not
+copied again to append the bar."
   (let (z *view-zoom*
         a *cell-aspect*
         fill (string-repeat " " a)  ; an `a`-wide blank; the face's bg fills its cell box
-        colors (get ui :colors)  ; the spawn-colour layer: [x y] → [r g b]
+        colors (get ui :colors)  ; the spawn-colour layer: bit index → packed colour
         bits (get live :bits)
         h (get live :h)
         wdt (get live :w))
-    (into
-      (into [(clear)]
+    (into [(clear)]
+      (concat
         (if (= z 1)
-          (map (fn (i)
-                 (let ([x y] (bit->xy i wdt))
-                   [:text y (* x a) fill (assoc *cell-face* :bg (cell-bg colors i))]))
+          (map
+            (fn (i)
+              ;; inline bit->xy: row = i÷wdt, col = (i mod wdt)·aspect
+              [:text (quot i wdt) (* (mod i wdt) a) fill (assoc *cell-face* :bg (cell-bg colors i))])
             (bit-positions bits))
           (let (visw (max 1 (quot wdt z))
                 vish (max 1 (quot h z))
@@ -382,9 +422,9 @@ masked to the column range (still O(visible-live), and fewer cells show), each a
                           ;; the visible cell's whole-board bit index = (oy+sy)*wdt + (ox+px)
                           (assoc zface :bg (cell-bg colors (+ (* (+ oy sy) wdt) (+ ox px))))])
                       (bit-positions vr)))))
-              (range vish)))))
-      ;; the bar spans the full SCREEN width (board cols × *cell-aspect*), at screen row *h*.
-      (footer-ops ui info h (* wdt a)))))
+              (range vish))))
+        ;; the bar spans the full SCREEN width (board cols × *cell-aspect*), at screen row *h*.
+        (footer-ops ui info h (* wdt a))))))
 
 ;; ---- the actors: SIM (board + log, self-paced) → RENDERER (compositor) --------
 ;; The SIM owns the board and paces itself with a self-resetting `(after)` timer; the RENDERER
