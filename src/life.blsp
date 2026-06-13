@@ -4,7 +4,8 @@ a packed BITBOARD (see `bitboard`) fit to the window. It starts EMPTY — LEFT c
 drops random shapes, RIGHT click/drag drops glider guns, holding either auto-repeats. The
 SCROLL wheel is a VIEW zoom (a camera onto the mouse — the board is unchanged). Keys: `-`/`=`
 lower/raise the fps cap, `[`/`]` cycle the auto-spawn preset; a bottom-right `clear` empties
-the board. Starts at a 10 fps cap. Two processes (ADR-058): a SIM that owns the board and paces
+the board. Starts UNCAPPED and auto-spawning a random pattern every 30 s. Two processes
+(ADR-058): a SIM that owns the board and paces
 ITSELF with a self-resetting `(after)` timer that input preempts (so pastes are instant), and
 this RENDERER that draws + handles input."
   (:use editor/display))
@@ -18,9 +19,9 @@ this RENDERER that draws + handles input."
 (def *h* 40)
 ;; The frame-rate cap. 0 = UNCAPPED (go ham — steps as fast as it can draw); a POSITIVE value
 ;; sets the SIM's `(after)` step timer to that period, to slow the sim down enough to watch.
-;; Starts at *target-fps* below (10); adjustable live with `-`/`=` (slower/faster; `=` past
-;; *fps-max* rolls back to uncapped).
-(def *target-fps* 10)  ; the fps cap to START at (0 = uncapped; >0 = paced)
+;; Starts at *target-fps* below (0 = uncapped); adjustable live with `-`/`=` (slower/faster;
+;; `-` from uncapped engages the cap near the top, `=` past *fps-max* rolls back to uncapped).
+(def *target-fps* 0)  ; the fps cap to START at (0 = uncapped — go ham; >0 = paced)
 (def *fps-min* 1)
 (def *fps-max* 120)
 (def *fps-step* 5)  ; fps per `-`/`=` press
@@ -74,9 +75,10 @@ this RENDERER that draws + handles input."
 (def *hold-delay* 12)  ; gens to hold before auto-repeat starts (~1.2 s at the 10 fps default)
 (def *spawn-every* 6)  ; gens between repeats once it's going (~1.7/s at the 10 fps default)
 ;; Auto-inject: drop a random pattern every *inject-secs* seconds to keep the board lively on
-;; its own (0 = NEVER — the default; you drive it). The spawn BUTTON cycles the presets
-;; off → 1s → 5s → 30s → off; the `[`/`]` keys step through them (rarer / more often).
-(def *inject-secs* 0)  ; seconds between random auto-injects (0 = never)
+;; its own (0 = NEVER; you drive it). Starts at 30 s so an empty board comes to life on its own.
+;; The spawn BUTTON cycles the presets off → 1s → 5s → 30s → off; the `[`/`]` keys step through
+;; them (rarer / more often).
+(def *inject-secs* 30)  ; seconds between random auto-injects (0 = never)
 (def *inject-presets* [1 5 30 0])  ; the auto-spawn options by frequency: 1 s, 5 s, 30 s, off
 ;; The bottom bar leads with two clickable BUTTONS — a SPAWN toggle and an FPS control
 ;; (click cycles a preset, drag scrubs). They're light raised KEYS overlaid on the reverse
@@ -90,6 +92,15 @@ this RENDERER that draws + handles input."
 (def *clear-label* " clear ")  ; the bottom-RIGHT key — click it to empty the board
 (def *log-every* 30)  ; the SIM writes a perf line to life.log every N gens (~0.3 Hz at the 10 fps default)
 (def *log-path* "life.log")  ; where the perf log is written (cwd; truncated each run)
+;; PARALLEL RECOLOUR pool size. The per-frame hot spot is the spawn-colour layer (`recolor`),
+;; whose cost is the per-birth blend (8 neighbour lookups + a channel average). Births are
+;; independent and write disjoint keys, so the SIM fans them across a pool of this many
+;; persistent worker processes (spawned once in `run-life`) and merges the results — measured
+;; ~3.2× faster than serial at 4 workers on a mid-size board. Sized from the scheduler pool
+;; (`worker-threads` ≈ nproc), leaving one thread for the SIM, but CAPPED at 4: past the knee
+;; the fan-out/merge serial overhead outweighs more workers (8 measured slower than 4). 0 ⇒ the
+;; pool is empty and `recolor-par` runs serial (a 1-core box, or a deliberate disable).
+(def *recolor-workers* (min 4 (max 0 (- (worker-threads) 1))))
 
 ;; Everything sowable mid-run: the still-lifes / oscillators / spaceships of `*shapes*`
 ;; plus the glider guns of `*shooters*` (both required above). `inject-pattern` samples
@@ -281,6 +292,59 @@ descends from a coloured spawn, so colour reaches everywhere. Verified identical
         live-colors (reduce (fn (c i) (dissoc c i)) colors dead))
     (reduce (fn (c i) (assoc c i (birth-blend colors w h i))) live-colors born)))
 
+;; ---- PARALLEL recolour: fan the birth blends across a persistent worker pool ---------------
+;; `recolor` above is the serial reference (and the test/correctness oracle). `recolor-par` is
+;; its parallel twin: it keeps the cheap set-up (the dead-removal and the bit math) on the SIM,
+;; but shards the births — the hot per-cell blend — across `*recolor-workers*` persistent
+;; processes. A birth's colour reads its 8 torus neighbours from the WHOLE colour map and writes
+;; the single key `i`, so every worker gets the full `colors` map (a ~1ms copy, dwarfed by the
+;; blend work it offloads) and a disjoint slice of birth indices; the disjoint keys merge with no
+;; conflict. The pool is spawned ONCE (no per-frame spawn cost) and reused every generation; the
+;; collect is a SELECTIVE receive, so queued input messages are left untouched for the SIM loop.
+
+(defn blend-worker-loop ()
+  "A persistent recolour worker: blend the births in `idxs` against the sent colour map and send
+the `[i packed]` pairs back to `from`. Loops until `:stop` (sent at SIM teardown by `sim-stop`)."
+  (receive
+    ([:blend colors w h idxs from] (do
+                                     (send from
+                                       [:blended (map (fn (i) [i (birth-blend colors w h i)]) idxs)])
+                                     (blend-worker-loop)))
+    (:stop :ok)))
+
+(defn recolor--chunk (xs k)
+  "Split list `xs` into at most `k` roughly-equal contiguous chunks, dropping any empties (so a
+births list shorter than `k` just spreads over fewer workers)."
+  (let (len (count xs)
+        sz (max 1 (quot (+ len (- k 1)) k)))
+    (filter (fn (c) (not (empty? c)))
+      (map (fn (j) (take sz (drop (* j sz) xs))) (range k)))))
+
+(defn recolor--collect (got total acc)
+  "Fan-in: gather `total` `[:blended pairs]` replies into one pairs list (selective receive — it
+ignores any non-`[:blended]` mail, leaving it queued for the SIM loop)."
+  (if (= got total)
+    acc
+    (recolor--collect (+ got 1) total (receive ([:blended pairs] (concat acc pairs))))))
+
+(defn recolor-par (workers colors old-bits new-bits w h)
+  "Parallel `recolor` — byte-identical result, but the per-birth blends are fanned across the
+persistent `workers` pool and merged. Falls back to serial `recolor` when the pool is empty."
+  (if (empty? workers)
+    (recolor colors old-bits new-bits w h)
+    (let (surv (bit-and old-bits new-bits)
+          born (bit-positions (bit-xor new-bits surv))  ; new & ~old — births this gen
+          dead (bit-positions (bit-xor old-bits surv))  ; old & ~new — deaths this gen
+          live-colors (reduce (fn (c i) (dissoc c i)) colors dead)
+          chunks (recolor--chunk born (count workers))
+          me (self)
+          nc (count chunks))
+      (do
+        (dotimes (j nc) (send (nth workers j) [:blend colors w h (nth chunks j) me]))
+        (reduce (fn (c [i p]) (if (nil? p) c (assoc c i p)))
+          live-colors
+          (recolor--collect 0 nc nil))))))
+
 (defn colors-refit (colors old-w new-w new-h)
   "Rekey the colour layer from board width `old-w` to a `new-w`×`new-h` board, DROPPING cells
 that fall outside the new bounds — the colour-layer twin of `bitboard/refit` (the keys are bit
@@ -463,6 +527,13 @@ wait for its `[:drawn]` ack (bounds the renderer's mailbox to one frame). Return
     (send renderer [:board board st colors])
     (receive ([:drawn] :ok) (:stop :stop) (after 2000 :ok))))
 
+(defn sim-stop (m)
+  "Tear the SIM down at every exit path: stop the persistent recolour workers, then close the
+perf log. The workers are spawned in `run-life` and carried on `m` as `:workers`."
+  (do
+    (dolist (w (get m :workers)) (send w :stop))
+    (perflog/log-stop (get m :logger))))
+
 (defn apply-clicks (board clicks s)
   "Drop a random pattern at each click cell `[x y kind]`, threading the PRNG `s`: a `:gun`
 cell samples a glider gun (`*shooters*`, right button), any other kind samples a shape
@@ -510,14 +581,14 @@ repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag 
         [c2 n2] (if inj? (color-spawn c1 n1 (get b1 :bits) (get b2 :bits)) [c1 n1])
         last-inj2 (if inj? now (get m :last-inj))
         nxt (bitboard/step b2)
-        c3 (recolor c2 (get b2 :bits) (get nxt :bits) w h)
+        c3 (recolor-par (get m :workers) c2 (get b2 :bits) (get nxt :bits) w h)
         cells (bitboard/live-count nxt)
         gen (get m :gen)
         st2 (status gen cells per))
     (do
       (when (= 0 (mod gen *log-every*)) (perflog/log-line (get m :logger) (log-fmt gen cells per)))
       (if (= :stop (sim-draw (get m :renderer) nxt st2 c3))
-        (perflog/log-stop (get m :logger))
+        (sim-stop m)
         (sim-loop (assoc m
                     :board nxt
                     :s s2
@@ -559,12 +630,12 @@ drag); the just-pasted cell becomes `:held`."
     (receive
       ([:press k a b] (sim-paste m2 k a b 0))
       ([:drag k a b] (sim-paste m2 k a b newhn))
-      (:stop (perflog/log-stop (get m :logger)))
+      (:stop (sim-stop m))
       (after 0
         (if (step-due? (get m :prev) (get m :cap))
           (sim-step (assoc m2 :hn newhn))
           (if (= :stop (sim-draw (get m :renderer) b2 (get m :st) c2))
-            (perflog/log-stop (get m :logger))
+            (sim-stop m)
             (sim-loop (assoc m2 :hn newhn))))))))
 
 (defn sim-loop (m)
@@ -581,7 +652,7 @@ auto-spawn; `[:clear]` empties the board; `:stop` ends it."
   (let (cap (get m :cap)
         wait (if (= cap 0) 0 (max 0 (- (quot 1000 cap) (quot (- (now-ns) (get m :prev)) 1000000)))))
     (receive
-      (:stop (perflog/log-stop (get m :logger)))
+      (:stop (sim-stop m))
       ([:press kind x y] (sim-paste m kind x y 0))
       ([:drag kind x y] (sim-paste m kind x y (get m :hn)))
       ([:release] (sim-loop (assoc m :held nil)))
@@ -590,7 +661,7 @@ auto-spawn; `[:clear]` empties the board; `:stop` ends it."
       ;; the clear button: swap in a fresh EMPTY board (at the current dims) and draw it now.
       ([:clear] (let (empty (bitboard/make *w* *h*))
                   (if (= :stop (sim-draw (get m :renderer) empty (get m :st) {}))
-                    (perflog/log-stop (get m :logger))
+                    (sim-stop m)
                     (sim-loop (assoc m :board empty :held nil :colors {} :next-id 0)))))
       (after wait (sim-step m)))))
 
@@ -820,11 +891,16 @@ render-only *view-zoom* camera (the board is unchanged)."
         board (bitboard/make *w* *h*)  ; START EMPTY — clicks add random shapes
         me (self)  ; this root process is the renderer
         logger (perflog/log-start *log-path*)
+        ;; the persistent recolour worker pool (see *recolor-workers*): spawned ONCE here and
+        ;; carried on the SIM state, the SIM fans each generation's births across them. Empty
+        ;; (0 on a 1-core box) ⇒ recolor-par runs serial. Stopped by `sim-stop` at SIM teardown.
+        workers (into [] (map (fn (_) (spawn (blend-worker-loop))) (range *recolor-workers*)))
         ;; the SIM's whole state in ONE map (see `sim-step`) — the PRNG seed is the start
         ;; timestamp, `prev`/`last-inj` start there too, and it carries the fps `cap` and paces
         ;; itself. Every loop function takes this map and recurses with only the keys it changed.
         sim (spawn (sim-loop {:renderer me
                               :logger logger
+                              :workers workers
                               :board board
                               :s start
                               :gen 0
