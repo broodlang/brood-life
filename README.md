@@ -14,9 +14,11 @@ delay, then throttled. Controls:
 - **`[` / `]`** — auto-spawn a random pattern rarer / more often (`[` past the max = never)
 - **`q` / Esc / window-X** — quit
 
-It starts at a gentle **10 fps cap** (slow enough to watch the patterns evolve); the fps
-button/keys retune it, all the way up to **uncapped** (as fast as it can draw) when you
-want it to rip — drawing and mouse feedback stay instant regardless of the cap.
+It starts **uncapped** (as fast as it can draw — it rips from the first frame); the fps
+button/keys retune it all the way down to a gentle **1 fps** when you want to watch the
+patterns evolve — drawing and mouse feedback stay instant regardless of the cap.
+It also starts **auto-spawning** a random pattern every **30 s**, so an empty board comes
+to life on its own; the `[spawn …]` button / `[`/`]` keys retune or disable that.
 It fits itself to the window and tracks live resizes, so the torus always fills the frame.
 A big block-font status line below the board leads with the two buttons, then reports
 generation, measured FPS, live cell count, frame spikes, and memory.
@@ -95,5 +97,5 @@ nest format         # format the source
   `*spawn-every*` gens; a drag draws freehand (one per cell) without re-arming. Zoom resizes
   the board font (the footer is re-scaled to a fixed pixel height, so only the board grows);
   cells that fall off the shrunk board are dropped (`bitboard/refit` clips, no wrap-back).
-  Auto-injection is back as an **opt-in** knob (`[`/`]` set the interval, default off) —
-  every `*inject-secs*` seconds the SIM sows a random pattern.
+  Auto-injection is on by default (`*inject-secs*`, **30 s**; `[`/`]` retune it or turn it
+  off) — every `*inject-secs*` seconds the SIM sows a random pattern.
