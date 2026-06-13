@@ -4,7 +4,8 @@ a packed BITBOARD (see `bitboard`) fit to the window. It starts EMPTY — LEFT c
 drops random shapes, RIGHT click/drag drops glider guns, holding either auto-repeats. The
 SCROLL wheel is a VIEW zoom (a camera onto the mouse — the board is unchanged). Keys: `-`/`=`
 lower/raise the fps cap, `[`/`]` cycle the auto-spawn preset; a bottom-right `clear` empties
-the board. Starts at a 10 fps cap. Two processes (ADR-058): a SIM that owns the board and paces
+the board. Starts UNCAPPED and auto-spawning a random pattern every 30 s. Two processes
+(ADR-058): a SIM that owns the board and paces
 ITSELF with a self-resetting `(after)` timer that input preempts (so pastes are instant), and
 this RENDERER that draws + handles input."
   (:use editor/display))
@@ -18,9 +19,9 @@ this RENDERER that draws + handles input."
 (def *h* 40)
 ;; The frame-rate cap. 0 = UNCAPPED (go ham — steps as fast as it can draw); a POSITIVE value
 ;; sets the SIM's `(after)` step timer to that period, to slow the sim down enough to watch.
-;; Starts at *target-fps* below (10); adjustable live with `-`/`=` (slower/faster; `=` past
-;; *fps-max* rolls back to uncapped).
-(def *target-fps* 10)  ; the fps cap to START at (0 = uncapped; >0 = paced)
+;; Starts at *target-fps* below (0 = uncapped); adjustable live with `-`/`=` (slower/faster;
+;; `-` from uncapped engages the cap near the top, `=` past *fps-max* rolls back to uncapped).
+(def *target-fps* 0)  ; the fps cap to START at (0 = uncapped — go ham; >0 = paced)
 (def *fps-min* 1)
 (def *fps-max* 120)
 (def *fps-step* 5)  ; fps per `-`/`=` press
@@ -380,6 +381,25 @@ carried a colour, or one kept past a resize)."
   (let (p (get colors i))
     (if (nil? p) *default-cell-bg* (unpack-rgb p))))
 
+(defn render--cells (colors bits wdt a fill)
+  "The `:text` ops for every live cell at *view-zoom* 1, CACHING the face per packed colour: cells
+that share a spawn colour (whole colonies do, until a boundary blend) reuse ONE face map + `[r g b]`
+vector instead of re-unpacking + re-`assoc`-ing per cell — far less per-frame garbage. The fold
+threads `[ops cache]`; output is identical to a per-cell `map` (order preserved by the final
+`reverse`). Uncoloured cells all share `df`, the default face built once."
+  (let (df (assoc *cell-face* :bg *default-cell-bg*))
+    (reverse (first (reduce (fn ([ops cache] i)
+                              (let (op-at (fn (face)
+                                            [:text (quot i wdt) (* (mod i wdt) a) fill face])
+                                    p (get colors i))
+                                (cond
+                                  (nil? p) [(cons (op-at df) ops) cache]
+                                  (get cache p) [(cons (op-at (get cache p)) ops) cache]
+                                  :else (let (face (assoc *cell-face* :bg (unpack-rgb p)))
+                                          [(cons (op-at face) ops) (assoc cache p face)]))))
+                      [nil {}]
+                      (bit-positions bits))))))
+
 (defn render (live ui info)
   "A display frame from `live`: the live cells as `:text` ops, then the bottom bar at row
 `*h*`. At *view-zoom* 1 (the whole board) it's ONE `bit-positions` over the whole-board
@@ -400,11 +420,7 @@ copied again to append the bar."
     (into [(clear)]
       (concat
         (if (= z 1)
-          (map
-            (fn (i)
-              ;; inline bit->xy: row = i÷wdt, col = (i mod wdt)·aspect
-              [:text (quot i wdt) (* (mod i wdt) a) fill (assoc *cell-face* :bg (cell-bg colors i))])
-            (bit-positions bits))
+          (render--cells colors bits wdt a fill)
           (let (visw (max 1 (quot wdt z))
                 vish (max 1 (quot h z))
                 ox (max 0 (min *view-ox* (max 0 (- wdt visw))))
