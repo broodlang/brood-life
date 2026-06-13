@@ -16,10 +16,10 @@ this RENDERER that draws + handles input."
 
 (def *w* 120)
 (def *h* 40)
-;; The frame-rate cap. DEFAULT 0 = UNCAPPED (go ham — steps as fast as it can draw); a
-;; POSITIVE value sets the SIM's `(after)` step timer to that period, to slow the sim down
-;; enough to watch. Adjustable live with `-`/`=` (slower/faster; `=` past *fps-max* rolls back
-;; to uncapped).
+;; The frame-rate cap. 0 = UNCAPPED (go ham — steps as fast as it can draw); a POSITIVE value
+;; sets the SIM's `(after)` step timer to that period, to slow the sim down enough to watch.
+;; Starts at *target-fps* below (10); adjustable live with `-`/`=` (slower/faster; `=` past
+;; *fps-max* rolls back to uncapped).
 (def *target-fps* 10)  ; the fps cap to START at (0 = uncapped; >0 = paced)
 (def *fps-min* 1)
 (def *fps-max* 120)
@@ -64,15 +64,15 @@ this RENDERER that draws + handles input."
 (def *status-face* {:reverse true})  ; the bottom bar: reverse-video, like the brood-edit mode line
 (def *grid-min* 5)  ; the sim torus never shrinks below *grid-min* x *grid-min*
 (def *seed-cells* 3000)  ; target initial ACTIVE (live) cell count — `seed` sows random
-; shapes until ~this many cells are live (the working population we pace to 30 fps).
+; shapes until ~this many cells are live (the working population the sim paces against the cap).
 ; Capped to ~90% of the torus area so a board smaller than this can't loop forever.
 ;; A STATIONARY hold auto-repeats like a keyboard key: the press lands a shape AT ONCE,
 ;; then nothing for *hold-delay* gens (so a quick click stays a single drop), then a repeat
 ;; every *spawn-every* gens. Dragging is DRAWING — one shape per cell crossed — and does
 ;; NOT re-arm the delay, so when a drag stops the auto-repeat picks straight up at the
 ;; throttle rate; only a fresh press restarts the warm-up delay.
-(def *hold-delay* 12)  ; gens to hold before auto-repeat starts (~0.4 s at 30 fps)
-(def *spawn-every* 6)  ; gens between repeats once it's going (~5/s at 30 fps)
+(def *hold-delay* 12)  ; gens to hold before auto-repeat starts (~1.2 s at the 10 fps default)
+(def *spawn-every* 6)  ; gens between repeats once it's going (~1.7/s at the 10 fps default)
 ;; Auto-inject: drop a random pattern every *inject-secs* seconds to keep the board lively on
 ;; its own (0 = NEVER — the default; you drive it). The spawn BUTTON cycles the presets
 ;; off → 1s → 5s → 30s → off; the `[`/`]` keys step through them (rarer / more often).
@@ -88,7 +88,7 @@ this RENDERER that draws + handles input."
 (def *btn-inset* 1)  ; how many scale-steps smaller the keys are than the bar (1 ⇒ a shelf below)
 (def *btn-face* {:bg :white :fg :black :bold true})  ; a light raised KEY on the reverse bar
 (def *clear-label* " clear ")  ; the bottom-RIGHT key — click it to empty the board
-(def *log-every* 30)  ; the SIM writes a perf line to life.log every N gens (~1 Hz at 30 fps)
+(def *log-every* 30)  ; the SIM writes a perf line to life.log every N gens (~0.3 Hz at the 10 fps default)
 (def *log-path* "life.log")  ; where the perf log is written (cwd; truncated each run)
 
 ;; Everything sowable mid-run: the still-lifes / oscillators / spaceships of `*shapes*`
@@ -162,15 +162,19 @@ bitboard `live`, threading the PRNG `s`; returns `[live' s']`."
     [(bitboard/place live pat x y) s3]))
 
 ;; ---- the SPAWN-COLOUR layer (parallel to the pure bitboard) -------------------------------
-;; `colors` maps a live cell `[x y]` → its `[r g b]` byte vector. Keyed by `[x y]` (not a bit
-;; index) so it survives a resize unchanged. The bitboard stays pure (alive/dead only); the SIM
-;; threads this layer through spawns and the step. A NEWBORN's colour is the BLEND (channel
-;; average) of its live parents' colours, so where two colonies meet their colours mix — which
-;; is why the colour is stored as raw RGB per cell, not a spawn id (a blend names no one spawn).
+;; `colors` maps a live cell's whole-board BIT INDEX `i` → its `[r g b]` byte vector. Keyed by
+;; the integer index (not an `[x y]` vector) because `recolor` REBUILDS this map every frame and
+;; the colour layer — not the bitboard step — is the per-frame hot spot: integer hashing is ~2×
+;; cheaper than hashing a 2-element vector key (measured). The board width is baked into the index
+;; (`i` = `y*w + x`), so a resize rekeys the layer with `colors-refit`. The bitboard stays pure
+;; (alive/dead only); the SIM threads this layer through spawns and the step. A NEWBORN's colour
+;; is the BLEND (channel average) of its live parents' colours, so where two colonies meet their
+;; colours mix — which is why the colour is stored as raw RGB per cell, not a spawn id (a blend
+;; names no one spawn).
 
 (defn bit->xy (i w)
   "The board cell `[x y]` for whole-board bit index `i` — bit `i` is cell `(i mod w, i div w)`,
-the same layout `bitboard` uses. The colour layer's one place for this decode."
+the same layout `bitboard` uses. Used by the renderer to place a lit cell."
   [(mod i w) (quot i w)])
 
 (defn hsv->rgb (h s v)
@@ -204,24 +208,27 @@ colour from its parents."
         chan (fn (k) (quot (reduce (fn (a c) (+ a (vector-ref c k))) 0 rgbs) n)))
     [(chan 0) (chan 1) (chan 2)]))
 
-(defn color-spawn (colors next-id old-bits new-bits w)
+(defn color-spawn (colors next-id old-bits new-bits)
   "Give every cell the latest placement turned on (bits in `new` not in `old`) the next spawn's
 fresh colour, so each spawn is its own colour. Returns `[colors' next-id']`. A placement only
-OR-s bits in, so `new ⊇ old` and the added cells are exactly `new XOR old`."
+OR-s bits in, so `new ⊇ old` and the added cells are exactly `new XOR old` — `bit-positions`
+hands them back as the bit INDICES the colour layer keys on, so no decode is needed here."
   (let (added (bit-positions (bit-xor new-bits old-bits)))
     (if (nil? added)
       [colors next-id]
       (let (rgb (spawn-rgb next-id))
         ; one colour for the whole spawn — compute it once
-        [(reduce (fn (c i) (assoc c (bit->xy i w) rgb)) colors added) (+ next-id 1)]))))
+        [(reduce (fn (c i) (assoc c i rgb)) colors added) (+ next-id 1)]))))
 
-(defn birth-blend (colors w h xy)
-  "The colour a NEWBORN at `xy` takes: the BLEND (channel average) of its parents' colours —
-its 8 torus neighbours that carry one. A colour means the neighbour was a live cell last gen,
-so this is exactly the live parents (a birth has 3); `nil` if none is coloured."
-  (let ([x y] xy
+(defn birth-blend (colors w h i)
+  "The colour a NEWBORN at bit index `i` takes: the BLEND (channel average) of its parents'
+colours — its 8 torus neighbours that carry one. A colour means the neighbour was a live cell
+last gen, so this is exactly the live parents (a birth has 3); `nil` if none is coloured. Each
+neighbour's own bit index is `(y+dy mod h)*w + (x+dx mod w)`."
+  (let (x (mod i w)
+        y (quot i w)
         rgbs (filter (fn (c) (not (nil? c)))
-               (map (fn ([dx dy]) (get colors [(mod (+ x dx) w) (mod (+ y dy) h)]))
+               (map (fn ([dx dy]) (get colors (+ (* (mod (+ y dy) h) w) (mod (+ x dx) w))))
                  [[-1 -1] [0 -1] [1 -1] [-1 0] [1 0] [-1 1] [0 1] [1 1]])))
     (if (nil? rgbs) nil (blend-rgb rgbs))))
 
@@ -229,14 +236,25 @@ so this is exactly the live parents (a birth has 3); `nil` if none is coloured."
   "Carry the colour layer across ONE generation, rebuilt from the live cells of `new-bits` (so
 dead cells drop out). A SURVIVOR already has an entry in `colors` (every live cell carries a
 colour, so a colour ⇔ it was live last gen) and keeps it; a NEWBORN (no prior colour) takes
-`birth-blend`, the average of its live parents."
+`birth-blend`, the average of its live parents. Both the source bits and the map keys are bit
+indices, so this is a straight index→colour rebuild with no `[x y]` decode."
   (let (recolour-cell (fn (acc i)
-                        (let (xy (bit->xy i w)
-                              prev (get colors xy))
-                          (assoc acc xy (if (nil? prev) (birth-blend colors w h xy) prev)))))
+                        (let (prev (get colors i))
+                          (assoc acc i (if (nil? prev) (birth-blend colors w h i) prev)))))
     (reduce recolour-cell
       {}
       (bit-positions new-bits))))
+
+(defn colors-refit (colors old-w new-w new-h)
+  "Rekey the colour layer from board width `old-w` to a `new-w`×`new-h` board, DROPPING cells
+that fall outside the new bounds — the colour-layer twin of `bitboard/refit` (the keys are bit
+indices, so the width is baked in). Run on a resize so a survivor keeps its colour at its new
+index. A no-op caller-side when the width is unchanged."
+  (reduce (fn (acc [i rgb])
+            (let (x (mod i old-w) y (quot i old-w))
+              (if (and (< x new-w) (< y new-h)) (assoc acc (+ (* y new-w) x) rgb) acc)))
+    {}
+    colors))
 
 ;; The two CLICKABLE button labels — fixed width (11 + 9 chars) so the layout/hit ranges
 ;; stay put as the numbers change; `pad-left` holds the value column. They take the value to
@@ -317,10 +335,10 @@ the previous frame). The renderer composes this after the buttons."
 ;; under a freshly-measured bar position (that mismatch made the footer jump on resize).
 ;; *view-zoom* is a render-only camera (per-op `:scale`, ADR-079) over the SAME board, so
 ;; zooming changes neither the board nor the bar — only which window of cells is magnified.
-(defn cell-bg (colors x y)
-  "The `:bg` for live board cell `(x,y)`: its `[r g b]` colour, or *default-cell-bg* for an
-uncoloured cell (no parent carried a colour, or one kept past a resize)."
-  (get colors [x y] *default-cell-bg*))
+(defn cell-bg (colors i)
+  "The `:bg` for the live board cell with whole-board bit index `i`: its `[r g b]` colour, or
+*default-cell-bg* for an uncoloured cell (no parent carried a colour, or one kept past a resize)."
+  (get colors i *default-cell-bg*))
 
 (defn render (live ui info)
   "A display frame from `live`: the live cells as `:text` ops, then the bottom bar at row
@@ -341,7 +359,7 @@ masked to the column range (still O(visible-live), and fewer cells show), each a
         (if (= z 1)
           (map (fn (i)
                  (let ([x y] (bit->xy i wdt))
-                   [:text y (* x a) fill (assoc *cell-face* :bg (cell-bg colors x y))]))
+                   [:text y (* x a) fill (assoc *cell-face* :bg (cell-bg colors i))]))
             (bit-positions bits))
           (let (visw (max 1 (quot wdt z))
                 vish (max 1 (quot h z))
@@ -356,11 +374,13 @@ masked to the column range (still O(visible-live), and fewer cells show), each a
                 (let (vr (bit-and (bit-shift-right bits (+ (* (+ oy sy) wdt) ox)) vismask))
                   (if (= vr 0)
                     nil
-                    (map (fn (px)
-                           [:text (* sy z)
-                             (* px az)
-                             fill
-                             (assoc zface :bg (cell-bg colors (+ ox px) (+ oy sy)))])
+                    (map
+                      (fn (px)
+                        [:text (* sy z)
+                          (* px az)
+                          fill
+                          ;; the visible cell's whole-board bit index = (oy+sy)*wdt + (ox+px)
+                          (assoc zface :bg (cell-bg colors (+ (* (+ oy sy) wdt) (+ ox px))))])
                       (bit-positions vr)))))
               (range vish)))))
       ;; the bar spans the full SCREEN width (board cols × *cell-aspect*), at screen row *h*.
@@ -421,9 +441,15 @@ cell samples a glider gun (`*shooters*`, right button), any other kind samples a
 (`*w*`/`*h*`, set by the renderer), fold in the held-cell auto-repeat + the wall-clock
 auto-inject, step, DRAW it, and recurse. No clock to ack — the SIM paces itself. The held-cell
 repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag already drew)."
-  (let (board (bitboard/fit (get m :board) *w* *h*)
+  (let (ob (get m :board)
+        board (bitboard/fit ob *w* *h*)
         w (get board :w)
         h (get board :h)
+        ;; a window resize changed *w*/*h*: the colour keys are bit indices, so rekey the layer
+        ;; to the new width (drops off-board cells) — mirrors the board's `bitboard/fit` above.
+        colors0 (if (= (get ob :w) w)
+                  (get m :colors)
+                  (colors-refit (get m :colors) (get ob :w) w h))
         now (now-ns)
         per (- now (get m :prev))
         held (get m :held)
@@ -433,12 +459,12 @@ repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag 
         ;; colour each spawn (held-repeat, then auto-inject) as it lands, then carry the layer
         ;; across the step — survivors keep their colour, newborns blend their live parents'.
         [c1 n1] (if repeat?
-                  (color-spawn (get m :colors) (get m :next-id) (get board :bits) (get b1 :bits) w)
-                  [(get m :colors) (get m :next-id)])
+                  (color-spawn colors0 (get m :next-id) (get board :bits) (get b1 :bits))
+                  [colors0 (get m :next-id)])
         inject (get m :inject)
         inj? (and (> inject 0) (>= (- now (get m :last-inj)) (* inject 1000000000)))
         [b2 s2] (if inj? (inject-pattern b1 s1) [b1 s1])
-        [c2 n2] (if inj? (color-spawn c1 n1 (get b1 :bits) (get b2 :bits) w) [c1 n1])
+        [c2 n2] (if inj? (color-spawn c1 n1 (get b1 :bits) (get b2 :bits)) [c1 n1])
         last-inj2 (if inj? now (get m :last-inj))
         nxt (bitboard/step b2)
         c3 (recolor c2 (get nxt :bits) w h)
@@ -485,8 +511,7 @@ drag); the just-pasted cell becomes `:held`."
         [c2 n2] (color-spawn (get m :colors)
                   (get m :next-id)
                   (get (get m :board) :bits)
-                  (get b2 :bits)
-                  (get b2 :w))
+                  (get b2 :bits))
         m2 (assoc m :board b2 :s s2 :held [x y kind] :colors c2 :next-id n2))
     (receive
       ([:press k a b] (sim-paste m2 k a b 0))
@@ -564,19 +589,29 @@ the renderer's two `[:mouse …]` arities (press carries a 7th click-count eleme
         ;; (default-font) value and the bar floats mid-window.
         (grid-fit w)
         ;; cache the sim's spawn-colour layer in the local ui mirror, so input
-        ;; redraws (which use the cached ui) paint the right colours too.
-        (let (nl2 (bitboard/fit nl *w* *h*)
-              ui2 (assoc ui :colors colors))
+        ;; redraws (which use the cached ui) paint the right colours too. The keys
+        ;; are bit indices, so if `grid-fit` just changed the width, rekey them to
+        ;; match the board we're about to draw (the sim catches up next frame).
+        (let (onw (get nl :w)
+              nl2 (bitboard/fit nl *w* *h*)
+              colors2 (if (= onw *w*) colors (colors-refit colors onw *w* *h*))
+              ui2 (assoc ui :colors colors2))
           (do
             (draw! w nl2 st ui2)
             (send sim [:drawn])
             (render-loop w sim nl2 st ui2)))))
     ;; Resize from the EVENT's cell grid — refit the cached board to it and redraw now.
-    ([:resize cols rows] (do
-                           (def *w* (max *grid-min* (quot cols *cell-aspect*)))
-                           (def *h* (max *grid-min* (max 1 (- rows *status-scale*))))
-                           (let (nl (bitboard/fit board *w* *h*))
-                             (do (draw! w nl info ui) (render-loop w sim nl info ui)))))
+    ([:resize cols rows]
+      (do
+        (def *w* (max *grid-min* (quot cols *cell-aspect*)))
+        (def *h* (max *grid-min* (max 1 (- rows *status-scale*))))
+        ;; the colour keys encode the OLD width; rekey them to the new width so
+        ;; they keep matching the refit board (`nl`) on this draw and on input
+        ;; redraws, until the sim resends a correctly-keyed frame.
+        (let (ow (get board :w)
+              nl (bitboard/fit board *w* *h*)
+              ui2 (if (= ow *w*) ui (assoc ui :colors (colors-refit (get ui :colors) ow *w* *h*))))
+          (do (draw! w nl info ui2) (render-loop w sim nl info ui2)))))
     ;; Two arities: a `:press` carries a trailing 7th element (its click-chain count), every
     ;; other action is 6 — vector patterns match by EXACT length, so both shapes need a clause
     ;; or presses (and thus every button, which fires on press) silently fall through to keys.

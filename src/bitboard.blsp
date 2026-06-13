@@ -51,7 +51,9 @@ number) and `bit-positions` (so rendering stays O(live), not O(area)).")
   "Advance one generation. A fixed handful of whole-board big-int ops (a bit-plane
 full-adder over the eight torus-shifted neighbour fields), independent of population.
 A cell lives iff it has exactly 3 live neighbours, or 2 and it is already live —
-`s1 & ~s2 & ~s3 & (s0 | cur)` over the 4-bit neighbour count `[s0 s1 s2 s3]`."
+`s1 & ~s2 & (s0 | cur)` over the low three bits `[s0 s1 s2]` of the neighbour count
+(the only other count with s1 set is 8, which truncates to s1=0 in three bits, so the
+4th plane the sum could carry is never consulted and isn't accumulated)."
   (let (w (get board :w)
         h (get board :h)
         mask (get board :mask)
@@ -71,25 +73,24 @@ A cell lives iff it has exactly 3 live neighbours, or 2 and it is already live �
         dn (fn (f) (bit-or (bit-shift-right f w) (bit-shift-left (bit-and f mask) hm1w)))
         ;; the eight neighbours: the three columns (west / centre / east) × the three rows
         ns [(up l) (up b) (up r) l r (dn l) (dn b) (dn r)]
-        ;; full-adder: sum the eight 1-bit-per-cell fields into a 4-bit count per cell
-        planes (reduce (fn ([s0 s1 s2 s3] m)
+        ;; full-adder: sum the eight 1-bit-per-cell fields into a per-cell count. We only
+        ;; need the low THREE bits (s0/s1/s2) — survival is `s1 & ~s2` (a count of 2 or 3),
+        ;; and the only larger count with s1 set, 8 (`1000`), drops to s1=0 once the sum is
+        ;; truncated to three bits — so the carry out of s2 is never read and isn't kept.
+        planes (reduce (fn ([s0 s1 s2] m)
                          (let (c (bit-and s0 m)
                                s0b (bit-xor s0 m)
                                c2 (bit-and s1 c)
                                s1b (bit-xor s1 c)
-                               c3 (bit-and s2 c2)
-                               s2b (bit-xor s2 c2)
-                               s3b (bit-or s3 c3))
-                           [s0b s1b s2b s3b]))
-                 [0 0 0 0]
+                               s2b (bit-xor s2 c2))
+                           [s0b s1b s2b]))
+                 [0 0 0]
                  ns)
         s0 (vector-ref planes 0)
         s1 (vector-ref planes 1)
-        s2 (vector-ref planes 2)
-        s3 (vector-ref planes 3))
+        s2 (vector-ref planes 2))
     (assoc board
-      :bits (bit-and (bit-and s1 (bit-and (bit-xor s2 brd) (bit-xor s3 brd)))
-              (bit-or s0 b)))))
+      :bits (bit-and (bit-and s1 (bit-xor s2 brd)) (bit-or s0 b)))))
 
 (defn cells (board)
   "A list of live `[x y]` cells — O(live), via one `bit-positions` over the whole board

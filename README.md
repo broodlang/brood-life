@@ -14,19 +14,21 @@ delay, then throttled. Controls:
 - **`[` / `]`** — auto-spawn a random pattern rarer / more often (`[` past the max = never)
 - **`q` / Esc / window-X** — quit
 
-It runs **uncapped by default** (as fast as it can draw, so drawing/mouse feedback is
-instant); the fps button/keys engage an opt-in cap when you want to slow it down to watch.
+It starts at a gentle **10 fps cap** (slow enough to watch the patterns evolve); the fps
+button/keys retune it, all the way up to **uncapped** (as fast as it can draw) when you
+want it to rip — drawing and mouse feedback stay instant regardless of the cap.
 It fits itself to the window and tracks live resizes, so the torus always fills the frame.
 A big block-font status line below the board leads with the two buttons, then reports
 generation, measured FPS, live cell count, frame spikes, and memory.
 
-The board is a packed **bitboard** — one arbitrary-precision integer per row, bit `x`
-= cell alive. A whole generation is one bit-plane neighbour sum per row over the three
-torus-wrapped rows, so the step cost is **independent of how many cells are live** (a
-flat ~10ms on a 250×140 board whether 300 or 3000 cells are lit). Rendering enumerates
+The board is a packed **bitboard** — the *whole grid* in one arbitrary-precision integer,
+bit `y*w + x` = cell `(x,y)` alive. A whole generation is one bit-plane neighbour sum (a
+full-adder over the eight torus-shifted copies of the grid), a fixed handful of big-int
+ops, so the step cost is **independent of how many cells are live** (well under a
+millisecond on a 250×140 board whether 300 or 3000 cells are lit). Rendering enumerates
 live cells with `bit-positions`, so it's O(live), not O(area). This needs Brood's
-arbitrary-precision integers + unrestricted bit-shifts (a row is a w-bit number shifted
-by w−1 to wrap the torus) and the `bit-positions` builtin.
+arbitrary-precision integers + unrestricted bit-shifts (each row's edge bits shift across
+to wrap the torus) and the `bit-positions` builtin.
 
 Written in Brood (`.blsp`), a small immutable Lisp.
 
@@ -63,11 +65,11 @@ nest format         # format the source
 
 ## Design notes
 
-- The board is a packed **bitboard** (`bitboard` module): one arbitrary-precision
-  integer per row (bit `x` = cell `(x,y)`). `step` is a bit-plane full-adder neighbour
-  sum per row over the three torus-wrapped rows — O(height) big-int ops, independent of
-  population (and an all-zero band is skipped). `render` enumerates live cells with the
-  `bit-positions` builtin (O(live)) and emits one draw op each over a leading `clear`.
+- The board is a packed **bitboard** (`bitboard` module): the whole grid in one
+  arbitrary-precision integer (bit `y*w + x` = cell `(x,y)`). `step` is a bit-plane
+  full-adder neighbour sum over the eight torus-shifted copies of the grid — a fixed
+  handful of big-int ops, independent of population. `render` enumerates live cells with
+  the `bit-positions` builtin (O(live)) and emits one draw op each over a leading `clear`.
   Relies on the kernel's bignums + unrestricted shifts + `bit-positions`.
 - The program is **two processes** (ADR-058): a **SIM** owns the model, steps it,
   formats the status line, writes the perf log, and pushes each board to the

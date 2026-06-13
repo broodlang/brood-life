@@ -12,6 +12,38 @@ bullet.
 
 ## Findings
 
+### ROUGH EDGE 2026-06-13 — `read-string` / `nest mcp eval` silently drop trailing forms
+
+`read-string` reads exactly ONE form and discards whatever follows, with no error and no
+warning: `(read-string "(def a 1) (def b 2) (+ a b)")` → `(def a 1)`. `eval-string`, by
+contrast, evaluates ALL forms and returns the last (`… → 3`). The `nest mcp` `eval` tool
+follows the `read-string` contract, so pasting a multi-form block into it runs only the
+first form — the rest vanish silently (here: a block of `defn`s where only the first
+defined, so later calls hit `unbound symbol`). Brood is dynamically typed, so no checker
+catches this; the fix belongs in the reader/eval seam — `read-string` should error on
+trailing non-whitespace input (or expose a `read-all`), and `eval` should either adopt
+`eval-string`'s eval-all semantics or report "N trailing forms ignored". Workaround: wrap
+the block in `(do …)`. Silent truncation reads as success when it isn't.
+
+### WIN 2026-06-13 — colour layer re-keyed to bit indices; step trimmed to 3 planes
+
+Two follow-ups to the whole-board step above (which flagged `render` / the per-frame
+colour work as the remaining Brood-side cost):
+
+- **Colour layer keyed by `[x y]` vector → integer bit index.** `recolor` rebuilds the
+  whole `cell → rgb` map every frame and was the per-frame hot spot — ~40× the step
+  (~6.5 ms vs ~0.16 ms on 250×140, 969 live). The keys were 2-element `[x y]` vectors;
+  switching them to the integer bit index `bit-positions` already hands back cut `recolor`
+  ~24% (the isolated map rebuild ~halves; the rest is fixed per-cell `get`/branch/closure
+  cost) and dropped a per-lit-cell `[x y]` allocation from `render`. The width is baked
+  into the index, so a resize rekeys via a new `colors-refit` (the colour twin of
+  `bitboard/refit`). **Lesson:** a structural map key (a tuple/vector) hashes far slower
+  than an integer; if a map is rebuilt every frame, pay to key it on a scalar.
+- **`step` full-adder trimmed from 4 planes to 3.** Survival is `s1 & ~s2` (count 2 or 3);
+  the only larger count with `s1` set, 8, truncates to `s1=0` in three bits, so the 4th
+  plane and the `~s3` term were dead. Removing them drops ~17 big-int ops/step (~10%).
+  Verified bit-identical across 150 random boards × 25 gens + the count-8 / all-live edges.
+
 ### WIN 2026-06-03 — whole-board bignum step (per-row → one integer), ~57× faster
 
 Smaller display blocks grew the torus to 480×395 (~190K cells), and the **per-row**
