@@ -5,8 +5,11 @@ Written in Brood (`.blsp`). The architecture is two processes (ADR-058): a
 **SIM** (owns the model, steps it, formats/logs, and paces itself with a
 self-resetting `(after)` timer that input preempts — the ADR-101 timer
 mechanism), and the **RENDERER** (the root process, which owns the window and
-composites). The sim steps the board serially. See `README.md` for the design
-notes and `src/` layout.
+composites). The sim steps the board serially (the step is cheap); its per-frame
+hot spot is the spawn-colour layer (`recolor`), which it can fan across a small
+pool of worker processes (`recolor-par`) on high-churn boards, falling back to
+serial above `*recolor-par-max-cells*`. See `README.md` for the design notes and
+`src/` layout.
 
 Conventions worth knowing here:
 

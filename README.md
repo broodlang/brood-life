@@ -77,10 +77,18 @@ nest format         # format the source
   formats the status line, writes the perf log, and pushes each board to the
   renderer; the **RENDERER** (the root process) owns the window and is a thin
   compositor.
-- The SIM steps the board **serially** — `step` is the bulk of the CPU, and on
-  these board sizes a serial recompute beats the copy-on-send overhead of fanning
-  it across processes.
-- The SIM **paces ITSELF to a frame-rate cap** (`*target-fps*`, default 10, live-adjustable
+- The SIM steps the board **serially** (`step` is a fixed handful of big-int ops,
+  ~0.2 ms — population-independent and not worth parallelising). The per-frame hot
+  spot is instead the **spawn-colour layer** (`recolor`): a per-birth blend of the
+  cell's live neighbours. Births are independent and write disjoint keys, so on a
+  **high-churn, moderate-size** board the SIM fans them across a small pool of
+  persistent worker processes (`recolor-par`, `*recolor-workers*`) for a ~2.7–3.2×
+  win. The win is bounded: each worker is sent the whole colour map every frame, so
+  past `*recolor-par-max-cells*` live cells that O(population) copy outweighs the
+  saving and `recolor-par` falls back to serial. (A copy-free version — workers that
+  own a board band and trade only halo rows — would win unconditionally, but is a
+  larger re-architecture and isn't built.)
+- The SIM **paces ITSELF to a frame-rate cap** (`*target-fps*`, default uncapped, live-adjustable
   with `-`/`=`): its `receive` parks on an `(after period)` timeout — a self-resetting timer
   (the same mechanism as ADR-101's `ui-run` timers) whose `period` subtracts the work already
   spent, so the cap is a true target. Any input message **preempts** the timeout, so a paste

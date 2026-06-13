@@ -92,15 +92,28 @@ this RENDERER that draws + handles input."
 (def *clear-label* " clear ")  ; the bottom-RIGHT key — click it to empty the board
 (def *log-every* 30)  ; the SIM writes a perf line to life.log every N gens (~0.3 Hz at the 10 fps default)
 (def *log-path* "life.log")  ; where the perf log is written (cwd; truncated each run)
-;; PARALLEL RECOLOUR pool size. The per-frame hot spot is the spawn-colour layer (`recolor`),
-;; whose cost is the per-birth blend (8 neighbour lookups + a channel average). Births are
-;; independent and write disjoint keys, so the SIM fans them across a pool of this many
-;; persistent worker processes (spawned once in `run-life`) and merges the results — measured
-;; ~3.2× faster than serial at 4 workers on a mid-size board. Sized from the scheduler pool
-;; (`worker-threads` ≈ nproc), leaving one thread for the SIM, but CAPPED at 4: past the knee
-;; the fan-out/merge serial overhead outweighs more workers (8 measured slower than 4). 0 ⇒ the
-;; pool is empty and `recolor-par` runs serial (a 1-core box, or a deliberate disable).
-(def *recolor-workers* (min 4 (max 0 (- (worker-threads) 1))))
+;; PARALLEL RECOLOUR. The per-frame hot spot is the spawn-colour layer (`recolor`), whose cost
+;; is the per-birth blend (8 neighbour lookups + a channel average). Births are independent and
+;; write disjoint keys, so the SIM can fan them across a pool of persistent worker processes
+;; (spawned once in `run-life`) and merge the results — measured ~2.7–3.2× on a moderate board
+;; with HIGH churn (lots of births, ~3k live cells).
+;;
+;; But it only wins in that regime. Each worker is sent the WHOLE colour map every frame (a
+;; birth reads neighbours anywhere on the board), and that O(population) copy — done once per
+;; worker — overtakes the blend savings on a DENSE or LOW-CHURN board: measured a NET LOSS by
+;; ~8k live cells (par 125ms vs serial 68ms), worsening with size (40k: 429 vs 324). So
+;; `recolor-par` is GUARDED: above *recolor-par-max-cells* live cells it just runs serial, which
+;; is exactly the right choice there. (The unconditional win needs a different shape — persistent
+;; workers that OWN a board band and exchange only halo rows, so per-frame traffic is O(halo) not
+;; O(population); that is a larger re-architecture, deferred.)
+(def *recolor-workers* (min 4 (max 0 (- (worker-threads) 1))))  ; pool size, capped at the knee
+;; the fan-out/merge serial overhead outweighs more workers past ~4 (8 measured slower than 4);
+;; sized from `worker-threads` ≈ nproc, leaving one thread for the SIM. 0 ⇒ pool empty ⇒ serial.
+(def *recolor-par-max-cells* 4000)  ; above this live-cell count, recolor-par falls back to serial
+;; (the map-copy-per-worker overtakes the win on bigger boards — see the note above). Heuristic:
+;; the crossover also depends on churn, so this is a conservative guard, not an exact threshold.
+(def *recolor-timeout-ms* 1000)  ; if a worker doesn't reply within this, abandon the fan-out and
+;; recompute serially — keeps a dead/stuck worker from wedging the SIM (there is no supervisor).
 
 ;; Everything sowable mid-run: the still-lifes / oscillators / spaceships of `*shapes*`
 ;; plus the glider guns of `*shooters*` (both required above). `inject-pattern` samples
@@ -297,10 +310,11 @@ descends from a coloured spawn, so colour reaches everywhere. Verified identical
 ;; its parallel twin: it keeps the cheap set-up (the dead-removal and the bit math) on the SIM,
 ;; but shards the births — the hot per-cell blend — across `*recolor-workers*` persistent
 ;; processes. A birth's colour reads its 8 torus neighbours from the WHOLE colour map and writes
-;; the single key `i`, so every worker gets the full `colors` map (a ~1ms copy, dwarfed by the
-;; blend work it offloads) and a disjoint slice of birth indices; the disjoint keys merge with no
-;; conflict. The pool is spawned ONCE (no per-frame spawn cost) and reused every generation; the
-;; collect is a SELECTIVE receive, so queued input messages are left untouched for the SIM loop.
+;; the single key `i`, so every worker gets the full `colors` map and a disjoint slice of birth
+;; indices; the disjoint keys merge with no conflict. The pool is spawned ONCE (no per-frame
+;; spawn cost) and reused every generation; the collect is a SELECTIVE receive, so queued input
+;; messages are left untouched for the SIM loop. The full-map copy is what bounds the win to
+;; smaller boards — see *recolor-par-max-cells* and the config note for the guard and why.
 
 (defn blend-worker-loop ()
   "A persistent recolour worker: blend the births in `idxs` against the sent colour map and send
@@ -322,15 +336,20 @@ births list shorter than `k` just spreads over fewer workers)."
 
 (defn recolor--collect (got total acc)
   "Fan-in: gather `total` `[:blended pairs]` replies into one pairs list (selective receive — it
-ignores any non-`[:blended]` mail, leaving it queued for the SIM loop)."
+ignores any non-`[:blended]` mail, leaving it queued for the SIM loop). Returns `:timeout` if a
+reply doesn't arrive within *recolor-timeout-ms* (a dead/stuck worker), so the caller can recover."
   (if (= got total)
     acc
-    (recolor--collect (+ got 1) total (receive ([:blended pairs] (concat acc pairs))))))
+    (receive
+      ([:blended pairs] (recolor--collect (+ got 1) total (concat acc pairs)))
+      (after *recolor-timeout-ms* :timeout))))
 
 (defn recolor-par (workers colors old-bits new-bits w h)
   "Parallel `recolor` — byte-identical result, but the per-birth blends are fanned across the
-persistent `workers` pool and merged. Falls back to serial `recolor` when the pool is empty."
-  (if (empty? workers)
+persistent `workers` pool and merged. Runs serial when the pool is empty, when the board is
+larger than *recolor-par-max-cells* (the full-map copy per worker would outweigh the win — see
+the config note), or as a fallback if the collect times out on a stuck worker."
+  (if (or (empty? workers) (> (bit-count new-bits) *recolor-par-max-cells*))
     (recolor colors old-bits new-bits w h)
     (let (surv (bit-and old-bits new-bits)
           born (bit-positions (bit-xor new-bits surv))  ; new & ~old — births this gen
@@ -341,9 +360,11 @@ persistent `workers` pool and merged. Falls back to serial `recolor` when the po
           nc (count chunks))
       (do
         (dotimes (j nc) (send (nth workers j) [:blend colors w h (nth chunks j) me]))
-        (reduce (fn (c [i p]) (if (nil? p) c (assoc c i p)))
-          live-colors
-          (recolor--collect 0 nc nil))))))
+        (let (pairs (recolor--collect 0 nc nil))
+          (if (= pairs :timeout)
+            ;; a worker stalled/died — recompute serially rather than block the SIM
+            (recolor colors old-bits new-bits w h)
+            (reduce (fn (c [i p]) (if (nil? p) c (assoc c i p))) live-colors pairs)))))))
 
 (defn colors-refit (colors old-w new-w new-h)
   "Rekey the colour layer from board width `old-w` to a `new-w`×`new-h` board, DROPPING cells
