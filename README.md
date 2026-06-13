@@ -77,24 +77,10 @@ nest format         # format the source
   formats the status line, writes the perf log, and pushes each board to the
   renderer; the **RENDERER** (the root process) owns the window and is a thin
   compositor.
-- The SIM steps the board **serially** (`step` is a fixed handful of big-int ops,
-  ~0.2 ms — population-independent and not worth parallelising). The per-frame hot
-  spot is instead the **spawn-colour layer** (`recolor`): a per-birth blend of the
-  cell's live neighbours. The SIM **shards** it across a fixed pool of persistent
-  worker processes (`*recolor-workers*`, ≈8), each OWNING one horizontal row-**band**'s
-  colour slice across generations — so the full colour map is never re-copied to
-  workers each frame (an earlier whole-map fan-out lost on dense boards for exactly
-  that reason). Each gen the SIM hands every worker its band's bits (shifted to band
-  width, so per-worker bit-ops are O(band)) plus that gen's spawn delta; workers
-  exchange one halo **row** with each neighbour (a torus ring), recolour their band in
-  parallel, and return the slice; the SIM merges (`shard-recolor`). Workers stay in
-  sync via the per-gen delta and the merge; a paste between steps pushes its delta
-  (`shard-add!`) and a resize/clear re-shards (`shard-reslice!`). Measured vs serial:
-  dense 30k-cell board 324 ms → ~200 ms; a 3k-cell board 117 ms → ~18 ms. The serial
-  `recolor` stays as the correctness oracle. (On a window shorter than the worker
-  count — a tiny window — some bands go empty and edge colours can glitch a frame; it
-  never crashes, and normal boards are exact.)
-- The SIM **paces ITSELF to a frame-rate cap** (`*target-fps*`, default uncapped, live-adjustable
+- The SIM steps the board **serially** — `step` is the bulk of the CPU, and on
+  these board sizes a serial recompute beats the copy-on-send overhead of fanning
+  it across processes.
+- The SIM **paces ITSELF to a frame-rate cap** (`*target-fps*`, default 10, live-adjustable
   with `-`/`=`): its `receive` parks on an `(after period)` timeout — a self-resetting timer
   (the same mechanism as ADR-101's `ui-run` timers) whose `period` subtracts the work already
   spent, so the cap is a true target. Any input message **preempts** the timeout, so a paste
