@@ -53,13 +53,11 @@ public sealed class Sim
     public async Task RunAsync(CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
-        var fpsClock = Stopwatch.StartNew();
-        int framesThisSecond = 0;
-        double measuredFps = 0;
+        long lastFrameMs = 0;     // wall time of the previous emitted frame — for the instantaneous fps
         bool awaitingAck = false;
 
         // Push an initial (empty) frame so the window has something to show at once.
-        await Emit(measuredFps);
+        await Emit(0);
 
         while (!ct.IsCancellationRequested)
         {
@@ -95,15 +93,6 @@ public sealed class Sim
             if (_spawnEvery > 0 && _gen % _spawnEvery == 0)
                 AutoSpawn();                  // a fresh spawn colour on the added cells
 
-            // measured fps
-            framesThisSecond++;
-            if (fpsClock.ElapsedMilliseconds >= 1000)
-            {
-                measuredFps = framesThisSecond * 1000.0 / fpsClock.ElapsedMilliseconds;
-                framesThisSecond = 0;
-                fpsClock.Restart();
-            }
-
             // Don't get ahead of the renderer: wait for the previous frame's ack.
             if (awaitingAck)
             {
@@ -111,7 +100,10 @@ public sealed class Sim
                 if (ack) return; // Quit arrived while waiting
             }
 
-            await Emit(measuredFps);
+            long nowMs = sw.ElapsedMilliseconds;
+            long perMs = nowMs - lastFrameMs;   // ms since the previous frame — Brood's `per`
+            lastFrameMs = nowMs;
+            await Emit(perMs);
             awaitingAck = true;
 
             // subtract the work already spent so the cap is a true target
@@ -269,7 +261,7 @@ public sealed class Sim
 
     // Build render ops: one op per live cell, each cell its OWN spawn-blend colour from the
     // colour layer (uncoloured cells render white). The recolour itself happened in `Recolor`.
-    private async Task Emit(double measuredFps)
+    private async Task Emit(long perMs)
     {
         var ops = new List<RenderOp>(_board.LiveCount());
         int w = _board.W;
@@ -279,9 +271,13 @@ public sealed class Sim
             ops.Add(new RenderOp(x, y, r, g, b));
         }
 
-        int live = ops.Count;
-        string status = $"gen {_gen}   fps {(_targetFps == 0 ? "uncapped" : _targetFps.ToString())}" +
-                        $" ({measuredFps:0})   live {live}   spawn {(_spawnEvery == 0 ? "off" : $"{_spawnEvery}g")}";
+        // EXACTLY Brood's `status` info line: "gen N · F fps · C cells · M MB".
+        // F = instantaneous fps from the last frame's delta (Brood `(quot 1000 (max 1 ms))`);
+        // M = bytes currently allocated / 1 MB — Brood's `mem-bytes` is its allocator's live
+        // bytes, whose managed-runtime analogue is GC.GetTotalMemory(false).
+        long fps = 1000 / Math.Max(1, perMs);
+        long mb = GC.GetTotalMemory(false) / 1048576;
+        string status = $"gen {_gen} · {fps} fps · {ops.Count} cells · {mb} MB";
 
         await _frames.WriteAsync(new Frame(ops.ToArray(), _board.W, _board.H, status));
     }
