@@ -17,6 +17,11 @@ this RENDERER that draws + handles input."
 
 (def *w* 120)
 (def *h* 40)
+;; FAIR-COMPARISON OVERRIDE (env-driven, off by default). When `LIFE_BOARD=WxH` is set the
+;; board is PINNED to those dims — `grid-fit`/`[:resize]` stop re-deriving `*w*`/`*h*` from the
+;; window — and `LIFE_BLOCK=N` seeds a centred solid N×N block (and disables auto-inject), so
+;; this port and the .NET one evolve cell-for-cell IDENTICALLY and only the engine speed differs.
+(def *fixed-board* nil)  ; [w h] when pinned via LIFE_BOARD, else nil (window-derived sizing)
 ;; The frame-rate cap. 0 = UNCAPPED (go ham — steps as fast as it can draw); a POSITIVE value
 ;; sets the SIM's `(after)` step timer to that period, to slow the sim down enough to watch.
 ;; Starts at *target-fps* below (0 = uncapped); adjustable live with `-`/`=` (slower/faster;
@@ -281,7 +286,13 @@ descends from a coloured spawn, so colour reaches everywhere. Verified identical
         born (bit-positions (bit-xor new-bits surv))  ; new & ~old — the births this gen
         dead (bit-positions (bit-xor old-bits surv))  ; old & ~new — the deaths this gen
         live-colors (reduce (fn (c i) (dissoc c i)) colors dead))
-    (reduce (fn (c i) (assoc c i (birth-blend colors w h i))) live-colors born)))
+    (reduce (fn (c i)
+              ;; only store a colour when the birth actually has a coloured parent — a
+              ;; colourless cell stays ABSENT (not a nil entry), so an all-uncoloured board
+              ;; keeps `colors` empty and the native `[:cells]` fast path in `render` fires.
+              (let (b (birth-blend colors w h i))
+                (if (nil? b) c (assoc c i b))))
+      live-colors born)))
 
 (defn colors-refit (colors old-w new-w new-h)
   "Rekey the colour layer from board width `old-w` to a `new-w`×`new-h` board, DROPPING cells
@@ -420,7 +431,14 @@ copied again to append the bar."
     (into [(clear)]
       (concat
         (if (= z 1)
-          (render--cells colors bits wdt a fill)
+          ;; FAST PATH: with no per-cell spawn colours, blit the WHOLE bitboard as one
+          ;; native `[:cells]` op — the kernel enumerates the set bits and fills each cell
+          ;; (O(live), in Rust), so the Brood side emits ONE op instead of one per cell.
+          ;; With a live colour layer, fall back to the per-cell `[:text]` builder (the op
+          ;; carries a single colour, so the gradient still needs the slow path).
+          (if (= 0 (count colors))
+            [[:cells 0 0 wdt a bits *default-cell-bg*]]
+            (render--cells colors bits wdt a fill))
           (let (visw (max 1 (quot wdt z))
                 vish (max 1 (quot h z))
                 ox (max 0 (min *view-ox* (max 0 (- wdt visw))))
@@ -672,8 +690,9 @@ the renderer's two `[:mouse …]` arities (press carries a 7th click-count eleme
     ;; Resize from the EVENT's cell grid — refit the cached board to it and redraw now.
     ([:resize cols rows]
       (do
-        (def *w* (max *grid-min* (quot cols *cell-aspect*)))
-        (def *h* (max *grid-min* (max 1 (- rows *status-scale*))))
+        (when (not *fixed-board*)
+          (def *w* (max *grid-min* (quot cols *cell-aspect*)))
+          (def *h* (max *grid-min* (max 1 (- rows *status-scale*)))))
         ;; the colour keys encode the OLD width; rekey them to the new width so
         ;; they keep matching the refit board (`nl`) on this draw and on input
         ;; redraws, until the sim resends a correctly-keyed frame.
@@ -705,8 +724,8 @@ a global can invalidate caches, so skip it on the common no-op frame. Returns `[
         nw (max *grid-min* (quot cols *cell-aspect*))  ; board cols = screen cols ÷ cell aspect
         nh (max *grid-min* (max 1 (- rows *status-scale*))))
     (do
-      (when (not (= nw *w*)) (def *w* nw))
-      (when (not (= nh *h*)) (def *h* nh))
+      (when (and (not *fixed-board*) (not (= nw *w*))) (def *w* nw))
+      (when (and (not *fixed-board*) (not (= nh *h*))) (def *h* nh))
       [cols rows])))
 
 (defn view-zoom! (dir mx my)
@@ -833,6 +852,29 @@ changes at once."
                 (do (send sim [:set-inject j]) [(assoc ui :inject j) true]))
     :else [ui false]))
 
+(defn env-board ()
+  "Parse `LIFE_BOARD` (\"WxH\" or a single \"N\" for a square) into `[w h]`, or nil when unset —
+the fair-comparison board pin shared with the .NET port."
+  (let (s (getenv "LIFE_BOARD"))
+    (if (or (nil? s) (= s ""))
+      nil
+      (let (parts (string-split s "x"))
+        (if (= (count parts) 2)
+          [(string->number (first parts)) (string->number (second parts))]
+          (let (n (string->number s)) [n n]))))))
+
+(defn env-int (name dflt)
+  "Read integer env var `name`, or `dflt` when unset/empty."
+  (let (s (getenv name)) (if (or (nil? s) (= s "")) dflt (string->number s))))
+
+(defn seed-block (w h n)
+  "A `w`×`h` board with a centred solid `n`×`n` block of live cells — the deterministic
+fair-comparison start (identical to the .NET port's `--block` seed)."
+  (let (pat (mapcat (fn (dy) (map (fn (dx) [dx dy]) (range n))) (range n))
+        cx (quot (- w n) 2)
+        cy (quot (- h n) 2))
+    (bitboard/place (bitboard/make w h) pat cx cy)))
+
 (defn run-life ()
   "Wire up the two actors and become the RENDERER. The SIM owns the board and paces ITSELF
 with a self-resetting `(after)` timer that input preempts (so pastes are instant); this
@@ -841,9 +883,16 @@ render-only *view-zoom* camera (the board is unchanged)."
   (let (w (gui-open "Brood Life" 1920 1200)  ; title + a big (screen-filling) window
         _ (gui-icon! w (icon-rgba) *icon-size* *icon-size*)  ; the taskbar/title-bar glider icon
         _ (gui-font! w {:family :mono :height *board-height*})  ; the FIXED window font (board only)
-        _ (grid-fit w)  ; sizes *w*/*h* before we build the board
+        ;; FAIR-COMPARISON pin: if LIFE_BOARD is set, lock *w*/*h* to it (so grid-fit / resize
+        ;; leave them alone); else size to the window as usual.
+        fb (env-board)
+        _ (def *fixed-board* fb)
+        _ (if fb (do (def *w* (first fb)) (def *h* (second fb))) (grid-fit w))
+        blk (env-int "LIFE_BLOCK" 0)  ; seed a centred solid blk×blk block (0 = the normal empty start)
+        fps (env-int "LIFE_FPS" *target-fps*)  ; starting fps cap (0 = uncapped)
+        inj (if (> blk 0) 0 *inject-secs*)  ; block seed ⇒ deterministic: no auto-inject
         start (now-ns)
-        board (bitboard/make *w* *h*)  ; START EMPTY — clicks add random shapes
+        board (if (> blk 0) (seed-block *w* *h* blk) (bitboard/make *w* *h*))  ; START EMPTY unless seeded
         me (self)  ; this root process is the renderer
         logger (perflog/log-start *log-path*)
         ;; the SIM's whole state in ONE map (see `sim-step`) — the PRNG seed is the start
@@ -857,10 +906,10 @@ render-only *view-zoom* camera (the board is unchanged)."
                               :prev start
                               :held nil
                               :hn 0
-                              :inject *inject-secs*
+                              :inject inj
                               :last-inj start
                               :st ""
-                              :cap *target-fps*
+                              :cap fps
                               :colors {}
                               :next-id 0})))
     ;; the renderer keeps a LOCAL mirror of cap/inject (for instant button labels) + drag state,
@@ -869,8 +918,8 @@ render-only *view-zoom* camera (the board is unchanged)."
       sim
       board
       ""
-      {:cap *target-fps*
-       :inject *inject-secs*
+      {:cap fps
+       :inject inj
        :drag nil
        :dcol 0
        :moved false
