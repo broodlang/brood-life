@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Spin up a particular implementation of the Life demo.
+#
+#   ./run                 # the Brood original (default)
+#   ./run brood [args]    # the Brood original — nest run
+#   ./run dotnet [args]   # the .NET port — ports/dotnet/Life
+#
+# Any extra args pass straight through, so the bounded-run flag works on either:
+#   ./run brood  --for 2s
+#   ./run dotnet --for 2s
+#   ./run dotnet -- --selftest
+#
+# --fair starts EITHER engine from an identical setup for a head-to-head: a fixed
+# 256x256 board seeded with a centred 100x100 block, uncapped. Both then evolve
+# cell-for-cell the same, so the only difference you see is engine/render speed.
+#   ./run brood  --fair
+#   ./run dotnet --fair
+# Override any knob via the env vars it sets: LIFE_BOARD=WxH LIFE_BLOCK=N LIFE_FPS=N.
+
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+target="${1:-brood}"
+[ $# -gt 0 ] && shift || true
+
+# Intercept --fair: export the shared comparison config, drop it from the args.
+fair_args=()
+for a in "$@"; do
+  if [ "$a" = "--fair" ]; then
+    export LIFE_BOARD="${LIFE_BOARD:-256x256}"
+    export LIFE_BLOCK="${LIFE_BLOCK:-100}"
+    export LIFE_FPS="${LIFE_FPS:-0}"
+  else
+    fair_args+=("$a")
+  fi
+done
+set -- "${fair_args[@]+"${fair_args[@]}"}"
+
+case "$target" in
+  brood)
+    cd "$here"
+    exec nest run "$@"
+    ;;
+  dotnet|net|.net)
+    cd "$here/ports/dotnet/Life"
+    exec dotnet run -c Release "$@"
+    ;;
+  -h|--help|help)
+    awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}"
+    ;;
+  *)
+    echo "run: unknown target '$target' (try: brood, dotnet, or --help)" >&2
+    exit 2
+    ;;
+esac
