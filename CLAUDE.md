@@ -2,11 +2,13 @@
 
 Conway's Game of Life on a wrapping torus, animated in a native GUI window.
 Written in Brood (`.blsp`). The architecture is two processes (ADR-058): a
-**SIM** (owns the model, steps it, formats/logs, and paces itself with a
-self-resetting `(after)` timer that input preempts — the ADR-101 timer
-mechanism), and the **RENDERER** (the root process, which owns the window and
-composites). The sim steps the board serially. See `README.md` for the design
-notes and `src/` layout.
+**SIM** (owns the model, steps it, recolours it, BUILDS the frame's render ops,
+and paces itself with a self-resetting `(after)` timer that input preempts — the
+ADR-101 timer mechanism), and the **RENDERER** (the root process, which owns the
+window and just BLITS the SIM's ops — op-building lives on the SIM because the
+root process is ~2× slower at compute; the renderer re-renders locally only for
+instant input feedback). The sim's per-frame work is serial. See `README.md` for
+the design notes and `src/` layout.
 
 Conventions worth knowing here:
 

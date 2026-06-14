@@ -74,13 +74,16 @@ nest format         # format the source
   the `bit-positions` builtin (O(live)) and emits one draw op each over a leading `clear`.
   Relies on the kernel's bignums + unrestricted shifts + `bit-positions`.
 - The program is **two processes** (ADR-058): a **SIM** owns the model, steps it,
-  formats the status line, writes the perf log, and pushes each board to the
-  renderer; the **RENDERER** (the root process) owns the window and is a thin
-  compositor.
-- The SIM steps the board **serially** — `step` is the bulk of the CPU, and on
-  these board sizes a serial recompute beats the copy-on-send overhead of fanning
-  it across processes.
-- The SIM **paces ITSELF to a frame-rate cap** (`*target-fps*`, default 10, live-adjustable
+  recolours it, **builds the frame's render ops**, formats the status line, writes
+  the perf log, and pushes each frame to the renderer; the **RENDERER** (the root
+  process) owns the window and is a thin compositor — it **blits** the SIM's ops,
+  re-rendering locally only for instant input feedback and resizes.
+- All per-frame work — `step`, `recolor`, and op-building — runs **serially on the
+  SIM**, which is a spawned process (~2× faster at compute than the root, so
+  op-building lives here rather than on the root renderer). The per-cell colour
+  blend is cheap enough that fanning it across worker processes lost to the
+  cross-process copy overhead — tried and reverted; serial on the SIM wins.
+- The SIM **paces ITSELF to a frame-rate cap** (`*target-fps*`, default uncapped, live-adjustable
   with `-`/`=`): its `receive` parks on an `(after period)` timeout — a self-resetting timer
   (the same mechanism as ADR-101's `ui-run` timers) whose `period` subtracts the work already
   spent, so the cap is a true target. Any input message **preempts** the timeout, so a paste
