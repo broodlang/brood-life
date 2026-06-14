@@ -277,7 +277,9 @@ public sealed class Sim
         // bytes, whose managed-runtime analogue is GC.GetTotalMemory(false).
         long fps = 1000 / Math.Max(1, perMs);
         long mb = GC.GetTotalMemory(false) / 1048576;
-        string status = $"gen {_gen} · {fps} fps · {ops.Count} cells · {mb} MB";
+        // Fixed-width fields so the line never reflows as digit counts change (the renderer
+        // draws it in a fixed-pitch grid). Same shape + widths as Brood's `status`.
+        string status = $"gen {_gen,7} · {fps,4} fps · {ops.Count,6} cells · {mb,4} MB";
 
         await _frames.WriteAsync(new Frame(ops.ToArray(), _board.W, _board.H, status));
     }

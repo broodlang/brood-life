@@ -377,15 +377,16 @@ width, so the CLEAR key can sit at the bottom-RIGHT (the spawn/fps keys lead at 
 ;; prepended by the renderer (`footer-ops`), not here. (No GC field: `gc-stats` is dev-only.)
 (defn status (gen cells per)
   "The info fields of the bottom strip from one generation's measurement (`per` = ns since
-the previous frame). The renderer composes this after the buttons."
+the previous frame). The renderer composes this after the buttons. Each number is padded to a
+FIXED width so the line never reflows as digit counts change (the bar is a monospace grid)."
   (str "gen "
-    gen
+    (pad-left (str gen) 7)
     " · "
-    (quot 1000 (max 1 (quot per 1000000)))
+    (pad-left (str (quot 1000 (max 1 (quot per 1000000)))) 4)
     " fps · "
-    cells
+    (pad-left (str cells) 6)
     " cells · "
-    (quot (mem-bytes) 1048576)
+    (pad-left (str (quot (mem-bytes) 1048576)) 4)
     " MB"))
 
 ;; The bottom bar as render ops: a full-width reverse `bar` holding the INFO (shifted past

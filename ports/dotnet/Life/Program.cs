@@ -67,6 +67,16 @@ Raylib.MaximizeWindow();
 // and the SIM (bounded only by the per-frame ack) runs flat out — the "faster is better" test.
 Raylib.SetTargetFPS(targetFps > 0 ? Math.Max(targetFps, 120) : 0);
 
+// Draw a string in a FIXED-PITCH grid (cell = widest glyph + 1px), so the status line never
+// reflows as the gen/fps/cells/MB digit widths change — Brood renders its footer in a
+// monospace grid for exactly this reason. Spaces are skipped (they just advance the cursor).
+int monoPitch = Raylib.MeasureText("M", 24) + 1;
+void DrawMono(string s, int x, int y, int size, Color c)
+{
+    for (int i = 0; i < s.Length; i++)
+        if (s[i] != ' ') Raylib.DrawText(s[i].ToString(), x + i * monoPitch, y, size, c);
+}
+
 Frame? latest = null;
 bool leftDown = false, rightDown = false;
 var clock = System.Diagnostics.Stopwatch.StartNew();
@@ -122,7 +132,7 @@ while (!Raylib.WindowShouldClose())
 
         int fy = windowH - footerPx;
         Raylib.DrawRectangle(0, fy, windowW, footerPx, new Color(24, 24, 30, 255));
-        Raylib.DrawText(frame.Status, 14, fy + 12, 24, new Color(220, 220, 230, 255));
+        DrawMono(frame.Status, 14, fy + 12, 24, new Color(220, 220, 230, 255));
         Raylib.DrawText("L-drag: shapes   R-drag: guns   scroll: zoom   -/=: fps   [ ]: spawn   q: quit",
             14, fy + 38, 14, new Color(120, 120, 140, 255));
     }
