@@ -60,7 +60,7 @@ this RENDERER that draws + handles input."
 (def *fps-min* 1)
 (def *fps-max* 120)
 (def *fps-step* 5)  ; fps per `-`/`=` press
-(def *board-height* 4)  ; the FIXED window cell-font px (set once) — the board "canvas" cell SIZE.
+(def *board-height* 2)  ; the FIXED window cell-font px (set once) — the board "canvas" cell SIZE.
 ;; Smaller ⇒ smaller blocks ⇒ MORE cells in the same window (a bigger X×Y board); larger ⇒
 ;; chunkier blocks, fewer cells. This is the knob for board "dimensions" — the window size
 ;; stays put. More cells is heavier to draw once they're live, so trade it against framerate.
@@ -461,14 +461,13 @@ copied again to append the bar."
     (into [(clear)]
       (concat
         (if (= z 1)
-          ;; FAST PATH: with no per-cell spawn colours, blit the WHOLE bitboard as one
-          ;; native `[:cells]` op — the kernel enumerates the set bits and fills each cell
-          ;; (O(live), in Rust), so the Brood side emits ONE op instead of one per cell.
-          ;; With a live colour layer, fall back to the per-cell `[:text]` builder (the op
-          ;; carries a single colour, so the gradient still needs the slow path).
+          ;; Blit the WHOLE board as ONE native op — the kernel enumerates set bits and fills
+          ;; each cell (O(live), in Rust) — instead of one interpreted `[:text]` op per cell
+          ;; (which was ~110 ms / 10K cells). Uncoloured (or flat): a single-colour `[:cells]`.
+          ;; Coloured: `[:cells-rgb]`, each cell taking its spawn colour from the `colors` map.
           (if (or *flat-render* (= 0 (count colors)))
             [[:cells 0 0 wdt a bits *default-cell-bg*]]
-            (render--cells colors bits wdt a fill))
+            [[:cells-rgb 0 0 wdt a bits colors *default-cell-bg*]])
           (let (visw (max 1 (quot wdt z))
                 vish (max 1 (quot h z))
                 ox (max 0 (min *view-ox* (max 0 (- wdt visw))))

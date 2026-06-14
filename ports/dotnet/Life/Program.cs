@@ -3,7 +3,7 @@ using Life;
 using Raylib_cs;
 
 // ── tuning knobs (the Brood `*globals*`) ──────────────────────────────────────
-int cellPx = 3;            // board cell size in pixels; scroll wheel zooms it (ADR: footer fixed)
+int cellPx = 2;            // board cell size in pixels; scroll wheel zooms it (ADR: footer fixed)
 int footerPx = 60;         // status-bar height, kept fixed as the board scales
 int targetFps = EnvInt("LIFE_FPS", 0);   // 0 == uncapped (rip from frame 1); -/= retune live
 int spawnEvery = 600;      // auto-spawn a random pattern every N generations; [/] retune
@@ -58,8 +58,11 @@ using var cts = new CancellationTokenSource();
 var simTask = Task.Run(() => sim.RunAsync(cts.Token));
 
 // ── the RENDERER (root): owns the window, blits the SIM's ops ──────────────────
-Raylib.SetConfigFlags(ConfigFlags.ResizableWindow);
+// Open MAXIMIZED to match the Brood window — the resize handler below then refits the
+// board to fill it (in window-derived mode). Resizable so the OS can un-maximize.
+Raylib.SetConfigFlags(ConfigFlags.ResizableWindow | ConfigFlags.MaximizedWindow);
 Raylib.InitWindow(windowW, windowH, "Life — .NET port (SIM/RENDERER split)");
+Raylib.MaximizeWindow();
 // the renderer's DISPLAY rate; 0 (uncapped sim) ⇒ no limiter, so it blits as fast as it can
 // and the SIM (bounded only by the per-frame ack) runs flat out — the "faster is better" test.
 Raylib.SetTargetFPS(targetFps > 0 ? Math.Max(targetFps, 120) : 0);

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Numerics;
 using System.Threading.Channels;
 
 namespace Life;
@@ -26,6 +27,18 @@ public sealed class Sim
 
     private BitBoard _board;
     private long _gen;
+
+    // ── spawn-colour layer — a faithful port of life.blsp's `recolor`/`color-spawn`/
+    // `birth-blend`. Keyed by bit index (x + y*W): each SPAWN (click/drag/auto-inject)
+    // takes one fresh hue; a SURVIVOR keeps its colour; a NEWBORN is the channel-average
+    // of its coloured torus neighbours; the DEAD are dropped. Cells with no entry (the
+    // initial seed) render WHITE — exactly Brood's uncoloured `:white` (0xe5).
+    private readonly Dictionary<int, (byte r, byte g, byte b)> _colors = new();
+    private int _nextId;  // next spawn's colour id; hue = id * *spawn-hue-step* (137°) on the wheel
+    private const int SpawnHueStep = 137;   // *spawn-hue-step* — ≈ the golden angle
+    private const double SpawnSat = 0.85;   // *spawn-sat*
+    private const double SpawnVal = 0.95;   // *spawn-val*
+    private static readonly (byte r, byte g, byte b) White = (0xe5, 0xe5, 0xe5);  // :white
 
     public Sim(ChannelReader<InputMsg> input, ChannelWriter<Frame> frames,
         BitBoard initial, int targetFps, int spawnEvery)
@@ -64,7 +77,7 @@ public sealed class Sim
                 {
                     case Quit: return;
                     case Drawn: awaitingAck = false; break;
-                    case Resize(var rw, var rh): _board = _board.Refit(rw, rh); break;
+                    case Resize(var rw, var rh): { int ow = _board.W; _board = _board.Refit(rw, rh); ColorsRefit(ow, rw, rh); break; }
                     case FpsDelta(var d): _targetFps = Math.Clamp(_targetFps + d, 0, 240); break;
                     case SpawnDelta(var d): _spawnEvery = Math.Max(0, _spawnEvery + d * 30); break;
                     case Press(var gun, var c, var r): Drop(gun, c, r); break;
@@ -73,12 +86,14 @@ public sealed class Sim
                 }
             }
 
-            // ── the frame's compute: step, auto-spawn, recolour-and-build-ops ──
+            // ── the frame's compute: step, recolour, auto-spawn, build-ops ──
+            var preStep = _board.Bits;
             _board = _board.Step();
             _gen++;
+            Recolor(preStep, _board.Bits);   // carry the colour layer across the step
 
             if (_spawnEvery > 0 && _gen % _spawnEvery == 0)
-                AutoSpawn();
+                AutoSpawn();                  // a fresh spawn colour on the added cells
 
             // measured fps
             framesThisSecond++;
@@ -137,7 +152,7 @@ public sealed class Sim
     {
         switch (m)
         {
-            case Resize(var rw, var rh): _board = _board.Refit(rw, rh); break;
+            case Resize(var rw, var rh): { int ow = _board.W; _board = _board.Refit(rw, rh); ColorsRefit(ow, rw, rh); break; }
             case FpsDelta(var d): _targetFps = Math.Clamp(_targetFps + d, 0, 240); break;
             case SpawnDelta(var d): _spawnEvery = Math.Max(0, _spawnEvery + d * 30); break;
             case Press(var gun, var c, var r): Drop(gun, c, r); break;
@@ -148,10 +163,12 @@ public sealed class Sim
 
     private void Drop(bool gun, int col, int row)
     {
+        var old = _board.Bits;
         if (gun)
             _board = _board.Place(Shapes.GosperGun, col, row);
         else
             _board = _board.Place(Shapes.Random((int)(_gen + col * 7 + row * 13)), col, row);
+        ColorSpawn(old, _board.Bits);
     }
 
     private void AutoSpawn()
@@ -159,16 +176,106 @@ public sealed class Sim
         int seed = (int)(_gen / Math.Max(1, _spawnEvery));
         int col = Mod(seed * 53, _board.W);
         int row = Mod(seed * 97, _board.H);
+        var old = _board.Bits;
         _board = _board.Place(Shapes.Random(seed), col, row);
+        ColorSpawn(old, _board.Bits);
     }
 
-    // Recolour + build render ops: one op per live cell, hue advancing with generation.
+    // Give every cell a placement turned ON (in `newBits`, not `oldBits`) the next spawn's
+    // fresh colour, so each spawn is its own hue. A placement only OR-s bits in, so the added
+    // cells are exactly new XOR old. (life.blsp `color-spawn`.)
+    private void ColorSpawn(BigInteger oldBits, BigInteger newBits)
+    {
+        var added = newBits ^ oldBits;
+        if (added.IsZero) return;
+        var rgb = SpawnRgb(_nextId++);
+        foreach (int i in Positions(added)) _colors[i] = rgb;
+    }
+
+    // Carry the colour layer across ONE generation (life.blsp `recolor`): a SURVIVOR (live
+    // both gens) keeps its colour; a DEAD cell (old & ~new) is dropped; a NEWBORN (new & ~old)
+    // takes the blend of its parents. Births read the PRE-STEP colours — the dead were live
+    // last gen, so they're valid parents — and don't see each other, so blend ALL births
+    // first, THEN drop the dead, THEN write the births.
+    private void Recolor(BigInteger oldBits, BigInteger newBits)
+    {
+        var surv = oldBits & newBits;
+        var bornBits = newBits ^ surv;   // new & ~old
+        var deadBits = oldBits ^ surv;   // old & ~new
+        if (bornBits.IsZero && deadBits.IsZero) return;
+
+        var births = new List<(int i, (byte, byte, byte) rgb)>();
+        foreach (int i in Positions(bornBits))
+            if (BirthBlend(i) is { } rgb) births.Add((i, rgb));
+        foreach (int i in Positions(deadBits)) _colors.Remove(i);
+        foreach (var (i, rgb) in births) _colors[i] = rgb;
+    }
+
+    // The colour a NEWBORN at index `i` takes: the channel-average (integer division, like
+    // Brood's `quot`) of its 8 torus neighbours that carry a colour — its live parents. null
+    // if none is coloured, so a colourless cell stays absent. (life.blsp `birth-blend`.)
+    private (byte, byte, byte)? BirthBlend(int i)
+    {
+        int w = _board.W, h = _board.H;
+        int x = i % w, y = i / w;
+        int rn = Mod(y - 1, h) * w, rc = y * w, rs = Mod(y + 1, h) * w;
+        int cl = Mod(x - 1, w), cr = Mod(x + 1, w);
+        int sr = 0, sg = 0, sb = 0, n = 0;
+        void Add(int j) { if (_colors.TryGetValue(j, out var c)) { sr += c.r; sg += c.g; sb += c.b; n++; } }
+        Add(rn + cl); Add(rn + x); Add(rn + cr);
+        Add(rc + cl); /*    self */ Add(rc + cr);
+        Add(rs + cl); Add(rs + x); Add(rs + cr);
+        if (n == 0) return null;
+        return ((byte)(sr / n), (byte)(sg / n), (byte)(sb / n));
+    }
+
+    // Rekey the colour layer when the board is refit to a new width/height, dropping cells
+    // that fall outside — the colour twin of BitBoard.Refit. (life.blsp `colors-refit`.)
+    private void ColorsRefit(int oldW, int newW, int newH)
+    {
+        if (_colors.Count == 0) return;
+        var rekeyed = new Dictionary<int, (byte, byte, byte)>(_colors.Count);
+        foreach (var (i, rgb) in _colors)
+        {
+            int x = i % oldW, y = i / oldW;
+            if (x < newW && y < newH) rekeyed[x + y * newW] = rgb;
+        }
+        _colors.Clear();
+        foreach (var (k, v) in rekeyed) _colors[k] = v;
+    }
+
+    // The vivid [r g b] for spawn `id`: hue walks the wheel by SpawnHueStep° per spawn, so
+    // consecutive spawns land far apart — a big range of distinct colours. (life.blsp `spawn-rgb`.)
+    private static (byte r, byte g, byte b) SpawnRgb(int id) =>
+        HsvRound(Mod(id * SpawnHueStep, 360) / 360.0, SpawnSat, SpawnVal);
+
+    // The set-bit INDICES of a bitfield, by a single byte scan (cf. BitBoard.Cells). The board
+    // fields are non-negative, so ToByteArray gives a clean little-endian magnitude.
+    private static IEnumerable<int> Positions(BigInteger bits)
+    {
+        byte[] bytes = bits.ToByteArray();
+        for (int bi = 0; bi < bytes.Length; bi++)
+        {
+            int by = bytes[bi];
+            if (by == 0) continue;
+            int baseBit = bi * 8;
+            while (by != 0)
+            {
+                yield return baseBit + System.Numerics.BitOperations.TrailingZeroCount(by);
+                by &= by - 1;
+            }
+        }
+    }
+
+    // Build render ops: one op per live cell, each cell its OWN spawn-blend colour from the
+    // colour layer (uncoloured cells render white). The recolour itself happened in `Recolor`.
     private async Task Emit(double measuredFps)
     {
         var ops = new List<RenderOp>(_board.LiveCount());
+        int w = _board.W;
         foreach (var (x, y) in _board.Cells())
         {
-            var (r, g, b) = Hsv(((x + y + _gen) % 360 + 360) % 360 / 360.0, 0.75, 1.0);
+            var (r, g, b) = _colors.TryGetValue(x + y * w, out var c) ? c : White;
             ops.Add(new RenderOp(x, y, r, g, b));
         }
 
@@ -181,12 +288,16 @@ public sealed class Sim
 
     private static int Mod(int a, int n) => ((a % n) + n) % n;
 
-    private static (byte, byte, byte) Hsv(double h, double s, double v)
+    // HSV (h 0–1, s/v 0–1) → [r g b] bytes. A faithful port of life.blsp `hsv->rgb`: the same
+    // sextant conversion, and Brood's `round` (half AWAY from zero), NOT a truncating cast — so
+    // a spawn's colour is bit-identical on both engines.
+    private static (byte, byte, byte) HsvRound(double h, double s, double v)
     {
-        double i = Math.Floor(h * 6);
-        double f = h * 6 - i;
-        double p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
-        (double r, double g, double b) = ((int)i % 6) switch
+        double hp = h * 6;
+        int i = (int)Math.Floor(hp);
+        double f = hp - i;
+        double p = v * (1 - s), q = v * (1 - s * f), t = v * (1 - s * (1 - f));
+        (double r, double g, double b) = (i % 6) switch
         {
             0 => (v, t, p),
             1 => (q, v, p),
@@ -195,6 +306,7 @@ public sealed class Sim
             4 => (t, p, v),
             _ => (v, p, q),
         };
-        return ((byte)(r * 255), (byte)(g * 255), (byte)(b * 255));
+        static byte B(double c) => (byte)Math.Round(c * 255, MidpointRounding.AwayFromZero);
+        return (B(r), B(g), B(b));
     }
 }
