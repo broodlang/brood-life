@@ -27,6 +27,11 @@ this RENDERER that draws + handles input."
 (defn bb-live-count (b) (if *use-bitset* (bitboard-bs/live-count b) (bitboard/live-count b)))
 (defn bb-fit (b w h) (if *use-bitset* (bitboard-bs/fit b w h) (bitboard/fit b w h)))
 (defn bb-refit (b w h) (if *use-bitset* (bitboard-bs/refit b w h) (bitboard/refit b w h)))
+;; Raw whole-board bit ops the colour layer + render run directly on `:bits` — dispatched so
+;; coloured play (recolor/color-spawn/render) works on the bitset board too, not just bignum.
+(defn bb-positions (b) (if *use-bitset* (bitset-positions b) (bit-positions b)))
+(defn bb-and (a b) (if *use-bitset* (bitset-and a b) (bit-and a b)))
+(defn bb-xor (a b) (if *use-bitset* (bitset-xor a b) (bit-xor a b)))
 
 (def *w* 120)
 (def *h* 40)
@@ -256,7 +261,7 @@ r, 12-23 g, 24-35 b, plus one count unit in bits 36+ (see the packed-colour sche
 fresh colour, so each spawn is its own colour. Returns `[colors' next-id']`. A placement only
 OR-s bits in, so `new ⊇ old` and the added cells are exactly `new XOR old` — `bit-positions`
 hands them back as the bit INDICES the colour layer keys on, so no decode is needed here."
-  (let (added (bit-positions (bit-xor new-bits old-bits)))
+  (let (added (bb-positions (bb-xor new-bits old-bits)))
     (if (nil? added)
       [colors next-id]
       (let (packed (pack-rgb (spawn-rgb next-id)))
@@ -307,9 +312,9 @@ of the population) measured ~10% faster. (The one behavioural difference from a 
 COLOURLESS live cell stays colourless rather than being blended — can't arise in play: every cell
 descends from a coloured spawn, so colour reaches everywhere. Verified identical to a rebuild over
 150 generations of spawns.)"
-  (let (surv (bit-and old-bits new-bits)
-        born (bit-positions (bit-xor new-bits surv))  ; new & ~old — the births this gen
-        dead (bit-positions (bit-xor old-bits surv))  ; old & ~new — the deaths this gen
+  (let (surv (bb-and old-bits new-bits)
+        born (bb-positions (bb-xor new-bits surv))  ; new & ~old — the births this gen
+        dead (bb-positions (bb-xor old-bits surv))  ; old & ~new — the deaths this gen
         live-colors (reduce (fn (c i) (dissoc c i)) colors dead))
     (reduce (fn (c i)
               ;; only store a colour when the birth actually has a coloured parent — a
@@ -434,7 +439,7 @@ threads `[ops cache]`; output is identical to a per-cell `map` (order preserved 
                                   :else (let (face (assoc *cell-face* :bg (unpack-rgb p)))
                                           [(cons (op-at face) ops) (assoc cache p face)]))))
                       [nil {}]
-                      (bit-positions bits))))))
+                      (bb-positions bits))))))
 
 (defn render (live ui info)
   "A display frame from `live`: the live cells as `:text` ops, then the bottom bar at row
