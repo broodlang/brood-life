@@ -28,6 +28,12 @@ this RENDERER that draws + handles input."
 ;; runs the extra gens as bare steps between draws, so the simulation advances at engine speed
 ;; (gens/sec = steps-per-frame × drawn fps) while the display still paints once per refresh.
 (def *steps-per-frame* 1)
+;; FLAT render (LIFE_FLAT=1): always draw the board as ONE native `[:cells]` op in a single
+;; colour, even when a spawn-colour layer exists — instead of the per-cell `[:text]` ops the
+;; colour gradient needs. The experimental GPU backend (`gui-gpu`) only paints the bulk ops
+;; (`[:cells]`/`[:rect]`), not `[:text]`, so this is what makes interactive play VISIBLE on the
+;; GPU (at the cost of the per-cell colours). On the CPU backend it just renders flat-white.
+(def *flat-render* false)
 ;; The frame-rate cap. 0 = UNCAPPED (go ham — steps as fast as it can draw); a POSITIVE value
 ;; sets the SIM's `(after)` step timer to that period, to slow the sim down enough to watch.
 ;; Starts at *target-fps* below (0 = uncapped); adjustable live with `-`/`=` (slower/faster;
@@ -442,7 +448,7 @@ copied again to append the bar."
           ;; (O(live), in Rust), so the Brood side emits ONE op instead of one per cell.
           ;; With a live colour layer, fall back to the per-cell `[:text]` builder (the op
           ;; carries a single colour, so the gradient still needs the slow path).
-          (if (= 0 (count colors))
+          (if (or *flat-render* (= 0 (count colors)))
             [[:cells 0 0 wdt a bits *default-cell-bg*]]
             (render--cells colors bits wdt a fill))
           (let (visw (max 1 (quot wdt z))
@@ -922,6 +928,7 @@ render-only *view-zoom* camera (the board is unchanged)."
         fb (env-board)
         _ (def *fixed-board* fb)
         _ (def *steps-per-frame* (max 1 (env-int "LIFE_STEPS" 1)))  ; gens per DRAWN frame
+        _ (def *flat-render* (> (env-int "LIFE_FLAT" 0) 0))  ; force the GPU-drawable [:cells] path
         _ (if fb (do (def *w* (first fb)) (def *h* (second fb))) (grid-fit w))
         blk (env-int "LIFE_BLOCK" 0)  ; seed a centred solid blk×blk block (0 = the normal empty start)
         fps (env-int "LIFE_FPS" *target-fps*)  ; starting fps cap (0 = uncapped)
