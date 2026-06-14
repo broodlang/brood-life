@@ -35,6 +35,11 @@ for a in "$@"; do
     # default: the bitset's view-zoom render path isn't ported, and normal coloured play
     # is render-bound so it wouldn't gain.) Override with LIFE_BITSET=0.
     export LIFE_BITSET="${LIFE_BITSET:-1}"
+    # GPU backend, PER-PROCESS (the global nest stays CPU for every other app). Unsynced
+    # present → the drawn frame rate isn't pinned to the monitor refresh. Safe here because
+    # --fair is uncoloured (the board draws via the native [:cells] op; text glyphs aren't
+    # on the GPU yet). Override with BROOD_GUI_GPU=0.
+    export BROOD_GUI_GPU="${BROOD_GUI_GPU:-1}"
   else
     fair_args+=("$a")
   fi
