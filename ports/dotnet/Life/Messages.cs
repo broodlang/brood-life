@@ -9,6 +9,9 @@ public sealed record Release : InputMsg;
 public sealed record Resize(int W, int H) : InputMsg;               // window resize / zoom
 public sealed record FpsDelta(int Step) : InputMsg;                 // -/= : retune the cap
 public sealed record SpawnDelta(int Step) : InputMsg;              // [/] : retune auto-spawn
+public sealed record SetFps(int Cap) : InputMsg;                    // fps button: absolute cap
+public sealed record SetSpawn(int Every) : InputMsg;               // spawn button: absolute interval
+public sealed record Clear : InputMsg;                              // clear button: empty the board
 public sealed record Drawn : InputMsg;                              // renderer's per-frame ack
 public sealed record Quit : InputMsg;
 

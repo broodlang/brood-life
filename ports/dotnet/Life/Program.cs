@@ -3,8 +3,8 @@ using Life;
 using Raylib_cs;
 
 // ── tuning knobs (the Brood `*globals*`) ──────────────────────────────────────
-int cellPx = 2;            // board cell size in pixels; scroll wheel zooms it (ADR: footer fixed)
-int footerPx = 60;         // status-bar height, kept fixed as the board scales
+int cellPx = 2;            // board cell size in pixels (at view zoom 1)
+int footerPx = 72;         // status-bar height (status line + a row of clickable buttons)
 int targetFps = EnvInt("LIFE_FPS", 0);   // 0 == uncapped (rip from frame 1); -/= retune live
 int spawnEvery = 600;      // auto-spawn a random pattern every N generations; [/] retune
 
@@ -81,6 +81,19 @@ Frame? latest = null;
 bool leftDown = false, rightDown = false;
 var clock = System.Diagnostics.Stopwatch.StartNew();
 
+// VIEW (camera) zoom — like Brood: the scroll wheel zooms onto the mouse, the BOARD is
+// unchanged (no refit). z=1 shows the whole board; higher magnifies a panned window.
+int viewZoom = 1, viewOx = 0, viewOy = 0;
+const int zoomMin = 1, zoomMax = 10, zoomStep = 1;
+
+// fps button: a click cycles a preset, a drag scrubs the cap (like Brood's footer key).
+bool fpsDragging = false, fpsMoved = false;
+int fpsDragLastX = 0;
+int[] spawnPresets = { 0, 60, 300, 1800 };   // off → frequent → … (generations, the .NET spawn unit)
+
+// footer button rects, recomputed each frame from the window size.
+Rectangle fpsBtn = default, spawnBtn = default, clearBtn = default;
+
 while (!Raylib.WindowShouldClose())
 {
     if (forMs is long limit && clock.ElapsedMilliseconds >= limit) break;
@@ -91,21 +104,44 @@ while (!Raylib.WindowShouldClose())
     {
         windowW = w; windowH = h;
         toSim.Writer.TryWrite(new Resize(BoardW(), BoardH()));
+        ClampView();
     }
 
-    // scroll-wheel zoom (resize the board cell, refit) — also off when pinned
-    float wheel = Raylib.GetMouseWheelMove();
-    if (!fixedBoard && wheel != 0)
-    {
-        cellPx = Math.Clamp(cellPx + (wheel > 0 ? 1 : -1), 1, 40);
-        toSim.Writer.TryWrite(new Resize(BoardW(), BoardH()));
-    }
-
-    // mouse → press/drag/release, forwarded to the SIM (left = shape, right = gun)
     var mp = Raylib.GetMousePosition();
-    int col = (int)(mp.X / cellPx), row = (int)(mp.Y / cellPx);
-    bool inBoard = row >= 0 && row < BoardH() && col >= 0 && col < BoardW();
 
+    // scroll-wheel → VIEW zoom (camera onto the mouse); the board is UNCHANGED, like Brood.
+    float wheel = Raylib.GetMouseWheelMove();
+    if (wheel != 0) ViewZoom(wheel > 0 ? zoomStep : -zoomStep, (int)mp.X, (int)mp.Y);
+
+    // map the screen pixel THROUGH the view (camera offset + zoom) to a BOARD cell
+    int cw = cellPx * viewZoom;
+    int col = viewOx + (int)(mp.X / cw), row = viewOy + (int)(mp.Y / cw);
+    bool overFooter = mp.Y >= windowH - footerPx;
+    bool inBoard = !overFooter && row >= 0 && row < BoardH() && col >= 0 && col < BoardW();
+
+    // ── clickable footer buttons (like Brood): fps (click cycles / drag scrubs), spawn, clear ──
+    int fyTop = windowH - footerPx;
+    fpsBtn = new Rectangle(14, fyTop + 40, 120, 26);
+    spawnBtn = new Rectangle(142, fyTop + 40, 150, 26);
+    clearBtn = new Rectangle(windowW - 100, fyTop + 40, 86, 26);
+    if (Raylib.IsMouseButtonPressed(MouseButton.Left))
+    {
+        if (PointIn(fpsBtn, mp)) { fpsDragging = true; fpsMoved = false; fpsDragLastX = (int)mp.X; }
+        else if (PointIn(spawnBtn, mp)) { spawnEvery = NextSpawn(spawnEvery); toSim.Writer.TryWrite(new SetSpawn(spawnEvery)); }
+        else if (PointIn(clearBtn, mp)) { toSim.Writer.TryWrite(new Clear()); }
+    }
+    if (fpsDragging && Raylib.IsMouseButtonDown(MouseButton.Left))
+    {
+        int d = ((int)mp.X - fpsDragLastX) / 8;   // 8 px per fps step — drag to scrub the cap
+        if (d != 0) { targetFps = FpsNudge(targetFps, d); toSim.Writer.TryWrite(new SetFps(targetFps)); fpsDragLastX = (int)mp.X; fpsMoved = true; }
+    }
+    if (Raylib.IsMouseButtonReleased(MouseButton.Left) && fpsDragging)
+    {
+        if (!fpsMoved) { targetFps = FpsCycle(targetFps); toSim.Writer.TryWrite(new SetFps(targetFps)); }
+        fpsDragging = false;
+    }
+
+    // board paint: press/drag/release forwarded to the SIM (left = shape, right = gun)
     HandleButton(MouseButton.Left, gun: false, ref leftDown, col, row, inBoard);
     HandleButton(MouseButton.Right, gun: true, ref rightDown, col, row, inBoard);
 
@@ -126,15 +162,23 @@ while (!Raylib.WindowShouldClose())
     Raylib.ClearBackground(new Color(12, 12, 16, 255));
     if (latest is Frame frame)
     {
+        // blit each live cell THROUGH the view: offset by the pan, scaled by the zoom, and
+        // clipped to the board viewport above the footer (the footer is painted over the top).
+        int cwR = cellPx * viewZoom;
+        int boardBottom = windowH - footerPx;
         foreach (var op in frame.Ops)
-            Raylib.DrawRectangle(op.X * cellPx, op.Y * cellPx, cellPx, cellPx,
-                new Color(op.R, op.G, op.B, (byte)255));
+        {
+            int rx = (op.X - viewOx) * cwR, ry = (op.Y - viewOy) * cwR;
+            if (rx < 0 || ry < 0 || rx >= windowW || ry >= boardBottom) continue;
+            Raylib.DrawRectangle(rx, ry, cwR, cwR, new Color(op.R, op.G, op.B, (byte)255));
+        }
 
         int fy = windowH - footerPx;
         Raylib.DrawRectangle(0, fy, windowW, footerPx, new Color(24, 24, 30, 255));
-        DrawMono(frame.Status, 14, fy + 12, 24, new Color(220, 220, 230, 255));
-        Raylib.DrawText("L-drag: shapes   R-drag: guns   scroll: zoom   -/=: fps   [ ]: spawn   q: quit",
-            14, fy + 38, 14, new Color(120, 120, 140, 255));
+        DrawMono(frame.Status, 14, fy + 8, 24, new Color(220, 220, 230, 255));
+        DrawButton(fpsBtn, $"fps {(targetFps == 0 ? "max" : targetFps.ToString())}", fpsDragging);
+        DrawButton(spawnBtn, $"spawn {(spawnEvery == 0 ? "off" : spawnEvery + "g")}", false);
+        DrawButton(clearBtn, "clear", false);
     }
     Raylib.EndDrawing();
 }
@@ -146,6 +190,57 @@ try { await simTask; } catch (OperationCanceledException) { }
 Raylib.CloseWindow();
 if (latest is Frame last) Console.WriteLine($"[.NET] {last.Status}");
 return 0;
+
+// VIEW zoom by `dir` (+in), clamped to [zoomMin, zoomMax]; keep the board cell under the
+// mouse fixed by panning, then clamp the pan so the magnified window stays in-board. Port of
+// Brood's `view-zoom!` (cells are square here, so no *cell-aspect* factor).
+void ViewZoom(int dir, int mx, int my)
+{
+    int z = viewZoom, z2 = Math.Clamp(z + dir, zoomMin, zoomMax);
+    int bx = viewOx + mx / (cellPx * z), by = viewOy + my / (cellPx * z);   // board cell under mouse
+    int ox = bx - mx / (cellPx * z2), oy = by - my / (cellPx * z2);          // keep it there at z2
+    int bw = BoardW(), bh = BoardH();
+    viewZoom = z2;
+    viewOx = Math.Clamp(ox, 0, Math.Max(0, bw - bw / z2));
+    viewOy = Math.Clamp(oy, 0, Math.Max(0, bh - bh / z2));
+}
+
+// Re-clamp the pan to the (possibly resized) board, keeping the zoom.
+void ClampView()
+{
+    int bw = BoardW(), bh = BoardH();
+    viewOx = Math.Clamp(viewOx, 0, Math.Max(0, bw - bw / viewZoom));
+    viewOy = Math.Clamp(viewOy, 0, Math.Max(0, bh - bh / viewZoom));
+}
+
+static bool PointIn(Rectangle r, System.Numerics.Vector2 p) =>
+    p.X >= r.X && p.X < r.X + r.Width && p.Y >= r.Y && p.Y < r.Y + r.Height;
+
+// fps button click: uncapped → 30 → 10 → 1 → uncapped (Brood `fps-cycle`).
+static int FpsCycle(int cap) => cap == 0 ? 30 : cap > 10 ? 10 : cap > 1 ? 1 : 0;
+
+// fps drag: move the cap by `d`, with 0 acting as just past the max so + wraps back to
+// uncapped (Brood `fps-nudge`; *fps-max* 120, *fps-min* 1).
+static int FpsNudge(int cap, int d)
+{
+    int baseV = cap == 0 ? 121 : cap, f = baseV + d;
+    return f > 120 ? 0 : Math.Max(1, f);
+}
+
+// spawn button: cycle the auto-spawn interval through the presets, wrapping (off → … → off).
+int NextSpawn(int every)
+{
+    int i = Array.IndexOf(spawnPresets, every);
+    return spawnPresets[(i < 0 ? 0 : i + 1) % spawnPresets.Length];
+}
+
+// A light raised footer key with dark text — Brood's *btn-face* {:bg :white :fg :black}.
+void DrawButton(Rectangle r, string label, bool active)
+{
+    Raylib.DrawRectangleRec(r, active ? new Color(238, 238, 238, 255) : new Color(200, 200, 206, 255));
+    Raylib.DrawRectangleLinesEx(r, 1, new Color(90, 90, 100, 255));
+    Raylib.DrawText(label, (int)r.X + 8, (int)r.Y + 5, 16, new Color(18, 18, 22, 255));
+}
 
 void HandleButton(MouseButton btn, bool gun, ref bool down, int col, int row, bool inBoard)
 {

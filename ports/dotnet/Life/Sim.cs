@@ -78,6 +78,9 @@ public sealed class Sim
                     case Resize(var rw, var rh): { int ow = _board.W; _board = _board.Refit(rw, rh); ColorsRefit(ow, rw, rh); break; }
                     case FpsDelta(var d): _targetFps = Math.Clamp(_targetFps + d, 0, 240); break;
                     case SpawnDelta(var d): _spawnEvery = Math.Max(0, _spawnEvery + d * 30); break;
+                    case SetFps(var cap): _targetFps = Math.Clamp(cap, 0, 240); break;
+                    case SetSpawn(var every): _spawnEvery = Math.Max(0, every); break;
+                    case Clear: _board = BitBoard.Make(_board.W, _board.H); _colors.Clear(); break;
                     case Press(var gun, var c, var r): Drop(gun, c, r); break;
                     case Drag(var gun, var c, var r): Drop(gun, c, r); break;  // freehand
                     case Release: break;
@@ -147,6 +150,9 @@ public sealed class Sim
             case Resize(var rw, var rh): { int ow = _board.W; _board = _board.Refit(rw, rh); ColorsRefit(ow, rw, rh); break; }
             case FpsDelta(var d): _targetFps = Math.Clamp(_targetFps + d, 0, 240); break;
             case SpawnDelta(var d): _spawnEvery = Math.Max(0, _spawnEvery + d * 30); break;
+            case SetFps(var cap): _targetFps = Math.Clamp(cap, 0, 240); break;
+            case SetSpawn(var every): _spawnEvery = Math.Max(0, every); break;
+            case Clear: _board = BitBoard.Make(_board.W, _board.H); _colors.Clear(); break;
             case Press(var gun, var c, var r): Drop(gun, c, r); break;
             case Drag(var gun, var c, var r): Drop(gun, c, r); break;
             case Release: break;
