@@ -22,6 +22,12 @@ this RENDERER that draws + handles input."
 ;; window — and `LIFE_BLOCK=N` seeds a centred solid N×N block (and disables auto-inject), so
 ;; this port and the .NET one evolve cell-for-cell IDENTICALLY and only the engine speed differs.
 (def *fixed-board* nil)  ; [w h] when pinned via LIFE_BOARD, else nil (window-derived sizing)
+;; Generations advanced per DRAWN frame (LIFE_STEPS, default 1). The renderer's present is
+;; throttled to the monitor refresh (vsync), and the SIM waits for its `[:drawn]` ack, so at
+;; 1 gen/frame the whole sim is pinned to ~refresh Hz no matter how fast the engine is. >1
+;; runs the extra gens as bare steps between draws, so the simulation advances at engine speed
+;; (gens/sec = steps-per-frame × drawn fps) while the display still paints once per refresh.
+(def *steps-per-frame* 1)
 ;; The frame-rate cap. 0 = UNCAPPED (go ham — steps as fast as it can draw); a POSITIVE value
 ;; sets the SIM's `(after)` step timer to that period, to slow the sim down enough to watch.
 ;; Starts at *target-fps* below (0 = uncapped); adjustable live with `-`/`=` (slower/faster;
@@ -523,7 +529,12 @@ cell samples a glider gun (`*shooters*`, right button), any other kind samples a
 (`*w*`/`*h*`, set by the renderer), fold in the held-cell auto-repeat + the wall-clock
 auto-inject, step, DRAW it, and recurse. No clock to ack — the SIM paces itself. The held-cell
 repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag already drew)."
-  (let (ob (get m :board)
+  (let (sp *steps-per-frame*
+        ;; Turbo: advance (sp-1) EXTRA bare generations before the drawn one, so the sim runs
+        ;; at engine speed instead of being pinned to the renderer's vsync rate. The extra gens
+        ;; are plain board steps (no inject/held/colour) — for the uncoloured throughput bench;
+        ;; at the default sp=1 this is a no-op (an empty `reduce`).
+        ob (reduce (fn (b _) (bitboard/step b)) (bitboard/fit (get m :board) *w* *h*) (range (- sp 1)))
         board (bitboard/fit ob *w* *h*)
         w (get board :w)
         h (get board :h)
@@ -549,12 +560,17 @@ repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag 
         [c2 n2] (if inj? (color-spawn c1 n1 (get b1 :bits) (get b2 :bits)) [c1 n1])
         last-inj2 (if inj? now (get m :last-inj))
         nxt (bitboard/step b2)
-        c3 (recolor c2 (get b2 :bits) (get nxt :bits) w h)
+        ;; Skip the per-birth colour blend entirely when no spawn colour is in play:
+        ;; with `c2` empty every birth blends to nil and every death dissocs nothing, so
+        ;; recolor is guaranteed to return the empty map — pure wasted work (the per-birth
+        ;; `birth-blend` over the churn is the frame's biggest remaining cost). An
+        ;; uncoloured board (the fair benchmark, a fresh board) now pays nothing here.
+        c3 (if (= 0 (count c2)) c2 (recolor c2 (get b2 :bits) (get nxt :bits) w h))
         cells (bitboard/live-count nxt)
-        gen (get m :gen)
+        gen (+ (get m :gen) (- sp 1))  ; the (sp-1) bare steps already advanced the generation
         st2 (status gen cells per))
     (do
-      (when (= 0 (mod gen *log-every*)) (perflog/log-line (get m :logger) (log-fmt gen cells per)))
+      (when (< (mod gen *log-every*) sp) (perflog/log-line (get m :logger) (log-fmt gen cells per)))
       (if (= :stop (sim-draw m nxt st2 c3))
         (perflog/log-stop (get m :logger))
         (sim-loop (assoc m
@@ -887,6 +903,7 @@ render-only *view-zoom* camera (the board is unchanged)."
         ;; leave them alone); else size to the window as usual.
         fb (env-board)
         _ (def *fixed-board* fb)
+        _ (def *steps-per-frame* (max 1 (env-int "LIFE_STEPS" 1)))  ; gens per DRAWN frame
         _ (if fb (do (def *w* (first fb)) (def *h* (second fb))) (grid-fit w))
         blk (env-int "LIFE_BLOCK" 0)  ; seed a centred solid blk×blk block (0 = the normal empty start)
         fps (env-int "LIFE_FPS" *target-fps*)  ; starting fps cap (0 = uncapped)
