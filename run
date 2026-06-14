@@ -30,6 +30,11 @@ for a in "$@"; do
     export LIFE_BOARD="${LIFE_BOARD:-256x256}"
     export LIFE_BLOCK="${LIFE_BLOCK:-100}"
     export LIFE_FPS="${LIFE_FPS:-0}"
+    # The fair benchmark is uncoloured + no-zoom — exactly where the refc-shared bitset
+    # board is a pure win (~5.7× the gen-rate), so default it on here. (Not a global
+    # default: the bitset's view-zoom render path isn't ported, and normal coloured play
+    # is render-bound so it wouldn't gain.) Override with LIFE_BITSET=0.
+    export LIFE_BITSET="${LIFE_BITSET:-1}"
   else
     fair_args+=("$a")
   fi
