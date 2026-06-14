@@ -503,9 +503,16 @@ BLITS the ops (no per-frame render on the slow root), while keeping board/colour
 locally on input. Sending the ops costs ~one colour-map copy more, far less than the render it
 moves off the root. Wait for the `[:drawn]` ack (bounds the renderer's mailbox to one frame).
 Returns `:ok`, or `:stop` if torn down while waiting."
-  (let (ops (render board {:colors colors :cap (get m :cap) :inject (get m :inject)} st))
+  (let (ops (render board {:colors colors :cap (get m :cap) :inject (get m :inject)} st)
+        ;; Send the renderer a SLIM board — just dims + the live bits — NOT the full record.
+        ;; The torus masks (`:board`/`:col0`/`:high`, each a whole-grid-sized bignum) are only
+        ;; used by `step`, on the SIM; copying them across the process boundary every frame was
+        ;; the dominant per-frame cost (O(board bits) — it pinned a 512² board to ~16 fps even
+        ;; empty). `bitboard/fit`/`render` on the renderer read only `:w`/`:h`/`:bits`, and a
+        ;; resize rebuilds the masks via `make`, so the slim board is sufficient there.
+        slim {:w (get board :w) :h (get board :h) :bits (get board :bits)})
     (do
-      (send (get m :renderer) [:board board st colors ops])
+      (send (get m :renderer) [:board slim st colors ops])
       (receive ([:drawn] :ok) (:stop :stop) (after 2000 :ok)))))
 
 (defn apply-clicks (board clicks s)
