@@ -504,13 +504,17 @@ locally on input. Sending the ops costs ~one colour-map copy more, far less than
 moves off the root. Wait for the `[:drawn]` ack (bounds the renderer's mailbox to one frame).
 Returns `:ok`, or `:stop` if torn down while waiting."
   (let (ops (render board {:colors colors :cap (get m :cap) :inject (get m :inject)} st)
-        ;; Send the renderer a SLIM board — just dims + the live bits — NOT the full record.
-        ;; The torus masks (`:board`/`:col0`/`:high`, each a whole-grid-sized bignum) are only
-        ;; used by `step`, on the SIM; copying them across the process boundary every frame was
-        ;; the dominant per-frame cost (O(board bits) — it pinned a 512² board to ~16 fps even
-        ;; empty). `bitboard/fit`/`render` on the renderer read only `:w`/`:h`/`:bits`, and a
-        ;; resize rebuilds the masks via `make`, so the slim board is sufficient there.
-        slim {:w (get board :w) :h (get board :h) :bits (get board :bits)})
+        ;; Send the renderer a SLIM board — NOT the full record. The torus masks
+        ;; (`:board`/`:col0`/`:high`, each a whole-grid-sized bignum) are only used by `step`,
+        ;; on the SIM; copying them across the process boundary every frame was the dominant
+        ;; per-frame cost (O(board bits) — it pinned a 512² board to ~16 fps even empty).
+        ;; In the uncoloured fast path the live `:bits` already ride along inside the `[:cells]`
+        ;; op, so we OMIT them here too and the renderer recovers them from the op (`cells-bits`)
+        ;; — one fewer whole-board copy per frame. With a colour layer the ops are per-cell
+        ;; `[:text]` with no single bitboard, so `:bits` stay on the slim board.
+        slim (if (= 0 (count colors))
+               {:w (get board :w) :h (get board :h)}
+               {:w (get board :w) :h (get board :h) :bits (get board :bits)}))
     (do
       (send (get m :renderer) [:board slim st colors ops])
       (receive ([:drawn] :ok) (:stop :stop) (after 2000 :ok)))))
@@ -678,6 +682,13 @@ the renderer's two `[:mouse …]` arities (press carries a 7th click-count eleme
       (when rd (draw! w board info ui2))
       (render-loop w sim board info ui2))))
 
+(defn cells-bits (ops)
+  "The live bitboard carried by the `[:cells]` op in `ops` (the uncoloured fast path), or nil
+when there isn't one. Lets the renderer recover the board's bits without the SIM sending them
+a second time alongside the op."
+  (reduce (fn (acc o) (if (and (nil? acc) (vector? o) (= (first o) :cells)) (vector-ref o 5) acc))
+    nil ops))
+
 ;; The RENDERER owns the window + input. On `[:board nl st colors ops]` it BLITS the ops the SIM
 ;; pre-rendered (op-building runs on the faster SIM, not the slow root), and caches the board +
 ;; colours so it can re-render LOCALLY on input (feedback never waits on the tick). It still
@@ -687,7 +698,7 @@ the renderer's two `[:mouse …]` arities (press carries a 7th click-count eleme
 ;; updates the LOCAL control mirror (`ui`) and redraws at once, then messages the SIM. Never sleeps.
 (defn render-loop (w sim board info ui)
   (receive
-    ([:board nl st colors ops]
+    ([:board nl0 st colors ops]
       (do
         ;; Re-read the window each frame into *w*/*h*: the cell grid grows
         ;; after the async gui-font! applies (and a font change sends no
@@ -695,11 +706,11 @@ the renderer's two `[:mouse …]` arities (press carries a 7th click-count eleme
         ;; the bar sit at the bottom — without it *h* stays at its startup
         ;; (default-font) value and the bar floats mid-window.
         (grid-fit w)
-        ;; cache the sim's spawn-colour layer in the local ui mirror, so input
-        ;; redraws (which use the cached ui) paint the right colours too. The keys
-        ;; are bit indices, so if `grid-fit` just changed the width, rekey them to
-        ;; match the board we're about to draw (the sim catches up next frame).
-        (let (onw (get nl :w)
+        ;; The SIM omits `:bits` from the slim board on the uncoloured fast path (they ride in
+        ;; the `[:cells]` op instead — one fewer whole-board copy per frame); recover them from
+        ;; the op for the cached board that input/resize redraws read.
+        (let (nl (if (get nl0 :bits) nl0 (assoc nl0 :bits (cells-bits ops)))
+              onw (get nl :w)
               dims-match (and (= onw *w*) (= (get nl :h) *h*))  ; SIM's ops valid for current dims?
               nl2 (bitboard/fit nl *w* *h*)
               colors2 (if (= onw *w*) colors (colors-refit colors onw *w* *h*))
