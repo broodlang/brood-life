@@ -3,9 +3,8 @@ using Life;
 using Raylib_cs;
 
 // ── tuning knobs (the Brood `*globals*`) ──────────────────────────────────────
-int cellPx = 2;            // board cell size in pixels (at view zoom 1)
+int cellPx = 6;            // board cell size in pixels (at view zoom 1)
 int footerPx = 72;         // status-bar height (status line + a row of clickable buttons)
-int targetFps = EnvInt("LIFE_FPS", 0);   // 0 == uncapped (rip from frame 1); -/= retune live
 int spawnEvery = 600;      // auto-spawn a random pattern every N generations; [/] retune
 
 // `--selftest` exercises the pure bitboard core (no window) — mirrors tests/life_test.blsp.
@@ -53,7 +52,7 @@ BitBoard Seed()
 var toSim = Channel.CreateUnbounded<InputMsg>(new() { SingleReader = true });
 var toRenderer = Channel.CreateUnbounded<Frame>(new() { SingleReader = true });
 
-var sim = new Sim(toSim.Reader, toRenderer.Writer, Seed(), targetFps, spawnEvery);
+var sim = new Sim(toSim.Reader, toRenderer.Writer, Seed(), spawnEvery);
 using var cts = new CancellationTokenSource();
 var simTask = Task.Run(() => sim.RunAsync(cts.Token));
 
@@ -65,7 +64,7 @@ Raylib.InitWindow(windowW, windowH, "Life — .NET port (SIM/RENDERER split)");
 Raylib.MaximizeWindow();
 // the renderer's DISPLAY rate; 0 (uncapped sim) ⇒ no limiter, so it blits as fast as it can
 // and the SIM (bounded only by the per-frame ack) runs flat out — the "faster is better" test.
-Raylib.SetTargetFPS(targetFps > 0 ? Math.Max(targetFps, 120) : 0);
+Raylib.SetTargetFPS(0);   // uncapped display — the SIM runs flat out, bounded only by the ack
 
 // Draw a string in a FIXED-PITCH grid (cell = widest glyph + 1px), so the status line never
 // reflows as the gen/fps/cells/MB digit widths change — Brood renders its footer in a
@@ -86,13 +85,10 @@ var clock = System.Diagnostics.Stopwatch.StartNew();
 int viewZoom = 1, viewOx = 0, viewOy = 0;
 const int zoomMin = 1, zoomMax = 10, zoomStep = 1;
 
-// fps button: a click cycles a preset, a drag scrubs the cap (like Brood's footer key).
-bool fpsDragging = false, fpsMoved = false;
-int fpsDragLastX = 0;
 int[] spawnPresets = { 0, 60, 300, 1800 };   // off → frequent → … (generations, the .NET spawn unit)
 
 // footer button rects, recomputed each frame from the window size.
-Rectangle fpsBtn = default, spawnBtn = default, clearBtn = default;
+Rectangle spawnBtn = default, clearBtn = default;
 
 while (!Raylib.WindowShouldClose())
 {
@@ -119,26 +115,14 @@ while (!Raylib.WindowShouldClose())
     bool overFooter = mp.Y >= windowH - footerPx;
     bool inBoard = !overFooter && row >= 0 && row < BoardH() && col >= 0 && col < BoardW();
 
-    // ── clickable footer buttons (like Brood): fps (click cycles / drag scrubs), spawn, clear ──
+    // ── clickable footer buttons (like Brood): spawn (cycles the interval), clear (empties) ──
     int fyTop = windowH - footerPx;
-    fpsBtn = new Rectangle(14, fyTop + 40, 120, 26);
-    spawnBtn = new Rectangle(142, fyTop + 40, 150, 26);
+    spawnBtn = new Rectangle(14, fyTop + 40, 150, 26);
     clearBtn = new Rectangle(windowW - 100, fyTop + 40, 86, 26);
     if (Raylib.IsMouseButtonPressed(MouseButton.Left))
     {
-        if (PointIn(fpsBtn, mp)) { fpsDragging = true; fpsMoved = false; fpsDragLastX = (int)mp.X; }
-        else if (PointIn(spawnBtn, mp)) { spawnEvery = NextSpawn(spawnEvery); toSim.Writer.TryWrite(new SetSpawn(spawnEvery)); }
+        if (PointIn(spawnBtn, mp)) { spawnEvery = NextSpawn(spawnEvery); toSim.Writer.TryWrite(new SetSpawn(spawnEvery)); }
         else if (PointIn(clearBtn, mp)) { toSim.Writer.TryWrite(new Clear()); }
-    }
-    if (fpsDragging && Raylib.IsMouseButtonDown(MouseButton.Left))
-    {
-        int d = ((int)mp.X - fpsDragLastX) / 8;   // 8 px per fps step — drag to scrub the cap
-        if (d != 0) { targetFps = FpsNudge(targetFps, d); toSim.Writer.TryWrite(new SetFps(targetFps)); fpsDragLastX = (int)mp.X; fpsMoved = true; }
-    }
-    if (Raylib.IsMouseButtonReleased(MouseButton.Left) && fpsDragging)
-    {
-        if (!fpsMoved) { targetFps = FpsCycle(targetFps); toSim.Writer.TryWrite(new SetFps(targetFps)); }
-        fpsDragging = false;
     }
 
     // board paint: press/drag/release forwarded to the SIM (left = shape, right = gun)
@@ -146,8 +130,6 @@ while (!Raylib.WindowShouldClose())
     HandleButton(MouseButton.Right, gun: true, ref rightDown, col, row, inBoard);
 
     // keyboard knobs
-    if (Raylib.IsKeyPressed(KeyboardKey.Minus)) toSim.Writer.TryWrite(new FpsDelta(-5));
-    if (Raylib.IsKeyPressed(KeyboardKey.Equal)) toSim.Writer.TryWrite(new FpsDelta(+5));
     if (Raylib.IsKeyPressed(KeyboardKey.LeftBracket)) toSim.Writer.TryWrite(new SpawnDelta(+1));
     if (Raylib.IsKeyPressed(KeyboardKey.RightBracket)) toSim.Writer.TryWrite(new SpawnDelta(-1));
     if (Raylib.IsKeyPressed(KeyboardKey.Q)) break;
@@ -176,7 +158,6 @@ while (!Raylib.WindowShouldClose())
         int fy = windowH - footerPx;
         Raylib.DrawRectangle(0, fy, windowW, footerPx, new Color(24, 24, 30, 255));
         DrawMono(frame.Status, 14, fy + 8, 24, new Color(220, 220, 230, 255));
-        DrawButton(fpsBtn, $"fps {(targetFps == 0 ? "max" : targetFps.ToString())}", fpsDragging);
         DrawButton(spawnBtn, $"spawn {(spawnEvery == 0 ? "off" : spawnEvery + "g")}", false);
         DrawButton(clearBtn, "clear", false);
     }
@@ -215,17 +196,6 @@ void ClampView()
 
 static bool PointIn(Rectangle r, System.Numerics.Vector2 p) =>
     p.X >= r.X && p.X < r.X + r.Width && p.Y >= r.Y && p.Y < r.Y + r.Height;
-
-// fps button click: uncapped → 30 → 10 → 1 → uncapped (Brood `fps-cycle`).
-static int FpsCycle(int cap) => cap == 0 ? 30 : cap > 10 ? 10 : cap > 1 ? 1 : 0;
-
-// fps drag: move the cap by `d`, with 0 acting as just past the max so + wraps back to
-// uncapped (Brood `fps-nudge`; *fps-max* 120, *fps-min* 1).
-static int FpsNudge(int cap, int d)
-{
-    int baseV = cap == 0 ? 121 : cap, f = baseV + d;
-    return f > 120 ? 0 : Math.Max(1, f);
-}
 
 // spawn button: cycle the auto-spawn interval through the presets, wrapping (off → … → off).
 int NextSpawn(int every)

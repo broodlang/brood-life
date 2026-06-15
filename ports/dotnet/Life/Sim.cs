@@ -21,8 +21,8 @@ public sealed class Sim
     private readonly ChannelReader<InputMsg> _input;
     private readonly ChannelWriter<Frame> _frames;
 
-    // Tuning knobs — the Brood `*globals*`. targetFps 0 == uncapped (rip from frame 1).
-    private int _targetFps;
+    // Tuning knobs — the Brood `*globals*`. There is no frame-rate cap: the SIM always runs
+    // flat out, bounded only by the renderer's per-frame ack.
     private int _spawnEvery;   // auto-spawn a random pattern every N generations (0 = off)
 
     private BitBoard _board;
@@ -41,11 +41,10 @@ public sealed class Sim
     private static readonly (byte r, byte g, byte b) White = (0xe5, 0xe5, 0xe5);  // :white
 
     public Sim(ChannelReader<InputMsg> input, ChannelWriter<Frame> frames,
-        BitBoard initial, int targetFps, int spawnEvery)
+        BitBoard initial, int spawnEvery)
     {
         _input = input;
         _frames = frames;
-        _targetFps = targetFps;
         _spawnEvery = spawnEvery;
         _board = initial;  // the renderer (Program) owns seeding, so a bench can pin it
     }
@@ -61,13 +60,6 @@ public sealed class Sim
 
         while (!ct.IsCancellationRequested)
         {
-            long workStart = sw.ElapsedMilliseconds;
-
-            // ── self-pacing wait: park until the next frame is due, but let input preempt ──
-            int period = _targetFps > 0 ? Math.Max(1, 1000 / _targetFps) : 0;
-            await WaitForTick(period, ct);
-            if (ct.IsCancellationRequested) break;
-
             // Drain every input that's queued (a preempting message + whatever piled up).
             while (_input.TryRead(out var msg))
             {
@@ -76,9 +68,7 @@ public sealed class Sim
                     case Quit: return;
                     case Drawn: awaitingAck = false; break;
                     case Resize(var rw, var rh): { int ow = _board.W; _board = _board.Refit(rw, rh); ColorsRefit(ow, rw, rh); break; }
-                    case FpsDelta(var d): _targetFps = Math.Clamp(_targetFps + d, 0, 240); break;
                     case SpawnDelta(var d): _spawnEvery = Math.Max(0, _spawnEvery + d * 30); break;
-                    case SetFps(var cap): _targetFps = Math.Clamp(cap, 0, 240); break;
                     case SetSpawn(var every): _spawnEvery = Math.Max(0, every); break;
                     case Clear: _board = BitBoard.Make(_board.W, _board.H); _colors.Clear(); break;
                     case Press(var gun, var c, var r): Drop(gun, c, r); break;
@@ -108,26 +98,7 @@ public sealed class Sim
             lastFrameMs = nowMs;
             await Emit(perMs);
             awaitingAck = true;
-
-            // subtract the work already spent so the cap is a true target
-            long spent = sw.ElapsedMilliseconds - workStart;
-            _ = spent; // (folded into the next WaitForTick via period; kept explicit for clarity)
         }
-    }
-
-    // Park until the frame is due. A queued/arriving input cancels the wait early (preempt).
-    private async Task WaitForTick(int periodMs, CancellationToken ct)
-    {
-        if (_input.TryPeek(out _)) return;       // input already waiting → act now
-        if (periodMs <= 0) return;               // uncapped → never park
-        using var delay = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        delay.CancelAfter(periodMs);
-        try
-        {
-            // returns true when a message arrives (preempt), throws when the delay fires
-            await _input.WaitToReadAsync(delay.Token);
-        }
-        catch (OperationCanceledException) { /* budget spent — step now */ }
     }
 
     // While bounded behind the renderer, block until the ack — but still honour Quit.
@@ -148,9 +119,7 @@ public sealed class Sim
         switch (m)
         {
             case Resize(var rw, var rh): { int ow = _board.W; _board = _board.Refit(rw, rh); ColorsRefit(ow, rw, rh); break; }
-            case FpsDelta(var d): _targetFps = Math.Clamp(_targetFps + d, 0, 240); break;
             case SpawnDelta(var d): _spawnEvery = Math.Max(0, _spawnEvery + d * 30); break;
-            case SetFps(var cap): _targetFps = Math.Clamp(cap, 0, 240); break;
             case SetSpawn(var every): _spawnEvery = Math.Max(0, every); break;
             case Clear: _board = BitBoard.Make(_board.W, _board.H); _colors.Clear(); break;
             case Press(var gun, var c, var r): Drop(gun, c, r); break;
