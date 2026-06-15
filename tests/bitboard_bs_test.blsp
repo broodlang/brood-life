@@ -4,24 +4,24 @@
 (deftest bs-blinker-oscillates
   (let (b (bitboard-bs/place (bitboard-bs/make 10 10) [[0 0] [1 0] [2 0]] 3 3)
         s1 (bitboard-bs/step b))
-    (assert (= (sort (bitboard-bs/cells s1)) (sort [[4 2] [4 3] [4 4]])))
-    (assert (= (sort (bitboard-bs/cells (bitboard-bs/step s1))) (sort (bitboard-bs/cells b))))))
+    (is (= (sort (bitboard-bs/cells s1)) (sort [[4 2] [4 3] [4 4]])))
+    (is (= (sort (bitboard-bs/cells (bitboard-bs/step s1))) (sort (bitboard-bs/cells b))))))
 
 (deftest bs-block-is-still
   (let (b (bitboard-bs/place (bitboard-bs/make 10 10) [[0 0] [1 0] [0 1] [1 1]] 2 2))
-    (assert (= (sort (bitboard-bs/cells (bitboard-bs/step b))) (sort (bitboard-bs/cells b))))))
+    (is (= (sort (bitboard-bs/cells (bitboard-bs/step b))) (sort (bitboard-bs/cells b))))))
 
 (deftest bs-glider-moves
   (let (g (bitboard-bs/place (bitboard-bs/make 20 20) [[1 0] [2 1] [0 2] [1 2] [2 2]] 1 1)
         g4 (bitboard-bs/step (bitboard-bs/step (bitboard-bs/step (bitboard-bs/step g)))))
-    (assert (= (bitboard-bs/live-count g4) 5))
-    (assert (= (sort (bitboard-bs/cells g4))
+    (is (= (bitboard-bs/live-count g4) 5))
+    (is (= (sort (bitboard-bs/cells g4))
               (sort (map (fn ([x y]) [(+ x 1) (+ y 1)]) (bitboard-bs/cells g)))))))
 
 (deftest bs-torus-wraps
   (let (b (bitboard-bs/place (bitboard-bs/make 6 6) [[0 0] [1 0] [2 0]] 5 3))
-    (assert (= (bitboard-bs/live-count (bitboard-bs/step b)) 3))))
+    (is (= (bitboard-bs/live-count (bitboard-bs/step b)) 3))))
 
 (deftest bs-live-count
   (let (g (bitboard-bs/place (bitboard-bs/make 20 20) [[1 0] [2 1] [0 2] [1 2] [2 2]] 1 1))
-    (assert (= (bitboard-bs/live-count g) 5))))
+    (is (= (bitboard-bs/live-count g) 5))))
