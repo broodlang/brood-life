@@ -8,6 +8,7 @@
   "A 120×40 bitboard with `coords` (a list of `[x y]`) live."
   (reduce (fn (b [x y]) (bset b x y)) (make 120 40) coords))
 
+; a right click adds a full glider gun
 (describe "life"
   (test "a blinker oscillates with period 2"
     (let (b (board [[1 0] [1 1] [1 2]]))
@@ -21,15 +22,16 @@
       (assert= (sort (cells g4))
         (sort (map (fn ([x y]) [(+ x 1) (+ y 1)]) (cells g))))))
 
+  ; -> horizontal, row 0
   (test "the torus wraps top-to-bottom: a blinker across the top edge rotates normally"
     (let (vertical (board [[1 39] [1 0] [1 1]]))
       ; col 1, rows 39/0/1 — straddles the top
-      (assert= (sort (cells (step vertical))) (sort [[0 0] [1 0] [2 0]]))))  ; -> horizontal, row 0
-
+      (assert= (sort (cells (step vertical))) (sort [[0 0] [1 0] [2 0]]))))
   (test "a seeded board is deterministic, non-empty, and on-grid"
     (let (s (seed 42))
       (do
-        (assert= (sort (cells s)) (sort (cells (seed 42))))  ; same seed -> same board
+        ; same seed -> same board
+        (assert= (sort (cells s)) (sort (cells (seed 42))))
         (is (> (live-count s) 0))
         (is (every? (fn ([x y]) (and (>= x 0) (< x 120) (>= y 0) (< y 40))) (cells s))))))
 
@@ -41,15 +43,17 @@
           [shape-drop _] (apply-clicks blank [[10 10 :shape]] 3)
           [gun-drop _] (apply-clicks blank [[10 10 :gun]] 3))
       (do
-        (is (= (live-count blank) 0))  ; the app starts empty
-        (is (> (live-count shape-drop) 0))  ; a left click adds a shape
-        (assert= (live-count gun-drop) 36)))))  ; a right click adds a full glider gun
-
+        ; the app starts empty
+        (is (= (live-count blank) 0))
+        ; a left click adds a shape
+        (is (> (live-count shape-drop) 0))
+        (assert= (live-count gun-drop) 36)))))
 ;; Shooters: the anti-stagnation guns. A gun keeps emitting gliders, so `inject-pattern`
 ;; sowing one onto a settled board makes the population trend up again. A one-cell typo
 ;; in *gosper-gun* would silently break it.
 (defn stepn (b n) (reduce (fn (acc _) (step acc)) b (range n)))
 
+; same seed -> same sow
 (describe "shooters re-energise a stagnant board"
   (test "the Gosper gun fires: it emits gliders, so the population grows"
     (let (g (board *gosper-gun*))
@@ -71,8 +75,43 @@
           [revived _] (inject-pattern settled 7)
           [again _] (inject-pattern settled 7))
       (do
-        (is (> (live-count revived) (live-count settled)))  ; a pattern was sown in
-        (assert= (sort (cells revived)) (sort (cells again)))))))  ; same seed -> same sow
+        ; a pattern was sown in
+        (is (> (live-count revived) (live-count settled)))
+        (assert= (sort (cells revived)) (sort (cells again)))))))
+;; The reaper hunts the OLDEST live cell, found from the age layer (bit index -> birth-gen).
+;; `age-step` carries that layer across a generation. The bug: a cell spawned this gen and
+;; surviving the step was treated as a survivor — kept an age it never had, left ageless and
+;; invisible to the reaper ("the reaper does not reap if the cell don't change"). The fix is
+;; to feed `age-step` the PRE-spawn board, so such a cell falls into `born` and is stamped.
+(describe "the reaper age layer"
+  ; the dead cell is dropped
+  (test "age-step drops the dead, keeps survivors' birth-gen, and stamps newcomers"
+    (let (
+          ; cells 0,1 alive last gen
+          old (bit-or (bit-shift-left 1 0) (bit-shift-left 1 1))
+          ; both born at gen 5
+          ages {0 5 1 5}
+          ; 1 survives, 0 dies, 7 appears
+          new (bit-or (bit-shift-left 1 1) (bit-shift-left 1 7))
+          stepped (age-step ages old new 9))
+      (do
+        ; survivor keeps its birth-gen
+        (assert= (get stepped 1) 5)
+        ; the newcomer is stamped "now"
+        (assert= (get stepped 7) 9)
+        (is (nil? (get stepped 0))))))
+  (test "every live cell carries an age — none is left invisible to the reaper"
+    ;; The invariant the reaper relies on: after a step, every set bit in the new board has
+    ;; an age entry. Pre-spawn old = {0,1}; new (post-step) = {1,7,9}. With the fix, 7 and 9
+    ;; (a spawn-and-survive plus a step newborn) are both stamped, not silently skipped.
+    (let (old (bit-or (bit-shift-left 1 0) (bit-shift-left 1 1))
+          new (reduce (fn (acc i) (bit-or acc (bit-shift-left 1 i))) 0 [1 7 9])
+          stepped (age-step {0 2 1 2} old new 11))
+      (is (every? (fn (i) (not (nil? (get stepped i)))) [1 7 9]))))
+
+  (test "oldest-xy finds the smallest birth-gen, ties broken by nearness to the reaper"
+    ;; w=120: idx 7 -> (7,0), idx 250 -> (10,2). Cell 7 is older (gen 3 < gen 8), so it wins.
+    (assert= (oldest-xy {7 3 250 8} 120 0 0) [7 0])))
 
 ;; The renderer (render-loop) routes its mailbox on `quit-signal?`: the window's X
 ;; (`:close`) and the q / Esc / Ctrl-C keys quit; board/status/mouse/other don't.
