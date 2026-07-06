@@ -2,8 +2,16 @@
 
 **Reporter:** brood-life (Conway demo) · **Date:** 2026-06-15
 **Kernel build:** `nest 0.1.0`, installed binary `~/.local/bin/nest` (built 2026-06-15 00:24)
-**Kernel HEAD:** `2f350df` (`lisp: native string-split, table (ETS), telemetry, proc cwd/env, treesit + fuzzy speedups`)
+**Kernel HEAD at report time:** `2f350df` (`lisp: native string-split, table (ETS), telemetry, proc cwd/env, treesit + fuzzy speedups`)
 **Component:** `crates/lisp/src/core/heap.rs` — moving GC copy/flush phase (`flush_oob`, ~L5590)
+
+**STATUS: RESOLVED** — Root cause was **KI-4** (bitset stored as non-UTF-8 `Value::Str`).
+Fixed in `95f52fd` (2026-06-15): bitsets are now a distinct `Value::Bitset` kind with a
+byte-clean slab; `promote_in` no longer routes through the UTF-8 string accessor.
+Regression tests: `gc::ki4_bitset_survives_spawn_promote` and
+`gc::ki4_bitset_survives_gc_churn_in_spawned_process` — both clean under
+`BROOD_GC_STRESS=1 BROOD_GC_VERIFY=1`. See `docs/known-issues.md` KI-4 for the full
+post-mortem and verification record.
 
 ---
 
