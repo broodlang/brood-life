@@ -102,3 +102,8 @@ nest format         # format the source
   cells that fall off the shrunk board are dropped (`bitboard/refit` clips, no wrap-back).
   Auto-injection is on by default (`*inject-secs*`, **30 s**; `[`/`]` retune it or turn it
   off) — every `*inject-secs*` seconds the SIM sows a random pattern.
+
+## License
+
+Licensed under the GNU Affero General Public License v3.0 (`AGPL-3.0-only`); see
+[`LICENSE`](LICENSE). Copyright © 2026 Wilhelm Kirschbaum.
