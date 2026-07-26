@@ -32,8 +32,8 @@ this RENDERER that draws + handles input."
 (defn bb-and (a b) (bit-and a b))
 (defn bb-xor (a b) (bit-xor a b))
 
-(def *w* 120)
-(def *h* 40)
+(defdyn *w* 120)
+(defdyn *h* 40)
 ;; FAIR-COMPARISON OVERRIDE (env-driven, off by default). When `LIFE_BOARD=WxH` is set the
 ;; board is PINNED to those dims — `grid-fit`/`[:resize]` stop re-deriving `*w*`/`*h*` from the
 ;; window — and `LIFE_BLOCK=N` seeds a centred solid N×N block (and disables auto-inject), so
@@ -182,7 +182,7 @@ this RENDERER that draws + handles input."
 ;; plus the glider guns of `*shooters*` (both required above). `inject-pattern` samples
 ;; this uniformly, so any known shape can drop onto the board for variety, and a gun
 ;; lands often enough to keep re-energising a settling board.
-(def *patterns* (concat *shapes* *shooters*))
+(def *patterns* (append *shapes* *shooters*))
 
 ;; ---- the app icon: the iconic Life GLIDER, generated from the pattern itself ----------
 ;; A small RGBA tile handed to the kernel's `gui-icon!` at startup — the OS taskbar /
@@ -645,7 +645,7 @@ so the scythe leads the way it's heading. Skips transparent (nil) sprite cells."
 or [] when the reaper is off (`rv` is the render bundle from `reaper-view`, or nil)."
   (if (nil? rv)
     []
-    (concat (trail-ops rv w h z a ox oy visw vish)
+    (append (trail-ops rv w h z a ox oy visw vish)
       (flash-ops rv w h z a ox oy visw vish)
       (reaper-ops rv w h z a ox oy visw vish))))
 
@@ -657,7 +657,7 @@ cell) — so the hot loop is a single enumeration with no per-row scan. Zoomed i
 visible board WINDOW (`*view-ox*`/`*oy*`, `w/z × h/z` cells) is drawn, magnified z×: each
 row's window is shifted to the origin and masked to the column range (still O(visible-live),
 and fewer cells show), each at `px*z`. The cell ops and the footer are spliced with one lazy
-`concat` poured into a SINGLE vector (`into`), so the O(live) ops vector is built once, not
+`append` poured into a SINGLE vector (`into`), so the O(live) ops vector is built once, not
 copied again to append the bar."
   (let (z *view-zoom*
         a *cell-aspect*
@@ -668,14 +668,14 @@ copied again to append the bar."
         h (get live :h)
         wdt (get live :w))
     (into [(clear)]
-      (concat
+      (append
         (if (= z 1)
           ;; Blit the WHOLE board as ONE native op — the kernel enumerates set bits and fills
           ;; each cell (O(live), in Rust) — instead of one interpreted `[:text]` op per cell
           ;; (which was ~110 ms / 10K cells). Uncoloured (or flat): a single-colour `[:cells]`.
           ;; Coloured: `[:cells-rgb]`, each cell taking its spawn colour from the `colors` map.
           ;; whole-board fast path (one native op), then the reaper sprite over it (ox=oy=0, z=1).
-          (concat (if (or *flat-render* (= 0 (count colors)))
+          (append (if (or *flat-render* (= 0 (count colors)))
                     [[:cells 0 0 wdt a bits *default-cell-bg*]]
                     [[:cells-rgb 0 0 wdt a bits colors *default-cell-bg*]])
             (reaper-overlay-ops rv wdt h 1 a 0 0 wdt h))
@@ -688,7 +688,7 @@ copied again to append the bar."
                 az (* a z))
             ;; the magnified visible window, then the robot block over it (mapped through the
             ;; same pan/zoom transform).
-            (concat
+            (append
               (mapcat
                 (fn (sy)
                   ;; the visible window of row (oy+sy): shift it to bit 0, mask to visw

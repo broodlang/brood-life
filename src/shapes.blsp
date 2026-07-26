@@ -149,4 +149,4 @@ fewer when the pattern is symmetric). All behave identically under Life's isotro
     pi-heptomino
     thunderbird])
 
-(def *shapes* (distinct (mapcat orientations *base-shapes*)))
+(defdyn *shapes* (distinct (mapcat orientations *base-shapes*)))

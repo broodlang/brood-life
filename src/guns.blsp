@@ -10,7 +10,7 @@ and the schedule that sows them stay in `life` (life/inject-pattern)."
 
 ;; The Gosper glider gun (36×9, period 30), as `[dx dy]` cells from its top-left
 ;; origin — the one gun every shooter is an orientation of.
-(def *gosper-gun*
+(defdyn *gosper-gun*
   [[0 4] [0 5]
     [1 4]
     [1 5]
@@ -50,4 +50,4 @@ and the schedule that sows them stay in `life` (life/inject-pattern)."
 ;; A rotation or reflection of a gun is itself a valid gun (Life's rules are isotropic),
 ;; so the one Gosper definition yields all eight shooters — firing along every diagonal —
 ;; for free. `orientations` (from `shapes`) dedupes the symmetric repeats.
-(def *shooters* (shapes/orientations *gosper-gun*))
+(defdyn *shooters* (shapes/orientations *gosper-gun*))
