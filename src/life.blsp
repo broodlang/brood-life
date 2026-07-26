@@ -11,26 +11,26 @@ this RENDERER that draws + handles input."
   (:use editor/display))
 
 (require 'bitboard)  ; the packed-bitboard board: make / bset / place / step / cells / live-count
-(require 'bitboard-bs)  ; the refc-shared BITSET twin (LIFE_BITSET=1) — board crosses send/table by ref
 (require 'shapes)  ; still-life / oscillator / spaceship / methuselah patterns (*shapes*) — left click
 (require 'guns)  ; glider-gun patterns (*shooters*) — right click, and sown by inject-pattern
 (require 'perflog)  ; tiny file logger — the SIM writes a perf line to life.log
-;; Board backend dispatch: the bignum `bitboard` (default) or the refc-shared `bitboard-bs`
-;; (LIFE_BITSET=1, set in `run-life`). The bitset board's `:bits` crosses send/table BY
-;; REFERENCE (an Arc bump) instead of deep-copying — for the uncoloured/fair benchmark. The
-;; colour layer still reads `:bits` as a bignum, so coloured play stays on the bignum board.
-(def *use-bitset* false)
-(defn bb-make (w h) (if *use-bitset* (bitboard-bs/make w h) (bitboard/make w h)))
-(defn bb-place (b pat x y) (if *use-bitset* (bitboard-bs/place b pat x y) (bitboard/place b pat x y)))
-(defn bb-step (b) (if *use-bitset* (bitboard-bs/step b) (bitboard/step b)))
-(defn bb-live-count (b) (if *use-bitset* (bitboard-bs/live-count b) (bitboard/live-count b)))
-(defn bb-fit (b w h) (if *use-bitset* (bitboard-bs/fit b w h) (bitboard/fit b w h)))
-(defn bb-refit (b w h) (if *use-bitset* (bitboard-bs/refit b w h) (bitboard/refit b w h)))
-;; Raw whole-board bit ops the colour layer + render run directly on `:bits` — dispatched so
-;; coloured play (recolor/color-spawn/render) works on the bitset board too, not just bignum.
-(defn bb-positions (b) (if *use-bitset* (bitset-positions b) (bit-positions b)))
-(defn bb-and (a b) (if *use-bitset* (bitset-and a b) (bit-and a b)))
-(defn bb-xor (a b) (if *use-bitset* (bitset-xor a b) (bit-xor a b)))
+;; The board API the rest of this file goes through. There was a second backend here — a
+;; refc-shared BITSET twin behind `LIFE_BITSET=1`, whose `:bits` crossed send/table by an
+;; Arc bump instead of deep-copying — and these were the dispatch layer between them. The
+;; kernel's `bitset` type and its ops were removed from Brood on 2026-06-28, so that
+;; backend could no longer run at all and is gone; the bignum `bitboard` is the only one.
+;; They stay as named wrappers rather than being inlined at ~30 call sites: they are the
+;; single seam if another backend is ever worth having.
+(defn bb-make (w h) (bitboard/make w h))
+(defn bb-place (b pat x y) (bitboard/place b pat x y))
+(defn bb-step (b) (bitboard/step b))
+(defn bb-live-count (b) (bitboard/live-count b))
+(defn bb-fit (b w h) (bitboard/fit b w h))
+(defn bb-refit (b w h) (bitboard/refit b w h))
+;; Raw whole-board bit ops the colour layer + render run directly on `:bits`.
+(defn bb-positions (b) (bit-positions b))
+(defn bb-and (a b) (bit-and a b))
+(defn bb-xor (a b) (bit-xor a b))
 
 (def *w* 120)
 (def *h* 40)
@@ -391,9 +391,8 @@ only its key (the bit index) changes with the width."
 ;; ---- the REAPER's pure core. While it's on the SIM keeps a parallel AGE layer (`ages`: bit index
 ;; → the generation a cell was born) carried across each step exactly like the colour layer — a
 ;; survivor keeps its birth-gen, a newborn is stamped NOW, a death is dropped — so the OLDEST live
-;; cell is simply the smallest stored value. The age/reap math is whole-board-integer specific, so
-;; the reaper assumes the default bitboard engine (the LIFE_BITSET fair-benchmark board carries no
-;; colour/age layer anyway).
+;; cell is simply the smallest stored value. The age/reap math is whole-board-integer specific,
+;; which the bignum bitboard is.
 (defn age-step (ages old-bits new-bits gen)
   "Carry the cell-AGE layer across one generation — the age analogue of `recolor`: drop the dead
 (`old & ~new`), stamp each newborn (`new & ~old`) with `gen`, survivors keep their birth-gen.
@@ -1204,7 +1203,6 @@ render-only *view-zoom* camera (the board is unchanged)."
         _ (def *fixed-board* fb)
         _ (def *steps-per-frame* (max 1 (env-int "LIFE_STEPS" 1)))  ; gens per DRAWN frame
         _ (def *flat-render* (> (env-int "LIFE_FLAT" 0) 0))  ; force the GPU-drawable [:cells] path
-        _ (def *use-bitset* (> (env-int "LIFE_BITSET" 0) 0))  ; refc-shared bitset board (uncoloured)
         _ (if fb (do (def *w* (first fb)) (def *h* (second fb))) (grid-fit w))
         blk (env-int "LIFE_BLOCK" 0)  ; seed a centred solid blk×blk block (0 = the normal empty start)
         inj (if (> blk 0) 0 *inject-secs*)  ; block seed ⇒ deterministic: no auto-inject
