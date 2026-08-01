@@ -439,7 +439,7 @@ of those CURRENTLY live and XOR it out, so only set bits flip. Whole-board-integ
 
 (defn toward (a b)
   "One step of `a` toward `b`: +1, -1, or 0 when already there."
-  (cond (< a b) 1 (> a b) -1 :else 0))
+  (cond (< a b) 1 (> a b) -1 else 0))
 
 (defn reaper-tick (rp board ages colors)
   "Advance the reaper ONE generation. `rp` is `{:rx :ry :tx :ty :move :face :trail :flash}`. It
@@ -469,7 +469,7 @@ Returns `[board' ages' colors' rp']`."
         trail1 (reduce (fn (t [c r]) (if (> r 1) (assoc t c (- r 1)) t)) {} (get rp :trail))
         trail2 (reduce (fn (t i) (assoc t i *reaper-trail-life*)) trail1 idxs)
         ;; facing follows the horizontal step; keep the last facing on a purely vertical move
-        face (let (sdx (- rx rx0)) (cond (> sdx 0) 1 (< sdx 0) -1 :else (or (get rp :face) 1)))
+        face (let (sdx (- rx rx0)) (cond (> sdx 0) 1 (< sdx 0) -1 else (or (get rp :face) 1)))
         ;; stay committed until we reach the target's cell; only then repick the next nearest-oldest
         arrived? (and tgt (= rx (first tgt)) (= ry (second tgt)))
         nt (if (and tgt (not arrived?)) tgt (oldest-xy ages2 w rx ry)))
@@ -1117,7 +1117,7 @@ view zoom doesn't move the bar), so the bar begins at screen row `*h*`."
                                         (send sim [:toggle-reaper])
                                         [(assoc ui :reaper-on (not (get ui :reaper-on))) true])
       (in-range? col (get l :clear)) (do (send sim [:clear]) [ui false])
-      :else [ui false])))
+      else [ui false])))
 
 (defn footer-release (sim ui)
   "Mouse up: tell the SIM the board press ended."
@@ -1133,7 +1133,7 @@ right = guns), drawn immediately by the sim — a bare mouse motion (no button d
     (= action :release) (footer-release sim ui)
     (in-footer? row) (if (= action :press) (footer-press sim ui col) [ui false])
     ;; on the board: PASTE only on a press or a drag — `:drag` always carries a held button,
-    ;; and bare motion arrives as its own `:move` action (button nil), which falls to `:else`
+    ;; and bare motion arrives as its own `:move` action (button nil), which falls to `else`
     ;; and drops nothing. Map the screen cell THROUGH the view to a BOARD cell — x = *view-ox*
     ;; + col/(aspect·z), y = *view-oy* + row/z (a board cell is *cell-aspect* screen cols wide)
     ;; — so a paste lands where you point, zoomed in or not.
@@ -1147,7 +1147,7 @@ right = guns), drawn immediately by the sim — a bare mouse motion (no button d
                                                     (quot col (* *cell-aspect* *view-zoom*)))
                                                   (+ *view-oy* (quot row *view-zoom*))])
                                               [ui false])
-    :else [ui false]))
+    else [ui false]))
 
 (defn on-key (sim m ui)
   "Route a control key to `[ui' redraw?]`: `[`/`]` retune the auto-spawn interval, `r` toggles the
@@ -1159,7 +1159,7 @@ reaper sprite itself is drawn from the SIM's frames)."
     (= m "r") (do
                 (send sim [:toggle-reaper])
                 [(assoc ui :reaper-on (not (get ui :reaper-on))) true])
-    :else [ui false]))
+    else [ui false]))
 
 (defn env-blank? (s)
   "Is env-var value `s` absent (nil) or the empty string?"
