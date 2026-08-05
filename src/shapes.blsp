@@ -35,26 +35,26 @@ fewer when the pattern is symmetric). All behave identically under Life's isotro
     (distinct [r0 r1 r2 r3 (mirror r0) (mirror r1) (mirror r2) (mirror r3)])))
 
 ;; ---- still-lifes: fixed under `step` -------------------------------------------
-(def block [[0 0] [1 0] [0 1] [1 1]])  ; OO / OO
-(def beehive [[1 0] [2 0] [0 1] [3 1] [1 2] [2 2]])  ; .OO. / O..O / .OO.
-(def loaf [[1 0] [2 0] [0 1] [3 1] [1 2] [3 2] [2 3]])  ; .OO. / O..O / .O.O / ..O.
-(def boat [[0 0] [1 0] [0 1] [2 1] [1 2]])  ; OO. / O.O / .O.
-(def tub [[1 0] [0 1] [2 1] [1 2]])  ; .O. / O.O / .O.
-(def ship [[0 0] [1 0] [0 1] [2 1] [1 2] [2 2]])  ; OO. / O.O / .OO
-(def pond [[1 0] [2 0] [0 1] [3 1] [0 2] [3 2] [1 3] [2 3]])  ; .OO. / O..O / O..O / .OO.
-(def barge [[1 0] [0 1] [2 1] [1 2] [3 2] [2 3]])  ; the long tub
+(def block [[0 0] [1 0] [0 1] [1 1]]) ; OO / OO
+(def beehive [[1 0] [2 0] [0 1] [3 1] [1 2] [2 2]]) ; .OO. / O..O / .OO.
+(def loaf [[1 0] [2 0] [0 1] [3 1] [1 2] [3 2] [2 3]]) ; .OO. / O..O / .O.O / ..O.
+(def boat [[0 0] [1 0] [0 1] [2 1] [1 2]]) ; OO. / O.O / .O.
+(def tub [[1 0] [0 1] [2 1] [1 2]]) ; .O. / O.O / .O.
+(def ship [[0 0] [1 0] [0 1] [2 1] [1 2] [2 2]]) ; OO. / O.O / .OO
+(def pond [[1 0] [2 0] [0 1] [3 1] [0 2] [3 2] [1 3] [2 3]]) ; .OO. / O..O / O..O / .OO.
+(def barge [[1 0] [0 1] [2 1] [1 2] [3 2] [2 3]]) ; the long tub
 (def long-ship [[0 0] [1 0] [0 1] [2 1] [1 2] [3 2] [2 3] [3 3]])
-(def snake [[0 0] [1 0] [3 0] [0 1] [2 1] [3 1]])  ; OO.O / O.OO
-(def eater1 [[0 0] [1 0] [0 1] [2 1] [2 2] [2 3] [3 3]])  ; the fishhook eater
-
+(def snake [[0 0] [1 0] [3 0] [0 1] [2 1] [3 1]]) ; OO.O / O.OO
+(def eater1 [[0 0] [1 0] [0 1] [2 1] [2 2] [2 3] [3 3]]) ; the fishhook eater
 ;; ---- oscillators: return to themselves after `period` gens ----------------------
-(def blinker [[0 0] [1 0] [2 0]])  ; OOO     (period 2)
-(def toad [[1 0] [2 0] [3 0] [0 1] [1 1] [2 1]])  ; .OOO / OOO.   (period 2)
-(def beacon [[0 0] [1 0] [0 1] [1 1] [2 2] [3 2] [2 3] [3 3]])  ; two blocks    (period 2)
-(def clock [[2 0] [0 1] [2 1] [1 2] [3 2] [1 3]])  ; period 2
+(def blinker [[0 0] [1 0] [2 0]]) ; OOO     (period 2)
+(def toad [[1 0] [2 0] [3 0] [0 1] [1 1] [2 1]]) ; .OOO / OOO.   (period 2)
+(def beacon [[0 0] [1 0] [0 1] [1 1] [2 2] [3 2] [2 3] [3 3]]) ; two blocks    (period 2)
+(def clock [[2 0] [0 1] [2 1] [1 2] [3 2] [1 3]]) ; period 2
 ;; the pulsar (period 3, 13×13) and pentadecathlon (period 15) — the big showy ones.
 (def pulsar
-  [[2 0] [3 0]
+  [[2 0]
+    [3 0]
     [4 0]
     [8 0]
     [9 0]
@@ -109,44 +109,20 @@ fewer when the pattern is symmetric). All behave identically under Life's isotro
 (def lwss [[0 0] [3 0] [4 1] [0 2] [4 2] [1 3] [2 3] [3 3] [4 3]])
 (def mwss [[2 0] [0 1] [4 1] [5 2] [0 3] [5 3] [1 4] [2 4] [3 4] [4 4] [5 4]])
 (def hwss [[2 0] [3 0] [0 1] [5 1] [6 2] [0 3] [6 3] [1 4] [2 4] [3 4] [4 4] [5 4] [6 4]])
-(def glider [[1 0] [2 1] [0 2] [1 2] [2 2]])  ; .O. / ..O / OOO  (period 4)
-
+(def glider [[1 0] [2 1] [0 2] [1 2] [2 2]]) ; .O. / ..O / OOO  (period 4)
 ;; ---- methuselahs: small starts that erupt into long-lived chaos -----------------
 ;; These don't settle — they're the energisers. R-pentomino runs ~1100 gens, acorn
 ;; ~5200, diehard burns out at exactly gen 130. Perfect for clicking onto the board.
-(def r-pentomino [[1 0] [2 0] [0 1] [1 1] [1 2]])  ; .OO / OO. / .O.
+(def r-pentomino [[1 0] [2 0] [0 1] [1 1] [1 2]]) ; .OO / OO. / .O.
 (def acorn [[1 0] [3 1] [0 2] [1 2] [4 2] [5 2] [6 2]])
 (def diehard [[6 0] [0 1] [1 1] [1 2] [5 2] [6 2] [7 2]])
-(def pi-heptomino [[0 0] [1 0] [2 0] [0 1] [2 1] [0 2] [2 2]])  ; OOO / O.O / O.O
-(def thunderbird [[0 0] [1 0] [2 0] [1 2] [1 3] [1 4]])  ; OOO / ... / .O. / .O. / .O.
-
+(def pi-heptomino [[0 0] [1 0] [2 0] [0 1] [2 1] [0 2] [2 2]]) ; OOO / O.O / O.O
+(def thunderbird [[0 0] [1 0] [2 0] [1 2] [1 3] [1 4]]) ; OOO / ... / .O. / .O. / .O.
 ;; The named bases, one per shape. `*shapes*` fans each into all its orientations and
 ;; dedupes, so a left click/drag (and `seed`/`inject-pattern`) samples the full ~110.
 (def *base-shapes*
-  [block beehive
-    loaf
-    boat
-    tub
-    ship
-    pond
-    barge
-    long-ship
-    snake
-    eater1
-    blinker
-    toad
-    beacon
-    clock
-    pulsar
-    pentadecathlon
-    lwss
-    mwss
-    hwss
-    glider
-    r-pentomino
-    acorn
-    diehard
-    pi-heptomino
-    thunderbird])
+  [block
+    beehive loaf boat tub ship pond barge long-ship snake eater1 blinker toad beacon clock pulsar
+    pentadecathlon lwss mwss hwss glider r-pentomino acorn diehard pi-heptomino thunderbird])
 
 (defdyn *shapes* (distinct (mapcat orientations *base-shapes*)))

@@ -1,10 +1,8 @@
 ;; life — Conway's Game of Life, a Brood project.
-(project :name
-  "life"
-  :version
-  "0.1.0"
-  :main
-  (life run-life))
+(project
+  :name "life"
+  :version "0.1.0"
+  :main (life run-life))
 
 ;; To depend on other Brood packages, add a :dependencies vector to the form
 ;; above (ADR-037). Dep names are bare symbols (no quoting):

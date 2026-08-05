@@ -18,9 +18,9 @@ number) and `bit-positions` (so rendering stays O(live), not O(area)).")
 (defn make (w h)
   "An empty `w`×`h` whole-board bitboard, with the torus edge-column masks precomputed.
 `:col0` = Σ 2^(y*w) is a closed form of board/mask (the geometric series 1+2^w+2^2w+…)."
-  (let (mask (- (bit-shift-left 1 w) 1)  ; one row: w low bits
-        board (- (bit-shift-left 1 (* w h)) 1)  ; the whole grid: w*h bits
-        col0 (quot board mask)  ; the x=0 bit of every row (each row's low bit)
+  (let (mask (- (bit-shift-left 1 w) 1) ; one row: w low bits
+        board (- (bit-shift-left 1 (* w h)) 1) ; the whole grid: w*h bits
+        col0 (quot board mask) ; the x=0 bit of every row (each row's low bit)
         high (bit-shift-left col0 (- w 1)))
     ; the x=w−1 bit of every row (each row's top bit)
     {:w w :h h :mask mask :board board :col0 col0 :high high :bits 0}))
