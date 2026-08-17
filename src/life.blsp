@@ -8,12 +8,10 @@ cycle the auto-spawn preset; a bottom-right `clear` empties the board. Always ru
 (ADR-058): a SIM that owns the board and paces
 ITSELF with a self-resetting `(after)` timer that input preempts (so pastes are instant), and
 this RENDERER that draws + handles input."
-  (:use editor/display))
+  (:use editor/display)
+  (:use shapes)
+  (:use guns))
 
-(require 'bitboard) ; the packed-bitboard board: make / bset / place / step / cells / live-count
-(require 'shapes) ; still-life / oscillator / spaceship / methuselah patterns (*shapes*) — left click
-(require 'guns) ; glider-gun patterns (*shooters*) — right click, and sown by inject-pattern
-(require 'perflog) ; tiny file logger — the SIM writes a perf line to life.log
 ;; The board API the rest of this file goes through. There was a second backend here — a
 ;; refc-shared BITSET twin behind `LIFE_BITSET=1`, whose `:bits` crossed send/table by an
 ;; Arc bump instead of deep-copying — and these were the dispatch layer between them. The
@@ -245,7 +243,7 @@ and `f` its fraction (no float `mod`, which the kernel's `mod` doesn't take)."
                   (= i 3) [p q v]
                   (= i 4) [t p v]
                   else [v p q]))
-    [(round (* 255 r)) (round (* 255 g)) (round (* 255 b))]))
+    [(math/round (* 255 r)) (math/round (* 255 g)) (math/round (* 255 b))]))
 
 (defn spawn-rgb (id)
   "The vivid `[r g b]` for spawn `id`: hue walks the wheel by *spawn-hue-step* per spawn, so
@@ -382,7 +380,7 @@ reaper `(rx,ry)` (Chebyshev distance), then lowest bit index. Breaking ties by d
 pick STABLE as the reaper moves, so on a repick it continues to a near cell instead of jumping
 across the board. nil when the layer is empty. Linear in the population."
   (let (best (reduce (fn (acc [i g])
-                       (let (d (max (abs (- (mod i w) rx)) (abs (- (quot i w) ry))))
+                       (let (d (max (math/abs (- (mod i w) rx)) (math/abs (- (quot i w) ry))))
                          (if (or (nil? acc)
                                (< g (vector-ref acc 1))
                                (and (= g (vector-ref acc 1)) (< d (vector-ref acc 2))))
@@ -1057,7 +1055,7 @@ then clamp the pan so the magnified window stays inside the board. A board cell 
 (defn- inject-index
   (inject)
   "Index of `inject` in `*inject-presets*` (0 if it isn't one — e.g. the initial value)."
-  (or (index-where (fn (x) (= x inject)) *inject-presets*) 0))
+  (or (enum/index-where (fn (x) (= x inject)) *inject-presets*) 0))
 
 (defn inject-cycle (inject)
   "The NEXT auto-spawn preset, wrapping: off → 1s → 5s → 30s → off — the `[spawn]` button."
