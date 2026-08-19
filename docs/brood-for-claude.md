@@ -227,7 +227,7 @@ The name never carries a sigil, at the definition or any call site.
 A trailing `!` is **rare and not a mutation warning** — nothing mutates, so the
 Scheme/Clojure reading is vacuous here and `!` is per-context by decision (ADR-163):
 `sig!` = a signature *enforced* at runtime, `set-load-path!` / `clipboard-set!` = the
-few root/OS-state setters, `(! pid payload)` = the Erlang-style cast in `proc/gen`.
+few root/OS-state setters, `(! pid payload)` = the Erlang-style cast in `gen`.
 **Don't add a `!` to a name of your own.**
 
 **Names come from whichever language named the thing best** — `partition` (Clojure)
@@ -264,7 +264,7 @@ one-sentence summary (it's what `(doc 'name)` and the LSP show on hover);
 backtick code, **bold**, and `-` bullet lists are rendered, so use them. Private (`defn-`) helpers usually skip the docstring and use a `;;` comment instead.
 
 ```lisp
-(defn format-source (src)
+(defn format/source (src)
   "Format `src` as a Brood source string. Idempotent."
   …)
 ```
@@ -276,7 +276,7 @@ paragraph on what the module is for and where its Rust substrate lives, if any.
 offending value appended via `str`-style trailing args:
 
 ```lisp
-(error "reload-on-change: no such path: " path)
+(error "reload/on-change: no such path: " path)
 ```
 
 ## Polymorphism — abilities (core)
@@ -395,9 +395,9 @@ edit the library. Beyond the core `Display` (`to-str`, what `println` shows) and
 | `impl` this | to get |
 |---|---|
 | `JsonEncode` — `(to-json x)`, from `json` | `json-encode` handles your type (a record's wire shape; a pid/fn/datetime at all). **No `:default`** — an unimpl'd kind still errors loudly. |
-| `Port` — `(io-write p s)`, from `io` | your value is an output port (`with-out`, logger sinks). A bare 1-arg fn already is one. |
+| `Port` — `(io/write p s)`, from `io` | your value is an output port (`with-out`, logger sinks). A bare 1-arg fn already is one. |
 | `LogBackend` — `(backend-emit b rec)`, from `log` | a backend that batches / emits JSON lines / samples. `backend-passes?` is the stock level+filter gate. |
-| `Response` — `(send-response r sock)`, from `net/http` | a response kind with its own wire behaviour, including who closes the socket. |
+| `Response` — `(send-response r sock)`, from `http` | a response kind with its own wire behaviour, including who closes the socket. |
 | `Dependency` (**sealed**), from `package` · `Temporal` — `(to-iso x)` (**sealed**), from `datetime` | a new manifest dep kind / calendar type. Sealed ⇒ `nest check` demands every op. |
 
 Also: `std/`'s value types are **records**, not plain maps — `buffer`, `queue`, `pq`,
@@ -671,7 +671,7 @@ named form.
 ```
 
 Use it for anything supervised — `std/proc/supervisor.blsp`'s `:start` thunks are
-`(fn () (spawn-link (worker …)))`, and `proc/gen`'s `spawn-server-link` is the
+`(fn () (spawn-link (worker …)))`, and `gen`'s `spawn-server-link` is the
 same idea for a `defprocess` server.
 
 ## Distributed nodes — named processes & cross-node addressing
@@ -715,22 +715,22 @@ quits or crashes is detected without any app-level goodbye message.
 cleanly — no need for an ad-hoc `[:bye]` broadcast. Returns `true` if a link
 existed.
 
-## Stateful servers — the `proc/gen` framework (`(:use proc/gen)`)
+## Stateful servers — the `gen` framework (`(:use gen)`)
 
 Raw `spawn`/`receive` is the substrate; for a process that **holds state and
-answers messages** (a gen_server / actor), use `proc/gen`. State is immutable —
+answers messages** (a gen_server / actor), use `gen`. State is immutable —
 each clause *returns the next state* to carry through the loop. Two message
 kinds:
 
 - **cast** — fire-and-forget; the clause body is the **next state**. Send with
   `(! pid payload)`.
 - **call** — synchronous; the clause body is `[reply next-state]` and the caller
-  blocks for `reply`. Send with `(gen-call pid payload)`.
+  blocks for `reply`. Send with `(gen/call pid payload)`.
 - **query** — synchronous read-only; the body is just the reply, state unchanged.
   Use this for "just read a field" cases to avoid the `[x s]` boilerplate.
 
 ```lisp
-(defmodule my-counter "…" (:use proc/gen))   ; (:use proc/gen), not (require 'proc/gen),
+(defmodule my-counter "…" (:use gen))   ; (:use gen), not (require 'gen),
                                           ; to write defprocess/cast/gen-call bare
 
 (defprocess counter (n)                 ; n is the state
@@ -743,14 +743,14 @@ kinds:
 (def c (spawn-server counter 0))        ; spawn with initial state 0 → pid
 (! c :inc)                              ; cast (returns immediately)
 (! c [:add 10])
-(gen-call c :value)                     ; => 11  (synchronous; blocks for reply)
-(gen-call c :double)                    ; => 22  (query — read-only)
+(gen/call c :value)                     ; => 11  (synchronous; blocks for reply)
+(gen/call c :double)                    ; => 22  (query — read-only)
 (stop c)                                ; graceful shutdown; ends the loop
 ```
 
 Other primitives: `(sleep ms)` parks the current process without touching its
 mailbox (it does *not* block a worker thread). `(stop pid)` ends a server
-process's receive loop cleanly — every `proc/gen` process automatically handles
+process's receive loop cleanly — every `gen` process automatically handles
 the stop envelope, no `:stop` clause needed.
 
 **Worker pool — fan out work, fan in results** (plain `spawn`/`receive`, the
@@ -1002,7 +1002,7 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
 - **processes**: `spawn` (incl. named-spawn `(spawn :name expr)`) `spawn-link`
   `send` `receive` `self` `ref` `monitor` `demonitor` `link` `unlink` `trap-exit`
   `register` `whereis`
-  — plus the **`proc/gen`** framework below
+  — plus the **`gen`** framework below
 - **lazy fusing views**: `lmap` `lfilter` `lkeep` `lremove` (thread with `->>`;
   realise with `seq`/`into`) plus `comp` for function composition
 

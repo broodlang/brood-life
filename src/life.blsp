@@ -1055,7 +1055,7 @@ then clamp the pan so the magnified window stays inside the board. A board cell 
 (defn- inject-index
   (inject)
   "Index of `inject` in `*inject-presets*` (0 if it isn't one — e.g. the initial value)."
-  (or (enum/index-where (fn (x) (= x inject)) *inject-presets*) 0))
+  (or (seq/index-where (fn (x) (= x inject)) *inject-presets*) 0))
 
 (defn inject-cycle (inject)
   "The NEXT auto-spawn preset, wrapping: off → 1s → 5s → 30s → off — the `[spawn]` button."
