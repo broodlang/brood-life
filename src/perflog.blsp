@@ -12,12 +12,12 @@ to finish. (If Brood gains an append/handle API, swap the re-spit for a real app
 `s` + newline and re-writes the whole buffer to `path`; `:stop` ends it."
   (receive
     (:stop nil)
-    ([:line s] (let (buf2 (str buf s "\n")) (do (spit path buf2) (perflog-loop path buf2))))))
+    ([:line s] (let (buf2 (str buf s "\n")) (do (file/spit path buf2) (perflog-loop path buf2))))))
 
 (defn log-start (path)
   "Start a logger writing to `path` (truncating any existing file); returns its pid."
   (do
-    (spit path "")
+    (file/spit path "")
     (spawn (perflog-loop path ""))))
 
 (defn log-line (pid s)

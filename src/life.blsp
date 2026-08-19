@@ -459,11 +459,11 @@ Returns `[board' ages' colors' rp']`."
 ;; show (the renderer's LOCAL copy) rather than reading a global, so the renderer can repaint
 ;; them the instant you click/drag, ahead of the sim.
 (defn spawn-label (inject)
-  (str " spawn " (if (> inject 0) (str (pad-left (str inject) 2) "s") "off") " "))
+  (str " spawn " (if (> inject 0) (str (string/pad-left (str inject) 2) "s") "off") " "))
 
 (defn reaper-label (on)
   "The `[reaper]` key — fixed width (12 chars) so the layout/hit ranges hold as the state flips."
-  (str " reaper " (pad-left (if on "on" "off") 3) " "))
+  (str " reaper " (string/pad-left (if on "on" "off") 3) " "))
 
 ;; The footer's CELL layout at the current scale, the single source of truth for both the
 ;; renderer and the click hit-test. The keys are *btn-inset* steps smaller than the bar, so
@@ -475,9 +475,9 @@ Returns `[board' ages' colors' rp']`."
 width, so the CLEAR key can sit at the bottom-RIGHT (the spawn/fps keys lead at the left)."
   (let (bs (max 1 (- *status-scale* *btn-inset*))
         m bs
-        sw (* (string-length (spawn-label 0)) bs)
-        rw (* (string-length (reaper-label false)) bs)
-        cw (* (string-length *clear-label*) bs)
+        sw (* (string/length (spawn-label 0)) bs)
+        rw (* (string/length (reaper-label false)) bs)
+        cw (* (string/length *clear-label*) bs)
         sx0 m
         sx1 (+ sx0 sw)
         rx0 (+ sx1 m) ; the reaper key sits just right of spawn, an `m` margin between
@@ -500,17 +500,17 @@ the previous frame). The renderer composes this after the buttons. Each number i
 FIXED width so the line never reflows as digit counts change (the bar is a monospace grid).
 `souls` is the reaper's lifetime reaped-cell tally."
   (str "gen "
-    (pad-left (str gen) 7)
+    (string/pad-left (str gen) 7)
     " · "
-    (pad-left (str (quot 1000 (max 1 (quot per 1000000)))) 4)
+    (string/pad-left (str (quot 1000 (max 1 (quot per 1000000)))) 4)
     " fps · "
-    (pad-left (str cells) 6)
+    (string/pad-left (str cells) 6)
     " cells · "
     *souls-label*
     " "
-    (pad-left (str souls) 7)
+    (string/pad-left (str souls) 7)
     " · "
-    (pad-left (str (quot (mem-bytes) 1048576)) 4)
+    (string/pad-left (str (quot (mem-bytes) 1048576)) 4)
     " MB"))
 
 ;; The bottom bar as render ops: a full-width reverse `bar` holding the INFO (shifted past
@@ -528,7 +528,7 @@ FIXED width so the line never reflows as digit counts change (the bar is a monos
         brow (+ top (get l :voff))
         bg (bar top
              vcols
-             (str (string-repeat " " (get l :info-char)) info)
+             (str (string/repeat " " (get l :info-char)) info)
              {:face *status-face* :align :left :scale *status-scale*}))
     [bg
       [:text brow sx0 (spawn-label (get ui :inject)) face]
@@ -557,7 +557,7 @@ carried a colour, or one kept past a resize)."
   (let (sx (- (mod bx w) ox)
         sy (- (mod by h) oy))
     (if (and (>= sx 0) (< sx visw) (>= sy 0) (< sy vish))
-      [[:text (* sy z) (* sx (* a z)) (string-repeat " " a) (assoc *cell-face* :bg col :scale z)]]
+      [[:text (* sy z) (* sx (* a z)) (string/repeat " " a) (assoc *cell-face* :bg col :scale z)]]
       [])))
 
 (defn trail-ops (rv w h z a ox oy visw vish)
@@ -630,7 +630,7 @@ and fewer cells show), each at `px*z`. The cell ops and the footer are spliced w
 copied again to append the bar."
   (let (z *view-zoom*
         a *cell-aspect*
-        fill (string-repeat " " a) ; an `a`-wide blank; the face's bg fills its cell box
+        fill (string/repeat " " a) ; an `a`-wide blank; the face's bg fills its cell box
         colors (get ui :colors) ; the spawn-colour layer: bit index → packed colour
         rv (get ui :reaper) ; the reaper's render bundle (pos/face/trail/flash), or nil when off
         bits (get live :bits)
@@ -1148,7 +1148,7 @@ the fair-comparison board pin shared with the .NET port."
   (let (s (getenv "LIFE_BOARD"))
     (if (env-blank? s)
       nil
-      (let (parts (string-split s "x"))
+      (let (parts (string/split s "x"))
         (if (= (count parts) 2)
           [(string->number (first parts)) (string->number (second parts))]
           (let (n (string->number s)) [n n]))))))
