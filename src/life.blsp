@@ -253,7 +253,7 @@ consecutive spawns are far apart on the colour wheel — a big range of distinct
 ;; ---- PACKED colour storage (the per-frame hot-path representation) -------------------------
 ;; A cell's `[r g b]` is stored as ONE machine-word integer, because the per-frame cost is
 ;; `recolor`, and a newborn's colour is the sum of its live parents' colours: on a packed int that
-;; is a single ADD per parent — no per-channel `vector-ref`, no 8-wide accumulator vector (which
+;; is a single ADD per parent — no per-channel `vector/ref`, no 8-wide accumulator vector (which
 ;; profiling showed was ~⅓ of the blend cost). Each channel sits in its own 12-bit field so the
 ;; sums don't carry into each other, and a CELL COUNT rides in the bits above: bits 0-11 = r,
 ;; 12-23 = g, 24-35 = b, 36+ = count (1 per stored colour). A channel is 0-255, so summing the ≤8
@@ -382,12 +382,12 @@ across the board. nil when the layer is empty. Linear in the population."
   (let (best (reduce (fn (acc [i g])
                        (let (d (max (math/abs (- (mod i w) rx)) (math/abs (- (quot i w) ry))))
                          (if (or (nil? acc)
-                               (< g (vector-ref acc 1))
-                               (and (= g (vector-ref acc 1)) (< d (vector-ref acc 2))))
+                               (< g (vector/ref acc 1))
+                               (and (= g (vector/ref acc 1)) (< d (vector/ref acc 2))))
                            [i g d]
                            acc)))
                nil ages))
-    (if (nil? best) nil [(mod (vector-ref best 0) w) (quot (vector-ref best 0) w)])))
+    (if (nil? best) nil [(mod (vector/ref best 0) w) (quot (vector/ref best 0) w)])))
 
 (defn footprint (cx cy w h)
   "The whole-board bit indices of the reaper's *reaper-size*² block centred on `(cx,cy)`, torus-
@@ -593,11 +593,11 @@ so the scythe leads the way it's heading. Skips transparent (nil) sprite cells."
     (mapcat
       (fn ([ix iy])
         (let (src (if (< face 0) (- (- n 1) ix) ix) ; mirror columns when facing left
-              col (vector-ref *reaper-sprite* (+ (* iy n) src)))
+              col (vector/ref *reaper-sprite* (+ (* iy n) src)))
           (if (nil? col)
             []
-            (overlay-cell (+ rx (vector-ref *reaper-offsets* ix))
-              (+ ry (vector-ref *reaper-offsets* iy))
+            (overlay-cell (+ rx (vector/ref *reaper-offsets* ix))
+              (+ ry (vector/ref *reaper-offsets* iy))
               col
               w
               h
@@ -958,7 +958,7 @@ the renderer's two `[:mouse …]` arities (press carries a 7th click-count eleme
   "The live bitboard carried by the `[:cells]` op in `ops` (the uncoloured fast path), or nil
 when there isn't one. Lets the renderer recover the board's bits without the SIM sending them
 a second time alongside the op."
-  (reduce (fn (acc o) (if (and (nil? acc) (vector? o) (= (first o) :cells)) (vector-ref o 5) acc))
+  (reduce (fn (acc o) (if (and (nil? acc) (vector? o) (= (first o) :cells)) (vector/ref o 5) acc))
     nil ops))
 
 ;; The RENDERER owns the window + input. On `[:board nl st colors ops]` it BLITS the ops the SIM
@@ -1059,12 +1059,12 @@ then clamp the pan so the magnified window stays inside the board. A board cell 
 
 (defn inject-cycle (inject)
   "The NEXT auto-spawn preset, wrapping: off → 1s → 5s → 30s → off — the `[spawn]` button."
-  (vector-ref *inject-presets* (mod (+ (inject-index inject) 1) (count *inject-presets*))))
+  (vector/ref *inject-presets* (mod (+ (inject-index inject) 1) (count *inject-presets*))))
 
 (defn inject-step (inject dir)
   "Step through the presets without wrapping: `dir` > 0 RARER (toward 30s / off), `dir` < 0
 MORE OFTEN (toward 1s). Behind the `[`/`]` keys."
-  (vector-ref *inject-presets*
+  (vector/ref *inject-presets*
     (max 0 (min (- (count *inject-presets*) 1) (+ (inject-index inject) dir)))))
 
 ;; ---- input → [ui' redraw?], sending the SIM throttled control messages -----------------
