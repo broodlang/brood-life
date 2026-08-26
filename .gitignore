@@ -11,3 +11,6 @@ life.log
 
 # nest release default output (binary is named after the project)
 /foobar
+
+# Startup-image cache — a build artifact, rebuilt on demand
+.brood/
