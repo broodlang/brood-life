@@ -32,7 +32,7 @@ shapes compare equal (lets `distinct` dedupe a symmetric pattern's repeated orie
   "The distinct orientations of `pat`: its four rotations and each one mirrored (up to 8;
 fewer when the pattern is symmetric). All behave identically under Life's isotropic rules."
   (let (r0 (normalize pat) r1 (rotate r0) r2 (rotate r1) r3 (rotate r2))
-    (distinct [r0 r1 r2 r3 (mirror r0) (mirror r1) (mirror r2) (mirror r3)])))
+    (seq/distinct [r0 r1 r2 r3 (mirror r0) (mirror r1) (mirror r2) (mirror r3)])))
 
 ;; ---- still-lifes: fixed under `step` -------------------------------------------
 (def block [[0 0] [1 0] [0 1] [1 1]]) ; OO / OO
@@ -125,4 +125,4 @@ fewer when the pattern is symmetric). All behave identically under Life's isotro
     beehive loaf boat tub ship pond barge long-ship snake eater1 blinker toad beacon clock pulsar
     pentadecathlon lwss mwss hwss glider r-pentomino acorn diehard pi-heptomino thunderbird])
 
-(defdyn *shapes* (distinct (mapcat orientations *base-shapes*)))
+(defdyn *shapes* (seq/distinct (mapcat orientations *base-shapes*)))

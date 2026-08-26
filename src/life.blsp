@@ -192,9 +192,9 @@ this RENDERER that draws + handles input."
 (the live app starts empty — see `run-life`)."
   (if (>= (bb-live-count acc) target)
     acc
-    (let ([shape s1] (sample s *shapes*)
-          [x s2] (rand-int s1 *w*)
-          [y s3] (rand-int s2 *h*))
+    (let ([shape s1] (seq/sample s *shapes*)
+          [x s2] (rand/int s1 *w*)
+          [y s3] (rand/int s2 *h*))
       (seed-sow s3 (bb-place acc shape x y) target))))
 
 (defn seed (s)
@@ -209,9 +209,9 @@ are live — capped to ~90% of the torus area (floored at 4) so a small board st
 (defn inject-pattern (live s)
   "Sow a random known pattern — any of `*patterns*` — at a random torus position onto
 bitboard `live`, threading the PRNG `s`; returns `[live' s']`."
-  (let ([pat s1] (sample s *patterns*)
-        [x s2] (rand-int s1 (get live :w))
-        [y s3] (rand-int s2 (get live :h)))
+  (let ([pat s1] (seq/sample s *patterns*)
+        [x s2] (rand/int s1 (get live :w))
+        [y s3] (rand/int s2 (get live :h)))
     [(bb-place live pat x y) s3]))
 
 ;; ---- the SPAWN-COLOUR layer (parallel to the pure bitboard) -------------------------------
@@ -382,12 +382,12 @@ across the board. nil when the layer is empty. Linear in the population."
   (let (best (reduce (fn (acc [i g])
                        (let (d (max (math/abs (- (mod i w) rx)) (math/abs (- (quot i w) ry))))
                          (if (or (nil? acc)
-                               (< g (vector-ref acc 1))
-                               (and (= g (vector-ref acc 1)) (< d (vector-ref acc 2))))
+                               (< g (seq/vector-ref acc 1))
+                               (and (= g (seq/vector-ref acc 1)) (< d (seq/vector-ref acc 2))))
                            [i g d]
                            acc)))
                nil ages))
-    (if (nil? best) nil [(mod (vector-ref best 0) w) (quot (vector-ref best 0) w)])))
+    (if (nil? best) nil [(mod (seq/vector-ref best 0) w) (quot (seq/vector-ref best 0) w)])))
 
 (defn footprint (cx cy w h)
   "The whole-board bit indices of the reaper's *reaper-size*² block centred on `(cx,cy)`, torus-
@@ -510,7 +510,7 @@ FIXED width so the line never reflows as digit counts change (the bar is a monos
     " "
     (string/pad-left (str souls) 7)
     " · "
-    (string/pad-left (str (quot (mem-bytes) 1048576)) 4)
+    (string/pad-left (str (quot (dev/mem-bytes) 1048576)) 4)
     " MB"))
 
 ;; The bottom bar as render ops: a full-width reverse `bar` holding the INFO (shifted past
@@ -593,11 +593,11 @@ so the scythe leads the way it's heading. Skips transparent (nil) sprite cells."
     (mapcat
       (fn ([ix iy])
         (let (src (if (< face 0) (- (- n 1) ix) ix) ; mirror columns when facing left
-              col (vector-ref *reaper-sprite* (+ (* iy n) src)))
+              col (seq/vector-ref *reaper-sprite* (+ (* iy n) src)))
           (if (nil? col)
             []
-            (overlay-cell (+ rx (vector-ref *reaper-offsets* ix))
-              (+ ry (vector-ref *reaper-offsets* iy))
+            (overlay-cell (+ rx (seq/vector-ref *reaper-offsets* ix))
+              (+ ry (seq/vector-ref *reaper-offsets* iy))
               col
               w
               h
@@ -696,7 +696,7 @@ dip to rising population or memory churn)."
     "\tms "
     (quot per 1000000)
     "\tmb "
-    (quot (mem-bytes) 1048576)))
+    (quot (dev/mem-bytes) 1048576)))
 
 ;; The SIM owns the board and paces ITSELF: its `receive` parks on an `(after period)` timeout
 ;; — a self-resetting timer (the same mechanism as ADR-101's named `ui-run` timers: both are
@@ -748,7 +748,7 @@ cell samples a glider gun (`*shooters*`, right button), any other kind samples a
 (the app starts empty)."
   (reduce (fn ([b s] [x y kind])
             (let (catalog (if (= kind :gun) *shooters* *shapes*)
-                  [pat s1] (sample s catalog))
+                  [pat s1] (seq/sample s catalog))
               [(bb-place b pat x y) s1]))
     [board s]
     clicks))
@@ -776,8 +776,8 @@ repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag 
         colors0 (if (= (get ob :w) w)
                   (get m :colors)
                   (colors-refit (get m :colors) (get ob :w) w h))
-        now (now-ns)
-        per (- now (get m :prev))
+        os/now (os/now-ns)
+        per (- os/now (get m :prev))
         held (get m :held)
         hn2 (if held (+ (get m :hn) 1) 0)
         repeat? (and held (>= hn2 *hold-delay*) (= 0 (mod (- hn2 *hold-delay*) *spawn-every*)))
@@ -788,10 +788,10 @@ repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag 
                   (color-spawn colors0 (get m :next-id) (get board :bits) (get b1 :bits))
                   [colors0 (get m :next-id)])
         inject (get m :inject)
-        inj? (and (> inject 0) (>= (- now (get m :last-inj)) (* inject 1000000000)))
+        inj? (and (> inject 0) (>= (- os/now (get m :last-inj)) (* inject 1000000000)))
         [b2 s2] (if inj? (inject-pattern b1 s1) [b1 s1])
         [c2 n2] (if inj? (color-spawn c1 n1 (get b1 :bits) (get b2 :bits)) [c1 n1])
-        last-inj2 (if inj? now (get m :last-inj))
+        last-inj2 (if inj? os/now (get m :last-inj))
         nxt (bb-step b2)
         ;; Skip the per-birth colour blend entirely when no spawn colour is in play:
         ;; with `c2` empty every birth blends to nil and every death dissocs nothing, so
@@ -826,7 +826,7 @@ repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag 
                     :board fboard
                     :s s2
                     :gen (+ gen 1)
-                    :prev now
+                    :prev os/now
                     :hn hn2
                     :last-inj last-inj2
                     :st st2
@@ -842,7 +842,7 @@ repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag 
 (vs. handing back to the loop) WHILE you drag, so the world animates as you draw without
 stepping once per pasted cell — a step costs far more than a paste, so that would lag the
 stroke. (Not a frame-rate cap: the paced loop itself runs uncapped.)"
-  (>= (- (now-ns) prev) (* (quot 1000 *step-rate*) 1000000)))
+  (>= (- (os/now-ns) prev) (* (quot 1000 *step-rate*) 1000000)))
 
 (defn sim-paste (m kind x y newhn)
   "Apply ONE pasted pattern; if more paste events are ALREADY queued (a fast drag), apply
@@ -939,12 +939,12 @@ Escape *key*), or the `q` / Esc / Ctrl-C keys."
 
 (defn render-quit (sim w)
   "Tear down: stop the sim (it owns the only timer), then close window `w`."
-  (do (send sim :stop) (gui-close w)))
+  (do (send sim :stop) (gui/close w)))
 
 (defn draw! (w board info ui)
   "Paint one frame: the board (under the *view-zoom* camera) + the bar (the renderer's
 buttons from `ui` + the sim's `info` string). Geometry is read from the board only."
-  (gui-draw w (render board ui info)))
+  (gui/draw w (render board ui info)))
 
 (defn render-mouse (w sim board info ui action button row col)
   "Route one mouse event, then redraw if the local control mirror changed and loop. Shared by
@@ -958,7 +958,8 @@ the renderer's two `[:mouse …]` arities (press carries a 7th click-count eleme
   "The live bitboard carried by the `[:cells]` op in `ops` (the uncoloured fast path), or nil
 when there isn't one. Lets the renderer recover the board's bits without the SIM sending them
 a second time alongside the op."
-  (reduce (fn (acc o) (if (and (nil? acc) (vector? o) (= (first o) :cells)) (vector-ref o 5) acc))
+  (reduce (fn (acc o)
+            (if (and (nil? acc) (vector? o) (= (first o) :cells)) (seq/vector-ref o 5) acc))
     nil ops))
 
 ;; The RENDERER owns the window + input. On `[:board nl st colors ops]` it BLITS the ops the SIM
@@ -990,7 +991,7 @@ a second time alongside the op."
           (do
             ;; common case: blit the SIM's pre-built ops; on a dim change, render locally so the
             ;; resize takes effect this frame (the SIM catches up to the new dims next frame).
-            (if dims-match (gui-draw w ops) (draw! w nl2 st ui2))
+            (if dims-match (gui/draw w ops) (draw! w nl2 st ui2))
             (send sim [:drawn])
             (render-loop w sim nl2 st ui2)))))
     ;; Resize from the EVENT's cell grid — refit the cached board to it and redraw now.
@@ -1026,7 +1027,7 @@ a second time alongside the op."
   "Re-fit the sim torus to window `w`: set `*w*`/`*h*` to the board area (the window cells,
 less the bar). Only `def`s when a value actually CHANGED — it runs every frame, and rebinding
 a global can invalidate caches, so skip it on the common no-op frame. Returns `[cols rows]`."
-  (let ([cols rows] (gui-size w)
+  (let ([cols rows] (gui/size w)
         nw (max *grid-min* (quot cols *cell-aspect*)) ; board cols = screen cols ÷ cell aspect
         nh (max *grid-min* (max 1 (- rows *status-scale*))))
     (do
@@ -1059,12 +1060,12 @@ then clamp the pan so the magnified window stays inside the board. A board cell 
 
 (defn inject-cycle (inject)
   "The NEXT auto-spawn preset, wrapping: off → 1s → 5s → 30s → off — the `[spawn]` button."
-  (vector-ref *inject-presets* (mod (+ (inject-index inject) 1) (count *inject-presets*))))
+  (seq/vector-ref *inject-presets* (mod (+ (inject-index inject) 1) (count *inject-presets*))))
 
 (defn inject-step (inject dir)
   "Step through the presets without wrapping: `dir` > 0 RARER (toward 30s / off), `dir` < 0
 MORE OFTEN (toward 1s). Behind the `[`/`]` keys."
-  (vector-ref *inject-presets*
+  (seq/vector-ref *inject-presets*
     (max 0 (min (- (count *inject-presets*) 1) (+ (inject-index inject) dir)))))
 
 ;; ---- input → [ui' redraw?], sending the SIM throttled control messages -----------------
@@ -1116,8 +1117,7 @@ right = guns), drawn immediately by the sim — a bare mouse motion (no button d
           [(if (= action :press) :press :drag)
             (if (= button
                   :right)
-              :gun
-              :shape)
+              :gun :shape)
             (+ *view-ox*
               (quot col (* *cell-aspect* *view-zoom*)))
             (+ *view-oy* (quot row *view-zoom*))])
@@ -1145,17 +1145,17 @@ reaper sprite itself is drawn from the SIM's frames)."
 (defn env-board ()
   "Parse `LIFE_BOARD` (\"WxH\" or a single \"N\" for a square) into `[w h]`, or nil when unset —
 the fair-comparison board pin shared with the .NET port."
-  (let (s (getenv "LIFE_BOARD"))
+  (let (s (os/getenv "LIFE_BOARD"))
     (if (env-blank? s)
       nil
       (let (parts (string/split s "x"))
         (if (= (count parts) 2)
-          [(string->number (first parts)) (string->number (second parts))]
-          (let (n (string->number s)) [n n]))))))
+          [(string/->number (first parts)) (string/->number (second parts))]
+          (let (n (string/->number s)) [n n]))))))
 
 (defn env-int (name dflt)
   "Read integer env var `name`, or `dflt` when unset/empty."
-  (let (s (getenv name)) (if (env-blank? s) dflt (string->number s))))
+  (let (s (os/getenv name)) (if (env-blank? s) dflt (string/->number s))))
 
 (defn seed-block (w h n)
   "A `w`×`h` board with a centred solid `n`×`n` block of live cells — the deterministic
@@ -1170,9 +1170,9 @@ fair-comparison start (identical to the .NET port's `--block` seed)."
 with a self-resetting `(after)` timer that input preempts (so pastes are instant); this
 process draws + handles input. The window cell font is set ONCE; the scroll wheel is a
 render-only *view-zoom* camera (the board is unchanged)."
-  (let (w (gui-open "Brood Life" 1920 1200) ; title + a big (screen-filling) window
-        _ (gui-icon! w (icon-rgba) *icon-size* *icon-size*) ; the taskbar/title-bar glider icon
-        _ (gui-font! w {:family :mono :height *board-height*}) ; the FIXED window font (board only)
+  (let (w (gui/open "Brood Life" 1920 1200) ; title + a big (screen-filling) window
+        _ (gui/icon! w (icon-rgba) *icon-size* *icon-size*) ; the taskbar/title-bar glider icon
+        _ (gui/font! w {:family :mono :height *board-height*}) ; the FIXED window font (board only)
         ;; FAIR-COMPARISON pin: if LIFE_BOARD is set, lock *w*/*h* to it (so grid-fit / resize
         ;; leave them alone); else size to the window as usual.
         fb (env-board)
@@ -1182,7 +1182,7 @@ render-only *view-zoom* camera (the board is unchanged)."
         _ (if fb (do (def *w* (first fb)) (def *h* (second fb))) (grid-fit w))
         blk (env-int "LIFE_BLOCK" 0) ; seed a centred solid blk×blk block (0 = the normal empty start)
         inj (if (> blk 0) 0 *inject-secs*) ; block seed ⇒ deterministic: no auto-inject
-        start (now-ns)
+        start (os/now-ns)
         board (if (> blk 0) (seed-block *w* *h* blk) (bb-make *w* *h*)) ; START EMPTY unless seeded
         me (self) ; this root process is the renderer
         logger (perflog/log-start *log-path*)
