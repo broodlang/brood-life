@@ -2,7 +2,7 @@
 (project
   :name "life"
   :version "0.1.0"
-  :brood ">= 0.13.0"
+  :brood ">= 0.14.1"
   :main (life run-life))
 
 ;; To depend on other Brood packages, add a :dependencies vector to the form
