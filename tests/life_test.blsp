@@ -88,11 +88,11 @@
   (test "age-step drops the dead, keeps survivors' birth-gen, and stamps newcomers"
     (let (
           ; cells 0,1 alive last gen
-          old (bit-or (bit-shift-left 1 0) (bit-shift-left 1 1))
+          old (bit/or (bit/shift-left 1 0) (bit/shift-left 1 1))
           ; both born at gen 5
           ages {0 5 1 5}
           ; 1 survives, 0 dies, 7 appears
-          new (bit-or (bit-shift-left 1 1) (bit-shift-left 1 7))
+          new (bit/or (bit/shift-left 1 1) (bit/shift-left 1 7))
           stepped (age-step ages old new 9))
       (do
         ; survivor keeps its birth-gen
@@ -104,8 +104,8 @@
     ;; The invariant the reaper relies on: after a step, every set bit in the new board has
     ;; an age entry. Pre-spawn old = {0,1}; new (post-step) = {1,7,9}. With the fix, 7 and 9
     ;; (a spawn-and-survive plus a step newborn) are both stamped, not silently skipped.
-    (let (old (bit-or (bit-shift-left 1 0) (bit-shift-left 1 1))
-          new (reduce (fn (acc i) (bit-or acc (bit-shift-left 1 i))) 0 [1 7 9])
+    (let (old (bit/or (bit/shift-left 1 0) (bit/shift-left 1 1))
+          new (reduce (fn (acc i) (bit/or acc (bit/shift-left 1 i))) 0 [1 7 9])
           stepped (age-step {0 2 1 2} old new 11))
       (is (every? (fn (i) (not (nil? (get stepped i)))) [1 7 9]))))
 

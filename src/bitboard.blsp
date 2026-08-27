@@ -18,26 +18,26 @@ number) and `bit-positions` (so rendering stays O(live), not O(area)).")
 (defn make (w h)
   "An empty `w`×`h` whole-board bitboard, with the torus edge-column masks precomputed.
 `:col0` = Σ 2^(y*w) is a closed form of board/mask (the geometric series 1+2^w+2^2w+…)."
-  (let (mask (- (bit-shift-left 1 w) 1) ; one row: w low bits
-        board (- (bit-shift-left 1 (* w h)) 1) ; the whole grid: w*h bits
-        col0 (quot board mask) ; the x=0 bit of every row (each row's low bit)
-        high (bit-shift-left col0 (- w 1)))
+  (let (mask (- (bit/shift-left 1 w) 1) ; one row: w low bits
+        board (- (bit/shift-left 1 (* w h)) 1) ; the whole grid: w*h bits
+        col0 (math/quot board mask) ; the x=0 bit of every row (each row's low bit)
+        high (bit/shift-left col0 (- w 1)))
     ; the x=w−1 bit of every row (each row's top bit)
     {:w w :h h :mask mask :board board :col0 col0 :high high :bits 0}))
 
 (defn bset (board x y)
   "Set cell `(x,y)` live; returns the new board. Caller wraps `x`/`y` into range."
   (let (w (get board :w))
-    (assoc board :bits (bit-or (get board :bits) (bit-shift-left 1 (+ x (* y w)))))))
+    (assoc board :bits (bit/or (get board :bits) (bit/shift-left 1 (+ x (* y w)))))))
 
 (defn place (board pat x y)
   "Set every cell of pattern `pat` (a list of `[dx dy]`) at origin `(x,y)`, wrapped."
   (let (w (get board :w) h (get board :h))
-    (reduce (fn (b [dx dy]) (bset b (mod (+ x dx) w) (mod (+ y dy) h))) board pat)))
+    (reduce (fn (b [dx dy]) (bset b (math/mod (+ x dx) w) (math/mod (+ y dy) h))) board pat)))
 
 (defn live-count (board)
   "Population: the number of live cells — one `bit-count` of the whole-board integer."
-  (bit-count (get board :bits)))
+  (bit/count (get board :bits)))
 
 ;; The whole-board torus neighbour FIELDS. For a one-cell shift, the bits that cross a
 ;; row boundary are the wrap: the WEST field (each cell sees its x−1 neighbour) is the
@@ -64,13 +64,13 @@ A cell lives iff it has exactly 3 live neighbours, or 2 and it is already live �
         wm1 (- w 1)
         hm1w (* (- h 1) w)
         ;; west / east neighbour fields (torus-wrapped within each row)
-        l (bit-or (bit-and (bit-shift-left b 1) (bit-xor col0 brd))
-            (bit-shift-right (bit-and b high) wm1))
-        r (bit-or (bit-and (bit-shift-right b 1) (bit-xor high brd))
-            (bit-shift-left (bit-and b col0) wm1))
+        l (bit/or (bit/and (bit/shift-left b 1) (bit/xor col0 brd))
+            (bit/shift-right (bit/and b high) wm1))
+        r (bit/or (bit/and (bit/shift-right b 1) (bit/xor high brd))
+            (bit/shift-left (bit/and b col0) wm1))
         ;; lift a field one row up / down, the off-board row wrapping round (torus)
-        up (fn (f) (bit-or (bit-and (bit-shift-left f w) brd) (bit-shift-right f hm1w)))
-        dn (fn (f) (bit-or (bit-shift-right f w) (bit-shift-left (bit-and f mask) hm1w)))
+        up (fn (f) (bit/or (bit/and (bit/shift-left f w) brd) (bit/shift-right f hm1w)))
+        dn (fn (f) (bit/or (bit/shift-right f w) (bit/shift-left (bit/and f mask) hm1w)))
         ;; the eight neighbours: the three columns (west / centre / east) × the three rows
         ns [(up l) (up b) (up r) l r (dn l) (dn b) (dn r)]
         ;; full-adder: sum the eight 1-bit-per-cell fields into a per-cell count. We only
@@ -78,11 +78,11 @@ A cell lives iff it has exactly 3 live neighbours, or 2 and it is already live �
         ;; and the only larger count with s1 set, 8 (`1000`), drops to s1=0 once the sum is
         ;; truncated to three bits — so the carry out of s2 is never read and isn't kept.
         planes (reduce (fn ([s0 s1 s2] m)
-                         (let (c (bit-and s0 m)
-                               s0b (bit-xor s0 m)
-                               c2 (bit-and s1 c)
-                               s1b (bit-xor s1 c)
-                               s2b (bit-xor s2 c2))
+                         (let (c (bit/and s0 m)
+                               s0b (bit/xor s0 m)
+                               c2 (bit/and s1 c)
+                               s1b (bit/xor s1 c)
+                               s2b (bit/xor s2 c2))
                            [s0b s1b s2b]))
                  [0 0 0]
                  ns)
@@ -90,13 +90,13 @@ A cell lives iff it has exactly 3 live neighbours, or 2 and it is already live �
         s1 (seq/vector-ref planes 1)
         s2 (seq/vector-ref planes 2))
     (assoc board
-      :bits (bit-and (bit-and s1 (bit-xor s2 brd)) (bit-or s0 b)))))
+      :bits (bit/and (bit/and s1 (bit/xor s2 brd)) (bit/or s0 b)))))
 
 (defn cells (board)
   "A list of live `[x y]` cells — O(live), via one `bit-positions` over the whole board
 (bit `i` ⇒ cell `(i mod w, i div w)`)."
   (let (w (get board :w))
-    (map (fn (i) [(mod i w) (quot i w)]) (bit-positions (get board :bits)))))
+    (map (fn (i) [(math/mod i w) (math/quot i w)]) (bit/positions (get board :bits)))))
 
 (defn refit (board w h)
   "Rebuild `board` at new dims (a window resize / zoom), DROPPING cells that fall outside
