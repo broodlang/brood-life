@@ -33,7 +33,7 @@ number) and `bit-positions` (so rendering stays O(live), not O(area)).")
 (defn place (board pat x y)
   "Set every cell of pattern `pat` (a list of `[dx dy]`) at origin `(x,y)`, wrapped."
   (let (w (get board :w) h (get board :h))
-    (reduce (fn (b [dx dy]) (bset b (math/mod (+ x dx) w) (math/mod (+ y dy) h))) board pat)))
+    (reduce pat board (fn (b [dx dy]) (bset b (math/mod (+ x dx) w) (math/mod (+ y dy) h))))))
 
 (defn live-count (board)
   "Population: the number of live cells — one `bit-count` of the whole-board integer."
@@ -77,15 +77,15 @@ A cell lives iff it has exactly 3 live neighbours, or 2 and it is already live �
         ;; need the low THREE bits (s0/s1/s2) — survival is `s1 & ~s2` (a count of 2 or 3),
         ;; and the only larger count with s1 set, 8 (`1000`), drops to s1=0 once the sum is
         ;; truncated to three bits — so the carry out of s2 is never read and isn't kept.
-        planes (reduce (fn ([s0 s1 s2] m)
-                         (let (c (bit/and s0 m)
-                               s0b (bit/xor s0 m)
-                               c2 (bit/and s1 c)
-                               s1b (bit/xor s1 c)
-                               s2b (bit/xor s2 c2))
-                           [s0b s1b s2b]))
+        planes (reduce ns
                  [0 0 0]
-                 ns)
+                 (fn ([s0 s1 s2] m)
+                   (let (c (bit/and s0 m)
+                         s0b (bit/xor s0 m)
+                         c2 (bit/and s1 c)
+                         s1b (bit/xor s1 c)
+                         s2b (bit/xor s2 c2))
+                     [s0b s1b s2b])))
         s0 (seq/vector-ref planes 0)
         s1 (seq/vector-ref planes 1)
         s2 (seq/vector-ref planes 2))
@@ -96,13 +96,13 @@ A cell lives iff it has exactly 3 live neighbours, or 2 and it is already live �
   "A list of live `[x y]` cells — O(live), via one `bit-positions` over the whole board
 (bit `i` ⇒ cell `(i mod w, i div w)`)."
   (let (w (get board :w))
-    (map (fn (i) [(math/mod i w) (math/quot i w)]) (bit/positions (get board :bits)))))
+    (map (bit/positions (get board :bits)) (fn (i) [(math/mod i w) (math/quot i w)]))))
 
 (defn refit (board w h)
   "Rebuild `board` at new dims (a window resize / zoom), DROPPING cells that fall outside
 the new `w`×`h` — what's off the board is gone, not wrapped back on. Shrinking (zoom in,
 smaller window) clips; growing keeps every cell, since they were all already in range."
-  (reduce (fn (b [x y]) (if (and (< x w) (< y h)) (bset b x y) b)) (make w h) (cells board)))
+  (reduce (cells board) (make w h) (fn (b [x y]) (if (and (< x w) (< y h)) (bset b x y) b))))
 
 (defn fit (board w h)
   "`board` if it already has dims `w`×`h`, else `refit` to them."

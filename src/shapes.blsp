@@ -17,16 +17,16 @@ diehard vanishes at gen 130).")
 (defn normalize (pat)
   "`pat` shifted so its minimum x and y are 0, and sorted — a canonical form so equal
 shapes compare equal (lets `distinct` dedupe a symmetric pattern's repeated orientations)."
-  (let (mx (apply math/min (map (fn ([x y]) x) pat)) my (apply math/min (map (fn ([x y]) y) pat)))
-    (sort (map (fn ([x y]) [(- x mx) (- y my)]) pat))))
+  (let (mx (apply math/min (map pat (fn ([x y]) x))) my (apply math/min (map pat (fn ([x y]) y))))
+    (sort (map pat (fn ([x y]) [(- x mx) (- y my)])))))
 
 (defn rotate (pat)
   "`pat` rotated 90° (x,y) → (y,−x), re-normalized to a non-negative origin."
-  (normalize (map (fn ([x y]) [y (- 0 x)]) pat)))
+  (normalize (map pat (fn ([x y]) [y (- 0 x)]))))
 
 (defn mirror (pat)
   "`pat` reflected across the y-axis (x,y) → (−x,y), re-normalized."
-  (normalize (map (fn ([x y]) [(- 0 x) y]) pat)))
+  (normalize (map pat (fn ([x y]) [(- 0 x) y]))))
 
 (defn orientations (pat)
   "The distinct orientations of `pat`: its four rotations and each one mirrored (up to 8;
@@ -125,4 +125,4 @@ fewer when the pattern is symmetric). All behave identically under Life's isotro
     beehive loaf boat tub ship pond barge long-ship snake eater1 blinker toad beacon clock pulsar
     pentadecathlon lwss mwss hwss glider r-pentomino acorn diehard pi-heptomino thunderbird])
 
-(defdyn *shapes* (seq/distinct (mapcat orientations *base-shapes*)))
+(defdyn *shapes* (seq/distinct (mapcat *base-shapes* orientations)))

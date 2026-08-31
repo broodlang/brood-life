@@ -61,8 +61,8 @@ def  fn  quote  quasiquote  if  do  let  letrec
 
 Common macros (expanded once at the compile pass — runtime-free): `defmacro`
 (lowers to `(def name (%make-macro (fn …)))`), `defn`, `defn-` / `def-`, `defdyn`, `binding`,
-`cond`, `when`, `unless`, `and`, `or`, `match`, `try` / `catch`, `->` / `->>` /
-`as->`, `some->` / `some->>` / `cond->` / `cond->>` / `doto`, `if-let` / `when-let`,
+`cond`, `when`, `unless`, `and`, `or`, `match`, `try` / `catch`, `->` / `as->`,
+`some->` / `cond->` / `doto`, `if-let` / `when-let`,
 `fmt` (string interpolation), `receive`, `spawn`.
 
 ## Defining things
@@ -233,7 +233,7 @@ processes were rare enough that they simply stay public.
 
 A trailing `!` is **rare and not a mutation warning** — nothing mutates, so the
 Scheme/Clojure reading is vacuous here and `!` is per-context by decision (ADR-163):
-`sig!` = a signature *enforced* at runtime, `reflect/set-load-path!` / `clipboard-set!` = the
+`sig!` = a signature *enforced* at runtime, `reflect/set-load-path` / `clipboard-set` = the
 few root/OS-state setters, `(! pid payload)` = the Erlang-style cast in `gen`.
 **Don't add a `!` to a name of your own.**
 
@@ -558,13 +558,13 @@ frame). Debug "how did I get here" from a caught error with
 `(map (fn (f) (get f :fn)) (get e :trace))`.
 
 For longer pipelines over large data, the **lazy `l*` combinators** fuse
-intermediate collections (one pass, no throwaway lists). Thread them with `->>`:
+intermediate collections (one pass, no throwaway lists). Thread them with `->`:
 
 ```lisp
 ;; eager: builds two throwaway lists of ~1000 / ~500 elements
 (reduce + 0 (map sq (filter math/even? (range 1000))))
 ;; fused: one pass, no intermediate lists (≈3× faster on large inputs)
-(->> (range 1000) (seq/lfilter math/even?) (seq/lmap sq) (reduce + 0))
+(-> (range 1000) (seq/lfilter math/even?) (seq/lmap sq) (reduce 0 +))
 ```
 
 `seq/lmap`/`seq/lfilter`/`seq/lkeep`/`seq/lremove` each return a lazy **seq-view** — a
@@ -608,7 +608,7 @@ path:
 
   Same shape for build-a-collection-then-rebuild: fold the source straight into
   the target instead of `filter`-then-`into`. (For longer `map`/`filter`
-  pipelines over large data, the `l*` combinators threaded with `->>` do this
+  pipelines over large data, the `l*` combinators threaded with `->` do this
   fusion for you — reach for them before hand-rolling a `fold`.)
 
 - **A comprehension over a tiny fixed set loses to an explicit literal.** `for`
@@ -1005,6 +1005,16 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   (or `decimal/number->`) for an inexact result; `math/numerator`/`math/denominator` read the parts.
   Number types: `int` (bignum on overflow) · `float` · `decimal` (`1.50M`, exact
   base-10) · `ratio` (`1/2`, exact rational). `number?`/`ratio?`/`decimal?` test them.
+- **Text → number: `(string/->number s)`, and it picks the type from the digits.**
+  `"42"` → an `int`, `"3.14"` → a `float`, anything it cannot parse in full → **`nil`**
+  (it never throws, and it rejects `"3abc"`, `"  7 "`, `"1/2"` — `string/trim` first, and
+  `(or (string/->number s) 0)` is the default idiom). So `"3"` gives you an int even when
+  you wanted a float: `(->float (string/->number "3"))`. Going the other way,
+  `math/floor`/`math/round` return an `int` (there is no `trunc`). An optional **radix**
+  reads hex/octal/binary — `(string/->number "1F" 16)` → `31` — integer-only, digits
+  alone (no `0x` prefix), 2–36 or it raises; this is the *only* way, since Brood has no
+  radix literals. For money use `(decimal/of "1.50")`, which **throws** on malformed
+  input rather than answering nil: a parse failing is data, a constructor failing is a bug.
 - **`math` module** (`math/…`, or `(:use math)`; a qualified `math/sqrt` auto-loads
   it — ADR-227): `abs` `ceil` `round` `round-to` (round to N decimals, stays a number)
   `pow` `sqrt` `clamp` `sum` `product`, the sign/parity predicates `positive?`
@@ -1052,7 +1062,7 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   `send` `receive` `self` `ref` `monitor` `demonitor` `link` `unlink` `proc/trap-exit`
   `proc/register` `proc/whereis`
   — plus the **`gen`** framework below
-- **lazy fusing views**: `seq/lmap` `seq/lfilter` `seq/lkeep` `seq/lremove` (thread with `->>`;
+- **lazy fusing views**: `seq/lmap` `seq/lfilter` `seq/lkeep` `seq/lremove` (thread with `->`;
   realise with `seq`/`into`) plus `comp` for function composition
 
 ## Pitfalls when generating Brood code
@@ -1068,6 +1078,12 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   literal.)
 - **Bare symbols in patterns *bind*.** Match a literal symbol with `'foo`;
   match a runtime value with `~expr`.
+- **A `(sig …)` goes BELOW the `defn` it describes**, always. A signature reads as
+  documentation and documentation goes above, which is exactly why this gets written
+  wrong — and it is not a style point: `BROOD_CONTRACTS=1` turns every `sig` into a
+  rebinding of the name, so a forward one fails and takes the whole module's load down.
+  It has been broken in bulk twice; `crates/lisp/tests/sig_placement.rs` now fails the
+  build on any `(sig …)` above its own definition, naming the line.
 - **A wrong `(sig …)` is a warning, not a shrug** (ADR-259). A misspelled type or
   constructor (`strng`, `(tupel int)`), a sig whose arity contradicts its `defn`,
   and a sig for a name the file never defines are all reported — a declaration used
@@ -1084,7 +1100,8 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   its parameters, or an honest nil default (`(or (nth parts 1) "")`, `(nth xs i default)`
   — the default IS the absence case). A record name in a sig is an open shape: a key it
   does not declare reads as unknown, so go through a declared accessor. A user predicate
-  (`datetime?`) does not narrow; the built-in `int?`/`string?`/… do.
+  narrows once it is DECLARED a guard — `(sig order? (any -> (is order)))` — exactly like
+  the built-in `int?`/`string?`; an undeclared one proves nothing.
 - **A `(record …)` is CLOSED** (ADR-264) — it names every key, and one it doesn't
   declare reads as `nil`. Write `(record &open :k T)` when a value may carry more,
   which is what a *parameter* usually wants. Closedness is what makes a tagged union
@@ -1092,6 +1109,12 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   `int | nil`, since the other alternative says `:ok` is absent.
 - **`=` is structural** and recursive — two unrelated structures that look the
   same compare equal.
+- **Write `(not (= a b))`, not `not=`** — `not=` is deprecated (ADR-300, 0.19.1) and
+  every use is an advisory warning. It only ever spelled the same thing: its body *is*
+  `(not (= a b))`, the long form is the faster one (the short one defeats both the
+  thin-wrapper elision and the leaf inliner), and past two arguments the name misleads —
+  `(not= 1 2 1)` is `true`, because it negates the whole `=` chain rather than meaning
+  "pairwise different".
 - **Variadic operators**: `(+ a b c)` works. The fast 2-arg primitives, when
   you really need them, are `%add` `%sub` `%mul` `%div` `%lt` `%eq`.
 - **No commas in maps**: `{:a 1 :b 2}` — spaces only.
@@ -1208,7 +1231,10 @@ time and exit cleanly.
 
 ## When in doubt
 
-`std/prelude.blsp` is the canonical example of idiomatic Brood — almost
+`std/prelude/*.blsp` is the canonical example of idiomatic Brood — almost
 everything below the kernel is written there in the language itself; read it.
+(Nine files — `core`, `predicates`, `map`, `control`, `match`, `process`, `seq`,
+`string`, `tools` — concatenated in that order; older docs still say
+`std/prelude.blsp`, which no longer exists.)
 Deep references: `docs/language.md` (full reference), `docs/spec.md` (the
 formal spec), `docs/pattern-matching.md` (the pattern grammar in detail).
