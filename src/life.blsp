@@ -282,7 +282,11 @@ fresh colour, so each spawn is its own colour. Returns `[colors' next-id']`. A p
 OR-s bits in, so `new ⊇ old` and the added cells are exactly `new XOR old` — `bit-positions`
 hands them back as the bit INDICES the colour layer keys on, so no decode is needed here."
   (let (added (bb-positions (bb-xor new-bits old-bits)))
-    (if (nil? added)
+    ;; `empty?`, not `nil?`: `bit/positions` answers a VECTOR of indices, `[]` when there
+    ;; are none — so the `nil?` early-out never fired and every placement paid for the
+    ;; colour work whether or not it added a cell. Found by brood's impossible-predicate
+    ;; lint (ADR-313).
+    (if (empty? added)
       [colors next-id]
       (let (packed (pack-rgb (spawn-rgb next-id)))
         ; one colour for the whole spawn — compute + pack it once
