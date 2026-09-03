@@ -1163,8 +1163,16 @@ the fair-comparison board pin shared with the .NET port."
           (let (n (string/->number s)) [n n]))))))
 
 (defn env-int (name dflt)
-  "Read integer env var `name`, or `dflt` when unset/empty."
-  (let (s (os/env name)) (if (env-blank? s) dflt (string/->number s))))
+  "Read integer env var `name`, or `dflt` when unset, empty, or not a number."
+  (let (s (os/env name))
+    (if (env-blank? s)
+      dflt
+      ;; An env var holds whatever the shell put there. A non-numeric one made
+      ;; `string/->number` answer a FAILURE, which is truthy, so it rode past every
+      ;; caller's guard into `math/max` and `>` and raised there — a long way from the
+      ;; `LIFE_STEPS=abc` that caused it. Unparseable is the same category as unset.
+      (let (n (string/->number s))
+        (if (int? n) n dflt)))))
 
 (defn seed-block (w h n)
   "A `w`×`h` board with a centred solid `n`×`n` block of live cells — the deterministic
