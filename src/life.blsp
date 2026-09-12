@@ -441,7 +441,8 @@ Returns `[board' ages' colors' rp']`."
         ry (if (and move? tgt) (+ ry0 (toward ry0 (second tgt))) ry0)
         idxs (footprint rx ry w h)
         ;; the cells actually reaped THIS tick = the LIVE ones under the footprint (flash + souls)
-        reaped (filter idxs (fn (i) (not (= 0 (bit/and (get board :bits) (bit/shift-left 1 i))))))
+        reaped (seq/filter idxs
+                 (fn (i) (not (= 0 (bit/and (get board :bits) (bit/shift-left 1 i))))))
         ages2 (reduce idxs ages (fn (a i) (dissoc a i)))
         colors2 (reduce idxs colors (fn (c i) (dissoc c i)))
         ;; ash wake: age every scorch one step + drop the spent, then scorch the whole new footprint
