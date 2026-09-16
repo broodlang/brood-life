@@ -15,7 +15,7 @@ A small, dynamic Lisp implemented in Rust.
   **process** (`spawn` / `send` / `receive`) or behind a Rust-backed handle.
 - **No loops** (`while`, `for`, `loop`/`recur`). Iterate with recursion — proper
   tail calls are guaranteed (including calls to *other* functions), so it's O(1)
-  stack — or the combinators `fold` / `reduce` / `map` / `filter`. A *local*,
+  stack — or the combinators `fold` / `reduce` / `map` / `seq/filter`. A *local*,
   self-contained loop is a `letrec`-bound closure called by name.
 - **Truthy / falsy**: only `nil` and `false` are falsy. `0`, `""`, `[]`, `{}`,
   `#{}` are *truthy*. **The one trap: an empty *list* is falsy**, because `()` ≡
@@ -52,7 +52,7 @@ name  foo-bar?  +       ; symbol (kebab-case is idiomatic)
 
 ## Special forms
 
-Only these eight are *special* (evaluator rules in `eval/mod.rs`); everything
+Only these eight are *special* (evaluator rules in `eval.rs`); everything
 else is a function or a macro:
 
 ```
@@ -485,16 +485,16 @@ calling a name (`go` here), and the tail call keeps it O(1).
 Prefer the higher-order combinators:
 
 ```lisp
-(reduce + 0 xs)
-(map sq xs)
-(filter math/even? xs)             ; even?/odd?/… live in the `math` module (ADR-227)
-(fold (fn (m k) (assoc m k (* k k))) {} (range 10))
-(map (partial + 10) xs)            ; partial / complement / constantly / comp all exist
-(filter (complement math/odd?) xs)
+(reduce xs 0 +)
+(map xs sq)
+(seq/filter xs math/even?)         ; even?/odd?/… live in the `math` module (ADR-227)
+(seq/reject xs math/even?)         ; the complement — `reject`, not `remove` (ADR-330)
+(fold (range 10) {} (fn (m k) (assoc m k (* k k))))
+(map xs (partial + 10))            ; partial / complement / constantly / comp all exist
 ```
 
 **One sequence view over every collection.** `count` `empty?` `first` `rest` `last`
-`map` `filter` `fold` `reduce` `into` `vec` `seq` take a list, vector, `bytes`, a
+`map` `fold` `reduce` `into` `vec` `seq` (and `seq/filter`) take a list, vector, `bytes`, a
 **set** (as its elements) or a **map** (as its `[k v]` pairs) — `(first {:a 1})` is
 `[:a 1]`. `conj`/`into` insert at each kind's natural point and *preserve the kind*;
 `(conj #{1} 2)` and `(disj s x)` are prelude, no `(:use set)` needed. Two ops stay
@@ -511,7 +511,7 @@ is an error, because in `match` a bare symbol silently *binds* instead of compar
 ```
 
 **A keyword is callable — `(:name p)` ≡ `(get p :name)`** (ADR-165), and it is a
-first-class value, so `(map :name people)` / `(sort-by :id rows)` / `(filter :cursor
+first-class value, so `(map people :name)` / `(sort-by rows :id)` / `(seq/filter zones :cursor
 zones)` all work. That is the point: no throwaway `(fn (p) (get p :name))`. Receivers
 mirror `get` (map by key, set by membership, `nil` empty); anything else — notably a
 *list of maps* — is a type error naming the keyword. Use `(get m k)` when the key is
@@ -562,7 +562,7 @@ intermediate collections (one pass, no throwaway lists). Thread them with `->`:
 
 ```lisp
 ;; eager: builds two throwaway lists of ~1000 / ~500 elements
-(reduce + 0 (map sq (filter math/even? (range 1000))))
+(reduce (map (seq/filter (range 1000) math/even?) sq) 0 +)
 ;; fused: one pass, no intermediate lists (≈3× faster on large inputs)
 (-> (range 1000) (seq/lfilter math/even?) (seq/lmap sq) (reduce 0 +))
 ```
@@ -574,7 +574,7 @@ pass. Consume with `fold`/`reduce`/`sum`/`count`/`into`/`string/join`/`seq`; `se
 `into`/`str`/`=` realise it. Two things to know: a view is **lazy** (it defers
 its fns until realised — don't build one for side effects; use eager `map`), and
 a view is **heap-local** (`send` refuses to ship one — realise it with `seq`/
-`into` before crossing a process). Eager `map`/`filter`/`keep`/`remove` are
+`into` before crossing a process). Eager `map`/`seq/filter`/`seq/keep`/`seq/reject` are
 unchanged: use them for a concrete list or for side effects.
 
 **`range` is a reducible lazy range — folding it builds no list.** `(range n)`
@@ -582,7 +582,7 @@ returns a lazy range, not a materialised list: `reduce` / `fold` / `sum` /
 `count` walk it in a counted loop with **zero allocation** (so `(reduce + 0
 (range 1_000_000))` is O(1) memory, not a million cons cells). It still behaves
 as the list of those integers everywhere else — `first` / `rest` / `nth` / `=`
-against a list / printing all work, and `map` / `filter` realise it on demand —
+against a list / printing all work, and `map` / `seq/filter` realise it on demand —
 so you never have to think about it except to know the common `(reduce f init
 (range n))` shape is already streaming. (Empty ranges are `nil`.)
 
@@ -607,7 +607,7 @@ path:
   ```
 
   Same shape for build-a-collection-then-rebuild: fold the source straight into
-  the target instead of `filter`-then-`into`. (For longer `map`/`filter`
+  the target instead of `seq/filter`-then-`into`. (For longer `map`/`seq/filter`
   pipelines over large data, the `l*` combinators threaded with `->` do this
   fusion for you — reach for them before hand-rolling a `fold`.)
 
@@ -646,7 +646,10 @@ closure and returns, the body never runs (a silent no-op that looks like "spawn
 didn't work"). Same for `(spawn name expr)`.
 
 Each process has its own heap; messages are **deep-copied** on `send`. `(self)`
-is the current process's pid. **Closures can be sent** — a `send`-ed function
+is the current process's pid. A `send` target is a pid, a **registered name** —
+`(proc/register :editor (self))` then `(send :editor msg)` from anywhere, Erlang's
+`Name ! Msg`; an unregistered name drops the message and warns once, never raises —
+or a `{:name :node}` address for a peer node. **Closures can be sent** — a `send`-ed function
 carries its code and its captured locals (deep-copied with it); only its *free
 global* references are late-bound on the receiver. So builtins/prelude names
 always resolve, and any `def`/`defn` the receiving image also has resolves
@@ -821,6 +824,14 @@ code paints to a terminal or a GUI window unchanged.
   `(view model cols rows)` → poll input → fold it with `(update model input cols
   rows)` → recurse, until the model is `:done`, then tear the frontend down. Set
   `:tick-ms` in the model for the refresh beat (input is `:tick` on timeout).
+- **Where a turn's time goes** = `BROOD_UI_TRACE=1`: one stderr line per phase —
+  `ui-run: view=4.71ms 236 ops`, `draw=`, `update=… <input>` — the Brood side of a
+  keystroke; `BROOD_GUI_TRACE=1` is the window's paint, the other half.
+- **A fragment that need not re-render** = `(ui-memo key deps thunk)` (ADR-336): inside
+  a running loop the previous turn's ops are reused while `deps` are `=` — a buffer
+  line of its rope and spans, a status bar of its segments — else `(thunk)` runs. Name
+  as deps everything the thunk reads, preferring values the model keeps between turns
+  (`=` is O(1) on the same cell). Outside a loop it is just the thunk.
 
 ```lisp
 (defmodule main "a counter app" (:use editor/ui) (:use editor/display))
@@ -938,7 +949,7 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
 `display`/`buffer`/`ansi`; `apropos`/`doc-search` search it interactively.)
 
 - **list / seq**: `first` `rest` `cons` `list` `count` `empty?` `nth`
-  `reverse` `map` `filter` `reduce` `fold` `append` (variadic, over
+  `reverse` `map` `reduce` `fold` `append` (variadic, over
   lists *and* vectors, returning a list) `mapcat` `sort` `take`
   `drop` `range` `zip` `partition` `repeat` `repeatedly`. The derived
   sequence helpers — `frequencies` `enumerate` `group-by` `chunk-by`
@@ -966,7 +977,8 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   `"e\u{301}"` is 2 codepoints but 1 cluster) · `string/->codepoints` ·
   `string/normalize` (`(string/normalize s :nfc)`, also `:nfd` `:nfkc` `:nfkd` — `=` is
   byte-structural, so `"é"` written two ways compares unequal until you normalise) ·
-  `string/display-width` (terminal cells, bare)
+  `string/display-width` (terminal cells, bare) · `string/width->index` (a cell → the
+  char index of the cluster on it — the inverse; mouse → point)
 - **string formatting**: `string/repeat` `string/pad-left` `string/pad-right`
   `->fixed` (number → string with fixed decimals, e.g. `(math/->fixed 3.14159 2)`
   → `"3.14"` — `str` prints full f64 precision, so reach for this for output) ·
@@ -975,7 +987,7 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
 - **map**: `assoc` `dissoc` `get` `keys` `vals` `contains?` `into` `%map-pairs`
   (a map's `[k v]` pairs) `seq` (universal list-view — coerces a map to its
   `[k v]` pairs; lists, vectors, strings, nil pass through). **Maps are seqable**:
-  `(map f m)` / `(filter f m)` / `(fold f acc m)` / `(reduce f acc m)` /
+  `(map m f)` / `(seq/filter m f)` / `(fold m acc f)` / `(reduce m acc f)` /
   `(count m)` / `(into [] m)` all walk the map as its `[k v]` pairs — no need
   for `(zip (keys m) (vals m))`. Iteration order (`keys`/`vals`/print/`seq`) is
   **hash-derived (ADR-040), NOT insertion order and NOT sorted** — don't rely on
@@ -1010,9 +1022,10 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   **`failure`** (it never throws, and it rejects `"3abc"`, `"  7 "`, `"1/2"` —
   `string/trim` first). So `"3"` gives you an int even when you wanted a float:
   `(->float (string/->number "3"))`. Going the other way, `math/floor`/`math/round`
-  return an `int` (there is no `trunc`). An optional **radix** reads hex/octal/binary —
-  `(string/->number "1F" 16)` → `31` — integer-only, digits alone (no `0x` prefix), 2–36
-  or it raises; this is the *only* way, since Brood has no radix literals. For money use
+  return an `int` (there is no `trunc`). An optional **radix** reads hex/octal/binary
+  from *data* — `(string/->number "1F" 16)` → `31` — integer-only, digits alone (no `0x`
+  prefix), 2–36 or it raises. In *source*, write the literal: `0xFF`, `0b1010`, `0o17`
+  are plain ints (ADR-334), so a mask is `(bit/and b 0x3F)`, not `63`. For money use
   `(decimal/of "1.50")`, which **throws**: a parse failing is data, a constructor failing
   is a bug.
 - **A `failure` is a returned value, not a raise (ADR-310).** Brood splits two channels:
@@ -1089,7 +1102,7 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
 - **No `setq` / `set!` / atoms.** State = a process, or re-bind a global with
   `def`.
 - **No `while` / `for`.** Use recursion (TCO is guaranteed) or
-  `fold` / `map` / `filter` / `reduce`.
+  `fold` / `map` / `seq/filter` / `reduce`.
 - **Calls are `(f x)`, never `f(x)`.** Brood has no C-style call syntax: `f(x)`
   reads as *two* forms — `f`, then `(x)` — so the `(x)` tries to *call the value
   of* `x` and you get `cannot call non-function`. Write `(io/puts "hi")`, not
@@ -1110,7 +1123,9 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   The **definition** owns the arity, so a sig cannot make a wrong call look right.
   Type grammar beyond the basics: `(or A B)`, `(and A B)`, `(not T)` — so "anything
   but nil" is `(and any (not nil))` — `(vector E)`, `(map K V)`, `(tuple A B)`,
-  `(record :k T)`, and bare literals (`:ok`, `5`, `true`, `"GET"`).
+  `(record :k T)`, and bare literals (`:ok`, `5`, `true`, `"GET"`). **Name a shape once
+  with `(deftype pane (record &open :rect (tuple int int int int)))`** and write
+  `(pane -> int)` — structural, module-scoped like a `sig`, not a runtime value (ADR-327).
 - **`nest check --strict` reads a known bound by inclusion.** Plain `nest check` warns only
   on a *provable* misuse (`∩ = ∅`); `--strict` also warns where a value is merely wider
   than the parameter — `number` where `int` is declared, `nil | string` from `nth`/`first`
@@ -1121,6 +1136,9 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   does not declare reads as unknown, so go through a declared accessor. A user predicate
   narrows once it is DECLARED a guard — `(sig order? (any -> (is order)))` — exactly like
   the built-in `int?`/`string?`; an undeclared one proves nothing.
+  Inclusion there is *consistent* subtyping (ADR-326): an unknown is the gradual `?` at
+  every depth — a record field or an element the checker could not type never warns on
+  its own; a *positively* known one (`vector<number>` into `vector<int>`) does.
 - **A `(record …)` is CLOSED** (ADR-264) — it names every key, and one it doesn't
   declare reads as `nil`. Write `(record &open :k T)` when a value may carry more,
   which is what a *parameter* usually wants. Closedness is what makes a tagged union
@@ -1166,7 +1184,9 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   (ADR-227 follow-up), for any module, so naming where something comes from loads
   it on demand (`mod/foo`). No bare-name magic, though — a bare `sqrt` with no
   `math/` prefix and no `(:use math)` stays unbound. The header understands exactly `(:use …)`,
-  `(:use-internals …)` and `(:alias …)`; **anything else is an error** —
+  `(:use-internals …)`, `(:alias …)` and `(:load a b …)` (load now, refer nothing — the
+  eager request, since a plain reference loads on first use, ADR-335); **anything else is
+  an error** —
   `(:require …)` and a misspelled `(:use-internal …)` are rejected rather than
   silently ignored.
 - **Not Clojure**: no transients, and **no `loop`/`recur`** — Brood has proper tail
