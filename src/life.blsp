@@ -389,14 +389,12 @@ across the board. nil when the layer is empty. Linear in the population."
                (fn (acc [i g])
                  (let (d (math/max (math/abs (- (math/mod i w) rx))
                            (math/abs (- (math/quot i w) ry))))
-                   (if (or (nil? acc)
-                         (< g (seq/vector-ref acc 1))
-                         (and (= g (seq/vector-ref acc 1)) (< d (seq/vector-ref acc 2))))
+                   (if (or (nil? acc) (< g (nth acc 1)) (and (= g (nth acc 1)) (< d (nth acc 2))))
                      [i g d]
                      acc)))))
     (if (nil? best)
       nil
-      [(math/mod (seq/vector-ref best 0) w) (math/quot (seq/vector-ref best 0) w)])))
+      [(math/mod (nth best 0) w) (math/quot (nth best 0) w)])))
 
 (defn footprint (cx cy w h)
   "The whole-board bit indices of the reaper's *reaper-size*² block centred on `(cx,cy)`, torus-
@@ -606,11 +604,11 @@ so the scythe leads the way it's heading. Skips transparent (nil) sprite cells."
     (mapcat (mapcat (range n) (fn (iy) (map (range n) (fn (ix) [ix iy]))))
       (fn ([ix iy])
         (let (src (if (< face 0) (- (- n 1) ix) ix) ; mirror columns when facing left
-              col (seq/vector-ref *reaper-sprite* (+ (* iy n) src)))
+              col (nth *reaper-sprite* (+ (* iy n) src)))
           (if (nil? col)
             []
-            (overlay-cell (+ rx (seq/vector-ref *reaper-offsets* ix))
-              (+ ry (seq/vector-ref *reaper-offsets* iy))
+            (overlay-cell (+ rx (nth *reaper-offsets* ix))
+              (+ ry (nth *reaper-offsets* iy))
               col
               w
               h
@@ -972,7 +970,7 @@ a second time alongside the op."
   (reduce ops
     nil
     (fn (acc o)
-      (if (and (nil? acc) (vector? o) (= (first o) :cells)) (seq/vector-ref o 5) acc))))
+      (if (and (nil? acc) (vector? o) (= (first o) :cells)) (nth o 5) acc))))
 
 ;; The RENDERER owns the window + input. On `[:board nl st colors ops]` it BLITS the ops the SIM
 ;; pre-rendered (op-building runs on the faster SIM, not the slow root), and caches the board +
@@ -1071,12 +1069,12 @@ then clamp the pan so the magnified window stays inside the board. A board cell 
 
 (defn inject-cycle (inject)
   "The NEXT auto-spawn preset, wrapping: off → 1s → 5s → 30s → off — the `[spawn]` button."
-  (seq/vector-ref *inject-presets* (math/mod (+ (inject-index inject) 1) (count *inject-presets*))))
+  (nth *inject-presets* (math/mod (+ (inject-index inject) 1) (count *inject-presets*))))
 
 (defn inject-step (inject dir)
   "Step through the presets without wrapping: `dir` > 0 RARER (toward 30s / off), `dir` < 0
 MORE OFTEN (toward 1s). Behind the `[`/`]` keys."
-  (seq/vector-ref *inject-presets*
+  (nth *inject-presets*
     (math/max 0 (math/min (- (count *inject-presets*) 1) (+ (inject-index inject) dir)))))
 
 ;; ---- input → [ui' redraw?], sending the SIM throttled control messages -----------------

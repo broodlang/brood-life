@@ -86,9 +86,9 @@ A cell lives iff it has exactly 3 live neighbours, or 2 and it is already live â
                          s1b (bit/xor s1 c)
                          s2b (bit/xor s2 c2))
                      [s0b s1b s2b])))
-        s0 (seq/vector-ref planes 0)
-        s1 (seq/vector-ref planes 1)
-        s2 (seq/vector-ref planes 2))
+        s0 (nth planes 0)
+        s1 (nth planes 1)
+        s2 (nth planes 2))
     (assoc board
       :bits (bit/and (bit/and s1 (bit/xor s2 brd)) (bit/or s0 b)))))
 
