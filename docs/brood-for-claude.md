@@ -838,6 +838,28 @@ Each worker is a green process on the scheduler's pool; `send` deep-copies the
 result across heaps. The `collect` loop is tail-recursive, so it's O(1) stack
 even for thousands of workers.
 
+**Parallelising a step-by-step simulation — tile it, don't re-spawn it.** The
+pool above suits independent jobs. For a computation that advances in steps over
+shared state (a cellular automaton, a grid relaxation), a fresh fan-out per step —
+spawn workers, send each the board, fan in, merge, repeat — is usually *slower*
+than one process: every step copies the board across heaps twice and ends in a
+serial merge, and when a step takes a millisecond that coordination is the whole
+cost. What wins is **spatial tiling with halo exchange**:
+
+- Split the grid into tiles (bands of rows is the simplest) and give each tile to a
+  process that lives for the **whole run**, holding its tile as loop state.
+- Each step, a tile sends only its **edge** cells to its neighbours and receives
+  theirs — the halo — then steps itself with the same pure function the serial
+  version uses. Pin the step number in the `receive` (`[:halo ^g …]`): a neighbour
+  can run one step ahead, and its next halo must wait in the mailbox.
+- Neighbours talk to each other directly; the parent hands the tiles out once and
+  collects them once.
+
+`examples/life_bands.blsp` in the Brood repository is the worked version: Game of
+Life in bands, checked against the serial step. Measure the serial version first —
+on a small board one process can still win, with too little work per step to pay
+even for a halo.
+
 ## Interactive apps — the display seam & `ui-run`
 
 An interactive app (terminal *or* native window) is one render-op protocol with
@@ -1014,6 +1036,11 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   every key and never forgets) · `defmemo` from the `memo` module (`(:use memo)`, then
   `(defmemo rows-of 8 (rope width) …)`: a `defn` that remembers its last N calls compared
   by `=` — bounded, and immediate for the same big value such as a rope) ·
+  `registry` for tables your modules fill as they load (`(registry/put! :app/hooks :save
+  'app/on-save)`, read with `registry/entries` / `registry/lookup` / `registry/ranked` — by an
+  entry's `:rank`): atomic across processes and carried by the image, which a `defonce` + `def`
+  table is not. Store hooks as symbols and call them with `(reflect/call-if-bound sym
+  fallback args…)`, so a redefinition takes and an unloaded module is simply absent ·
   `if-let`/`when-let` test truth, `if-some`/`when-some` test presence (`false` counts) ·
   `condp` asks `(pred value test)`, value first: `(condp < 15 10 :small 100 :medium
   :large)` → `:medium`.
