@@ -485,9 +485,9 @@ Returns `[board' ages' colors' rp']`."
 width, so the CLEAR key can sit at the bottom-RIGHT (the spawn/fps keys lead at the left)."
   (let (bs (math/max 1 (- *status-scale* *btn-inset*))
         m bs
-        sw (* (string/length (spawn-label 0)) bs)
-        rw (* (string/length (reaper-label false)) bs)
-        cw (* (string/length *clear-label*) bs)
+        sw (* (count (spawn-label 0)) bs)
+        rw (* (count (reaper-label false)) bs)
+        cw (* (count *clear-label*) bs)
         sx0 m
         sx1 (+ sx0 sw)
         rx0 (+ sx1 m) ; the reaper key sits just right of spawn, an `m` margin between
@@ -1020,8 +1020,9 @@ a second time alongside the op."
     ;; Two arities: a `:press` carries a trailing 7th element (its click-chain count), every
     ;; other action is 6 — vector patterns match by EXACT length, so both shapes need a clause
     ;; or presses (and thus every button, which fires on press) silently fall through to keys.
-    ([:mouse action button row col mods] (render-mouse w sim board info ui action button row col))
-    ([:mouse action button row col mods n] (render-mouse w sim board info ui action button row col))
+    ([:mouse action button row col _mods] (render-mouse w sim board info ui action button row col))
+    ([:mouse action button row col _mods _n] (render-mouse w
+                                               sim board info ui action button row col))
     (m (if (quit-signal? m)
          (render-quit sim w)
          (let ([ui2 rd] (on-key sim m ui))

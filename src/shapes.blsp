@@ -17,7 +17,7 @@ diehard vanishes at gen 130).")
 (defn normalize (pat)
   "`pat` shifted so its minimum x and y are 0, and sorted — a canonical form so equal
 shapes compare equal (lets `distinct` dedupe a symmetric pattern's repeated orientations)."
-  (let (mx (apply math/min (map pat (fn ([x y]) x))) my (apply math/min (map pat (fn ([x y]) y))))
+  (let (mx (apply math/min (map pat (fn ([x _y]) x))) my (apply math/min (map pat (fn ([_x y]) y))))
     (sort (map pat (fn ([x y]) [(- x mx) (- y my)])))))
 
 (defn rotate (pat)

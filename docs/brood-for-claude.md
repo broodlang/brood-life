@@ -1110,7 +1110,7 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   `(fold-for (acc 0 x xs) (+ acc x))`), `doseq` (destructuring/`:when`),
   `dotimes` `(i n)`, `dolist` `(x coll)`. `doseq`/`dotimes`/`dolist` return `nil`.
 - **string**: the string surface lives in the `string` module (ADR-230), so these are
-  **`string/`-qualified** unless listed as bare below: `string/length`
+  **`string/`-qualified** unless listed as bare below (a string's length is the bare `count`): `string/substring`
   `string/substring` `string/char-at` (returns a 1-char *string* — Brood has no char
   type) `string/split` `string/join` `string/replace` `string/trim` `string/triml`
   `string/trimr` `string/blank?` `string/upper` `string/lower`
