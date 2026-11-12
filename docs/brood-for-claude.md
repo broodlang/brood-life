@@ -24,6 +24,8 @@ A small, dynamic Lisp implemented in Rust.
   `(if () …)` takes `else`. A function returning a list-or-`nil` that you branch
   on directly will treat an empty-list result as false. **Test emptiness with
   `(empty? x)`** (uniform across every collection), never a bare `(if x …)`.
+  `nest check` reports a test on a value that may be a list or another collection
+  (`:list-truthiness`, ADR-620).
 - **Late binding**: globals can be re-defined; a redefinition is visible to
   every running process on its next lookup.
 
@@ -63,7 +65,7 @@ def  fn  quote  quasiquote  if  do  let  letrec
 
 Common macros (expanded once at the compile pass — runtime-free): `defmacro`
 (lowers to `(def name (%make-macro (fn …)))`), `defn`, `defn-` / `def-`, `defdyn`, `binding`,
-`cond`, `when`, `unless`, `and`, `or`, `match`, `try` / `catch`, `->` / `as->`,
+`cond`, `when`, `and`, `or`, `match`, `try` / `catch`, `->` / `as->`,
 `ok->` / `cond->` / `doto`, `if-let` / `when-let`,
 `string/interp` (string interpolation), `for` / `fold-for`, `condp`, `if-some` /
 `when-some`, `receive`, `spawn`.
@@ -85,12 +87,12 @@ Common macros (expanded once at the compile pass — runtime-free): `defmacro`
 (defdyn *log-level* :info)                          ; dynamic variable
 (binding (*log-level* :debug) (do-thing))           ; scoped rebind
 
-(defrecord point (x y))                             ; a record: a map + a nominal identity
-(point 3 4)                                         ; => {:__id__ :<ns>/point, :x 3, :y 4}
+(defrecord point (x y))                             ; a record: fields + a nominal identity
+(point 3 4)                                         ; => #<ns>/point{:x 3, :y 4}
 (point-x (point 3 4))                               ; => 3  (accessor per field; a typo is a
                                                     ;        checker-caught undefined-fn, not silent nil)
 ;; update with plain assoc/merge; `(record? r)`/`(record-id r)`/`(fields r)` are the id
-;; API; a record is NOT `=` to a bare map (`=` is structural and the id is an entry). Typed fields: (defrecord point ((x int) (y int)))
+;; API; a record is its own kind and is NOT `=` to a bare map (ADR-542). Typed fields: (defrecord point ((x int) (y int)))
 ```
 
 A `fn`/`defn` body of several forms is an **implicit `do`**: each is evaluated
@@ -103,35 +105,33 @@ Clojure: `(map xs f)`, `(fold xs init f)`, `(reduce xs init f)`, `(seq/filter xs
 `(string/starts-with? s "#")`, `(contains? m k)`, `(index-of coll x)`. A callback's own
 parameters keep the familiar order: `(fold xs 0 (fn (acc x) (+ acc x)))`.
 
-`fn` is multi-clause two ways (don't mix them in one `defn`):
+`fn` takes several clauses, tried **in order** — the first that matches runs, by argument
+count and by shape alike, so arity and pattern clauses mix in one `defn` (ADR-619):
 
 ```lisp
-(defn arity-fn                       ; multi-ARITY: dispatch by arg count (Clojure-style)
+(defn arity-fn                       ; dispatch by arg count
   ((x)   (arity-fn x 0))             ; param lists are LISTS (x), not vectors [x]
   ((x y) (+ x y)))
 
-(defn classify                       ; multi-PATTERN: same arity, dispatch by shape + :when guard
+(defn classify                       ; dispatch by shape + :when guard
   ((0)               :zero)
   ((n) :when (< n 0)  :neg)
   ((n)               :pos))
+
+(defn rect                           ; both in one fn, with an optional in a pattern clause
+  ((:unit)               1)
+  ((w &optional (h w))   (* w h)))
 ```
 
-Arity arms (plain-symbol heads, optionally with `&`/`&optional`) bind directly and
-are cheap — this is how the prelude's variadic `+`/`-`/`<`/`=` stay fast. Pattern
-heads (literals/destructuring) use the matcher.
+Every head takes the same slots: required patterns, `&optional` slots (`name`, `(name
+default)`, `(pattern default)`), a rest after `&` (a name or a pattern), and a `:when`
+guard first in the body — a single-clause `fn` included. Plain-symbol heads still bind
+directly and stay cheap (the prelude's variadic `+`/`-`/`<`/`=`).
 
-**Trap — `&optional` defaults & patterns don't combine with arity overloading.** An
-`&optional` slot must be a plain symbol (it can't be a pattern). A clause head with
-a `(default …)` optional form or a pattern is matched as a *pattern* clause, so its
-`&optional` is read literally — don't expect it to act as an arity marker. Pick one
-mechanism per `defn`. Required params *can* still be patterns next to `&optional`
-(only the optional/rest slot is restricted). To branch on an optional, bind it and
-`match` in the body (`nil` = omitted):
-
-```lisp
-(defn h (x &optional opt) (match opt (nil [:no x]) (v [:yes x v])))
-;; NOT: (defn h ((x) …) ((x &optional (y 9)) …))   ; &optional in a clause head → match error
-```
+**Trap — order matters, and a dead clause is a compile error.** `((x &optional y) …)`
+written before `((x) …)` takes every call the second would, so the `fn` is refused
+("can never run"); put the more specific clause first. (Clojure picks by arity whatever
+the order; Brood goes in order and refuses what order would hide.)
 
 Local bindings — `let` takes a **flat** name/value list (not Scheme's double-parens), and is sequential (each binding sees the earlier ones):
 
@@ -219,8 +219,8 @@ and your packages stay fully redefinable, which is what hot reload is for. If a 
 you want is taken: pick another, shadow it locally (`(let (get …) …)` is fine), or
 define it in a `(defmodule your/mod …)` — that makes `your/mod/get`, which is yours.
 Inside that module your definition wins every bare call, even over a prelude **macro**
-(`(defn spy …)` → `(debug/spy x)` calls yours; `/spy` reaches the macro). Defining a prelude
-macro's name warns at load unless the header says `(:shadow spy)` (ADR-423).
+(`(defn when …)` → `(when x)` calls yours; `/when` reaches the macro). Defining a prelude
+macro's name warns at load unless the header says `(:shadow when)` (ADR-423).
 The rule reserves shipped **functions**; a `defdyn` name is never reserved whatever it
 holds, and it is ambient (root) — so `(def *print-length* 3)` from any module rebinds the
 one root binding, and `(def *out* my-port)` still redirects output permanently. A plain
@@ -391,12 +391,13 @@ Other things worth knowing:
   `:module/name` id, and two record shapes dispatch apart even with identical fields. A
   plain map (even one carrying a `:type` field) is *never* rerouted — it dispatches as
   `:map`; identity comes only from `defrecord`, never sniffed.
-- **A record is still a map underneath.** `(type-of r)` is `:map`, and `get`/`assoc`
-  behave as on a map — `(get r :__id__)` even reaches the id. But a record is **NOT `=`**
-  to a bare map with the same fields (nominal), and its
-  **collection view is the fields, id-free**: `seq`/`count`/`keys`/`vals`/`map`/`fold`
-  over a record see its fields, never `:__id__` (via the `Seqable` ability). Use
-  `record?`/`record-id`/`fields` to test/read the identity explicitly.
+- **A record is its own kind, not a map** (ADR-542). `(type-of r)` is `:record` and
+  `(map? r)` is false, but field access works as on a map: `get`, keyword calls, `assoc`,
+  `update`, `dissoc` and `{:keys …}` destructuring act on its fields and keep it the same
+  record type. Its identity is in the value, never a key — no `:__id__` to read or forge —
+  and it is **NOT `=`** to a map with the same fields. Its collection view
+  (`seq`/`count`/`keys`/`vals`/`map`/`fold`) is its fields (the `Seqable` ability). Use
+  `record?`/`record-id`/`fields` for the identity and the plain field map.
 - **Match a record by id + fields** with `(record name {:k p …})` — the `name` fixes the
   nominal id (bare = current ns, or `mod/name`) and the optional `{…}` is a map pattern over
   its fields (`{:k p}` / `:keys` / `:or` compose); a plain map or a different record fails.
@@ -433,18 +434,18 @@ edit the library. Beyond the core `Display` (`->string`, what `io/puts` shows) a
 | `impl` this | to get |
 |---|---|
 | `JsonEncode` — `(->json x)`, from `json` | `json/encode` handles your type (a record's wire shape; a pid/fn/datetime at all). **No `:default`** — an unimpl'd kind still errors loudly. |
-| `Port` — `(io-write p s)`, from `io` | your value is an output port (`with-out`, logger sinks). A bare 1-arg fn already is one. |
+| `Port` — `(emit p s)`, from `io` | your value is an output port (`with-out`, logger sinks). A bare 1-arg fn already is one. |
 | `LogBackend` — `(backend-emit b rec)`, from `log` | a backend that batches / emits JSON lines / samples. `backend-passes?` is the stock level+filter gate. |
 | `Response` — `(send-response r sock)`, from `http` | a response kind with its own wire behaviour, including who closes the socket. |
 | `Dependency` (**sealed**), from `package` · `Temporal` — `(->iso x)` (**sealed**), from `datetime` | a new manifest dep kind / calendar type. Sealed ⇒ `nest check` demands every op. |
 
 Also: `std/`'s value types are **records**, not plain maps — `buffer`, `queue`, `pq`,
 `multimap`, `datetime`/`date`/`time-of-day`, and the four dependency kinds. So
-`(buffer? x)` / `(queue/queue? x)` / `(datetime/date? x)` are identity checks a look-alike map fails, each
+`(editor/buffer/buffer? x)` / `(queue/queue? x)` / `(datetime/date? x)` are identity checks a look-alike map fails, each
 prints as itself (`#<buffer *scratch* 11 chars>`, `2026-07-29T…Z`) rather than dumping its
 internals, and **none of them is `=` to a map with the same fields** — build them with
 their constructors, and don't compare one against a map literal in a test. Where a library
-renders a *user* value to text (`template/render`, `csv-emit`, `url/query-encode`) it calls
+renders a *user* value to text (`template/render`, `csv/encode`, `url/query-encode`) it calls
 `->string`, so your `Display` impl governs that output too.
 
 ## Patterns (`let`, `fn`, `match`, `receive`)
@@ -516,7 +517,7 @@ Prefer the higher-order combinators:
 ```lisp
 (def xs [1 2 3 4])
 (defn sq (n) (* n n))
-(reduce xs 0 +)                    ;=> 10
+(reduce xs 0 +)                    ;=> 10   ; `(reduce xs +)` seeds with the first item and raises on empty
 (map xs sq)                        ;=> (1 4 9 16)
 (seq/filter xs math/even?)         ;=> (2 4)   ; even?/odd?/… live in the `math` module (ADR-227)
 (seq/reject xs math/even?)         ;=> (1 3)   ; the combinator/complement — `reject`, not `remove` (ADR-330)
@@ -688,6 +689,22 @@ path:
 both run `(work c)` in the child, and a bare function name is *called* —
 `(spawn worker)` runs `(worker)`. Prefer the plain expression.
 
+**When to reach for a process (vs staying pure).** Pure functions are the default; a
+process earns its place for:
+
+- **Long-lived evolving state** — a counter, cache, or session. A process holding
+  state in its `receive` loop is *the* way to express mutable state; the packaged
+  form is a `gen` server (`defserver` + `gen/start`/`gen/call`/`gen/cast`).
+- **CPU fan-out across cores** — `seq/pmap`, or `spawn` a worker per band and fan
+  back in with `receive`. Measure the sequential version first; small inputs won't
+  beat the spawn + copy-on-send overhead.
+- **I/O multiplexing** — several blocking sources at once: one process per source,
+  a coordinator `receive`s.
+
+Need the child's exit reason? `(spawn-monitor expr)` → `[pid ref]`, monitored before the
+child runs (a separate `spawn` then `monitor` can report `:noproc` instead). Test
+concurrency with spawn-N-then-collect.
+
 Each process has its own heap; messages are **deep-copied** on `send`. `(self)`
 is the current process's pid. A `send` target is a pid, a **registered name** —
 `(proc/register :editor (self))` then `(send :editor msg)` from anywhere; an
@@ -703,7 +720,7 @@ pattern clauses just like `match`, plus an optional `(after ms body...)`
 clause for timeouts.
 
 **`spawn` is let-it-crash.** If `expr` throws, the process exits, its monitors fire
-`[:down ref pid [:error msg]]`, and (under `brood file` / `nest run`) the default crash
+`[:down ref pid [:error e]]` (`e` the error map), and (under `brood file` / `nest run`) the default crash
 reporter prints the pid, reason and trace once per crash site. There is no kernel-level supervisor — a
 hand-written one is ~10 lines of Brood (see `std/proc/supervisor.blsp`).
 Named-spawn `(spawn :name expr)` is idempotent on the name: if `:name` is
@@ -847,7 +864,7 @@ pattern most demos want):
 
 (defn run (n)
   (let (me (self))
-    (dotimes (i n) (spawn (worker me i)))   ; fan out n workers
+    (doseq (i (range n)) (spawn (worker me i)))   ; fan out n workers
     (collect 0 n {})))                       ; fan in n results into a map
 ```
 
@@ -886,8 +903,8 @@ code paints to a terminal or a GUI window unchanged.
 - **Frame** = a vector of render ops, built with `editor/display` constructors:
   `(frame (clear) (text row col s face?) (cursor row col))`. A *face* is a style
   map, `{:fg :red :bold true}` (`(:use editor/display)` for the constructors).
-- **Frontend** = a map of five fns `{:enter :leave :size :draw :poll}`. `(:use editor/ui)`
-  gives you `editor/ui/*term-display*` (the terminal) and `(gui-display)` (a native window,
+- **Frontend** = a map of five fns `{:enter :leave :size :draw :poll}`. `(:use editor/frontend)`
+  gives you `editor/frontend/*term-display*` (the terminal) and `(gui-display)` (a native window,
   needs a `--features gui` build); `display-broadcast` fans one frame to several.
 - **The loop** = `(ui-run model view update display)` — a TEA loop: render
   `(view model cols rows)` → poll input → fold it with `(update model input cols
@@ -897,23 +914,28 @@ code paints to a terminal or a GUI window unchanged.
   `ui-run: view=4.71ms 236 ops`, `draw=`, `update=… <input>` — the Brood side of a
   keystroke; `BROOD_GUI_TRACE=1` is the window's paint, the other half, plus
   `[gui-latency] input->present` per answered input (`gui/latency id` returns them, ADR-440).
+  For the tail, `gui/latency-histogram id` counts every input since the window opened, keys
+  apart from the pointer, and `gui/latency-percentiles` reads p50 / p99 / p99.9 off it; the
+  histograms add and subtract (`gui/latency-merge`, `gui/latency-since`), so an app keeps one
+  across sessions (ADR-612). `gui/key-repeat? id` says whether the press being folded is an OS
+  repeat, and `gui/reduce-motion?` reads the desktop's reduced-motion switch.
 - **Input before background** (ADR-490) = a display's `:poll-input` answers queued USER
   input without waiting (a window delivers it on the mailbox's priority lane,
   `proc/send-priority` / `proc/take-priority`), and its `:poll-tagged` answers
   `[message input?]` (`proc/receive-lane`); the loop asks input first, only input holds
   `:idle?` timers back, and a `:coalesce-input? true` app folds background only
-  `*ui-fold-budget-ms*` (8) per turn before rendering. State that matters only at its newest value goes out with
+  8 ms (the model's `:fold-budget-ms`) per turn before rendering. State that matters only at its newest value goes out with
   `(proc/send-latest pid key msg)`: a queued older message with that key is replaced. Both
   lanes cross a node link (ADR-492), and a served window client paints only its newest frame. An
-  `update`/`view` slower than `*ui-slow-ms*` (50) is reported with the input's tag — to the
-  model's `:on-slow` `(fn (report) …)`, else stderr.
+  `update`/`view` slower than 50 ms (the model's `:slow-ms`) is reported with the input's tag and how much of it was GC
+  (`:gc-ms`, from `proc/gc-us`) — to the model's `:on-slow` `(fn (report) …)`, else stderr.
 - **Quit** (ADR-491) = `update` and `view` run in an interrupt window, and `ui-run` arms the
   kernel's quit key: C-g (`:ctrl-g` — a window and the terminal deliver it on the priority
   lane, a served session as `[:key :ctrl-g]`) arriving while a turn has run past
-  `*ui-quit-busy-ms*` (300) STOPS it at its next safepoint, inside long builtins too — an
+  `editor/ui/*quit-busy-ms*` (300) STOPS it at its next safepoint, inside long builtins too — an
   interrupted `update` keeps the old model, an interrupted `view` the last frame — and is
   then folded as an ordinary key. A window shows the wait cursor meanwhile. A BACKGROUND
-  message's fold is stopped past `*ui-event-ceiling-ms*` (2000); a user's command never is.
+  message's fold is stopped past 2000 ms (the model's `:event-ceiling-ms`); a user's command never is.
   Both are reported to `:on-slow` with `:interrupted true` and `:input` (true for the user's
   turn — say "Quit" only then). Model keys: `:quit-key` (nil: none), `:quit-busy-ms`,
   `:event-ceiling-ms` (nil: none). Outside `ui-run`: `(proc/interruptible ceiling-ms
@@ -940,9 +962,14 @@ code paints to a terminal or a GUI window unchanged.
   rot]`, physical pixels from the window's corner. Build them with `gui/line` and
   `gui/sprite` over a `gui/texture` handle; open the window with `{:input :pixels}` so
   mouse messages carry pixels. The engine above them is the `b2d` package (ADR-374).
+- **A picture** (a page, a photo) = `(editor/display/image row col w h source opts)`: PNG / JPEG
+  bytes in a cell block, painted at full pixel resolution by both window painters and in
+  half-block cells by a terminal (pixels through the kitty graphics protocol where the terminal
+  has it, ADR-695) — one op for both, decoded once per content (ADR-686). No
+  texture to manage; a sprite is for a game's many moving copies of one texture.
 
 ```lisp
-(defmodule main "a counter app" (:use editor/ui) (:use editor/display))
+(defmodule main "a counter app" (:use editor/ui) (:use editor/frontend) (:use editor/display))
 
 (defn view (m cols rows)
   (frame (clear) (text 0 0 (str "count: " (get m :count)))))
@@ -953,7 +980,7 @@ code paints to a terminal or a GUI window unchanged.
         (= input :ctrl-c) (assoc m :done true)   ; Esc/Ctrl-C → quit
         else m))
 
-(defn main () (ui-run {:count 0 :done false :tick-ms 1000} view update editor/ui/*term-display*))
+(defn main () (ui-run {:count 0 :done false :tick-ms 1000} view update editor/frontend/*term-display*))
 ;; for a window instead: (ui-run … (gui-display))   ; --features gui
 ```
 
@@ -971,7 +998,7 @@ a resize is `[:resize cols rows]`. **A GUI window's close button (the X) is its 
 can still be closed by the X. **`ui-run` quits on `:close` automatically**, so every
 `ui-run` app is closeable for free; you never wire it into `update`. In a hand-rolled
 `(receive)` loop (not on `ui-run`), match it yourself — `(:close :quit)` — or use the
-`editor/ui/quit-request?` predicate. (`nest new --template gui` / `--template editor`
+`editor/frontend/quit-request?` predicate. (`nest new --template gui` / `--template editor`
 scaffold complete `ui-run` apps; `--template tui-loop` a plain stdout animation.)
 
 ## Hot reload (`nest run --watch FILE`)
@@ -1063,6 +1090,31 @@ until 2026-08; that name is gone.)
 `try`/`catch` above is for the raising half. `(catch e …)` catches everything, a pattern
 such as `(catch {:kind :type} …)` one kind; `(error-message e)` reads whatever was caught.
 
+### When Brood itself crashes (a Rust panic)
+
+First tell your program's failure from the runtime's. A process that raises is
+reported by the default crash reporter (pid, reason, trace) under `brood file` /
+`nest run`, and deep recursion is a catchable `recursion too deep` error — both are
+*your* code. A Rust **panic** (a use-after-GC tripwire, a heap index, a runtime
+invariant) is the runtime's: it is appended to **`.brood_crash_dump`** in the working
+directory (read the **last** `=== brood crash dump ===` block; at 16 MiB it rotates to
+`.brood_crash_dump.old`). A `SIGSEGV` leaves no dump. (Inside the Brood repo, the
+`brood-debug` skill is the full playbook.)
+
+A runtime crash is a bug to report, not to work around:
+
+1. **Minimise** to the smallest deterministic `.blsp` that still reproduces.
+2. **Capture** the last dump block, plus `brood --version`.
+3. **Localise** with the knobs (`brood --debug-flags` lists them all); each one that
+   flips the verdict (crash ↔ clean) names a subsystem:
+   - `BROOD_GC_STRESS=1` — collect at every safepoint; makes a GC race deterministic.
+   - `BROOD_GC_VERIFY=1` — walk the live graph before each collection; names a stale
+     handle and the cell that holds it.
+   - `BROOD_TIER=1` (no JIT) / `BROOD_TIER=0` (tree-walker) — which execution tier.
+   - `BROOD_J=1` (one scheduler worker) or `nest test --max-parallel 1` (at most one spawned
+     process running at a time) — rules the scheduler in or out.
+4. **File it** with the repro, the dump block and which knobs change the verdict.
+
 ## Common builtins
 
 This is a curated tour, not the full list. For the **complete reference** —
@@ -1088,17 +1140,19 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   with `seq/reduced` to stop early and `seq/xtake-while` as the built-in stopping stage.
 - **combinators & binding forms**: bare `comp` `partial` `identity`; `combinator/complement` `combinator/constantly`
   `combinator/juxt` (`((combinator/juxt inc dec) 5)` → `[6 4]`) `combinator/fnil` (`((combinator/fnil inc 0) nil)` → `1`)
-  `combinator/memoize` (a `table`-backed cache — put it under a `def`, never in a loop; it hashes
-  every key and never forgets) · `defmemo` from the `memo` module (`(:use memo)`, then
+  · memoisation is `defmemo` from the `memo` module — there is no `memoize` function
+  (ADR-522), so a cache exists only at a definition (`(:use memo)`, then
   `(defmemo rows-of 8 (rope width) …)`: a `defn` that remembers its last N calls compared
-  by `=` — bounded, and immediate for the same big value such as a rope) ·
-  `registry` for tables your modules fill as they load (`(registry/put! :app/hooks :save
+  by `=` — bounded, and immediate for the same big value: each process keeps its store
+  uncopied, so the caller's own vector or map hits by identity, ADR-670) ·
+  `registry` for tables your modules fill as they load (`(registry/put :app/hooks :save
   'app/on-save)`, read with `registry/entries` / `registry/lookup` / `registry/ranked` — by an
   entry's `:rank`): atomic across processes and carried by the image, which a `defonce` + `def`
   table is not. Store hooks as symbols and call them with `(reflect/call-if-bound sym
   fallback args…)`, so a redefinition takes and an unloaded module is simply absent ·
   `settings` for a user config file that is data (ADR-428): `(settings/define :app/settings
   :cursor {:default :block :type '(or :block :bar) :doc "…"})` once, then `read-file`,
+  `file-warnings` (a file that does not read, said with its line, never silently `{}`),
   `warnings`, `value-of` (the default when unset or invalid) and `default-source` (the
   documented file to write the first time) ·
   `if-let`/`when-let` test truth, `if-some`/`when-some` test presence (`false` counts) ·
@@ -1107,17 +1161,20 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
 - **iteration** (macros — there is no `while` and no imperative `for` loop): `for`
   (list comprehension, with `:when`; add `:into []` / `:into {}` / `:into #{}` as the
   LAST pair to build that kind directly), `fold-for` (an accumulating comprehension:
-  `(fold-for (acc 0 x xs) (+ acc x))`), `doseq` (destructuring/`:when`),
-  `dotimes` `(i n)`, `dolist` `(x coll)`. `doseq`/`dotimes`/`dolist` return `nil`.
+  `(fold-for (acc 0 x xs) (+ acc x))`), and `doseq`, the one form for effects: `for`'s
+  bindings, collects nothing, returns `nil`; a counted loop is `(doseq (i (range n)) …)`.
+  There is no `dotimes`, `dolist` or `unless` (removed by ADR-674): write `doseq` and
+  `(when (not t) …)`.
 - **string**: the string surface lives in the `string` module (ADR-230), so these are
-  **`string/`-qualified** unless listed as bare below (a string's length is the bare `count`): `string/substring`
+  **`string/`-qualified** unless listed as bare below:
   `string/substring` `string/char-at` (returns a 1-char *string* — Brood has no char
-  type) `string/split` `string/join` `string/replace` `string/trim` `string/triml`
-  `string/trimr` `string/blank?` `string/upper` `string/lower`
+  type) `string/split` `string/join` `string/replace` `string/trim` `string/trim-left`
+  `string/trim-right` `string/blank?` `string/upper` `string/lower`
   `string/starts-with?` `string/ends-with?` `string/->list` `string/list->`
   `string/->bytes` `string/bytes->`.
-  **Bare (core, not in the module):** `str` `pr-str` `index-of` `includes?`
-  `string/->number` `->string` (the polymorphic Display op — on a symbol or keyword it
+  **Bare (core, not in the module):** `str` `pr-str` `count` (a string's length in
+  chars; there is no `string/length`) `index-of` `includes?`
+  `->string` (the polymorphic Display op — on a symbol or keyword it
   yields the bare spelling, so `(->string :foo)` is `"foo"` while `(str :foo)` is `":foo"`).
   There is no `symbol->string`/`number->string`/`name` — use `str` or `->string`
   (ADR-239 removed both as redundant).
@@ -1127,7 +1184,9 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   `string/normalize` (`(string/normalize s :nfc)`, also `:nfd` `:nfkc` `:nfkd` — `=` is
   byte-structural, so `"é"` written two ways compares unequal until you normalise) ·
   `string/display-width` (terminal cells) · `string/width->index` (a cell → the
-  char index of the cluster on it — the inverse; mouse → point)
+  char index of the cluster on it — the inverse; mouse → point) · a tab spans to the
+  next stop of the dynamic `*tab-width*` (8; `(binding (*tab-width* 4) …)` moves every
+  measure inside, ADR-537)
 - **string formatting**: `string/repeat` `string/pad-left` `string/pad-right` ·
   `math/->fixed` (number → string with fixed decimals, e.g. `(math/->fixed 3.14159 2)`
   → `"3.14"` — `str` prints full f64 precision, so reach for this for output) ·
@@ -1165,7 +1224,7 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   **`/` is exact** (ADR-196): `(/ 1 2)` → `1/2` (a **ratio**, not a float),
   `(/ 6 3)` → `2` (divides evenly → int). `1/2` is a literal; ratios do the full
   tower (ratio+decimal is exact, ratio+float contagion). Reach for `->float`
-  (or `decimal/number->`) for an inexact result; `math/numerator`/`math/denominator` read the parts.
+  for an inexact result (or `decimal/of` for an exact decimal); `math/numerator`/`math/denominator` read the parts.
   Number types: `int` (bignum on overflow) · `float` · `decimal` (`1.50M`, exact
   base-10) · `ratio` (`1/2`, exact rational). `number?`/`ratio?`/`decimal?` test them.
 - **Text → number: `(string/->number s)`, and it picks the type from the digits.**
@@ -1184,7 +1243,9 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   `try`/`catch`, or let the supervisor have it), while a **known failure comes back as a
   value** — `(string/->number "abc")`, the `encoding` decoders, `datetime/parse-*`,
   `url/percent-decode`. Test with `failure?`, read with `error-message`, build one with
-  `(failure "…")`. It is **truthy** — like every non-`nil`, non-`false` value — so it
+  `(failure "…")`, or with fields a caller can branch on with
+  `(failure/with {:status 404} "…")`, read back with `fields` (ADR-617) — the HTTP clients
+  answer a transport failure this way. It is **truthy** — like every non-`nil`, non-`false` value — so it
   never vanishes into a default: `(or (string/->number s) 0)` yields the *failure*, not
   `0`. To default, say so: `(let (n (string/->number s)) (if (failure? n) 0 n))`. It is
   also *not* `nil`, which still means absence (`get`, `nth`, `os/env`, `first` of empty).
@@ -1215,7 +1276,9 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   loop/process state like any other value.
 - **meta / eval**: `apply` (call a fn with a list of args — the only way to
   splat) `reflect/eval` `reflect/read-string` `reflect/eval-string` `reflect/gensym` (fresh symbol, for macros)
-- **discovery / introspection**: `doc` `reflect/arglist` `bound?` `reflect/source-location`;
+  `reflect/error-at` (a macro's error placed at the sub-form it names: `(reflect/error-at
+  form "my-macro: …")`, ADR-618)
+- **discovery / introspection**: `reflect/doc` `reflect/arglist` `bound?` `reflect/source-location`;
   and to *find* what exists rather than guess names — `reflect/global-names`,
   `reflect/apropos` (name substring, e.g. `(reflect/apropos "rand")`), `reflect/doc-search` (matches
   docstrings). The same three are `nest mcp` tools (the name-list tool is called
@@ -1362,17 +1425,23 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   (ADR-227 follow-up), for any module, so naming where something comes from loads
   it on demand (`mod/foo`). No bare-name magic, though — a bare `sqrt` with no
   `math/` prefix and no `(:use math)` stays unbound. The header understands exactly `(:use …)`,
-  `(:use-internals …)`, `(:alias …)` and `(:load a b …)` (load now, refer nothing — the
-  eager request, since a plain reference loads on first use, ADR-335); **anything else is
-  an error** —
+  `(:use-internals …)`, `(:alias …)`, `(:shadow …)`, `(:implements …)` and `(:load a b …)`
+  (load now, refer nothing — the eager request, since a plain reference loads on first
+  use, ADR-335); **anything else is an error** —
   `(:require …)` and a misspelled `(:use-internal …)` are rejected rather than
   silently ignored.
 - **Not Clojure**: no transients, and **no `loop`/`recur`** — Brood has proper tail
   calls, so recursion is just calling a name (a `defn`, or a local `letrec`); see
-  *Looping is recursion*. Namespaces *do* exist now (ADR-065) but are `mod/name`-flat,
-  not Clojure's `require :as` aliasing.
-- **Not Scheme / CL**: no `setq`, no `cond`-with-`t`-catch-all (use `else`
-  or `:else`).
+  *Looping is recursion*. Namespaces *do* exist now (ADR-065) but are `mod/name`-flat;
+  a short prefix is the header clause `(:alias mod :as m)`, not Clojure's `require :as`.
+- **Not Scheme / CL**: no `setq`, no `cond`-with-`t`-catch-all: write `else`. Not
+  Clojure's `:else` either — `cond` refuses any constant test (ADR-518).
+- **One pipe**: `->` (with `$` to place the value elsewhere); there is no `->>`, because
+  every collection function takes its collection first (ADR-308).
+- **`()` is `nil`**, so an empty list is falsy while `[]`, `{}`, `#{}` and `""` are truthy —
+  test emptiness with `empty?`.
+- **Dynamic scope is explicit and per-process**: `let` on a `defdyn` name is lexical (only
+  `binding` rebinds), and a `spawn`ed child starts from the defaults — send it the value.
 - **`sort` on heterogeneous / non-numeric items uses *structural* order.**
   `(sort coll)` is `<` for numbers, lexicographic for vectors/lists, text order
   for strings/symbols/keywords (so `(sort [[1 0] [2 1]])` works, no comparator
@@ -1391,7 +1460,8 @@ in the REPL. (`nest doc <module>` does the same for an opt-in module like
   deliberately non-tail test helper, a catch whose nothing is the answer — is
   acknowledged in code with `(check-allow :category form…)`: `:non-tail-recursion`,
   `:discarded-catch`, `:cross-module-def`, `:constant-condition`, `:unreachable-clause`,
-  `:type-mismatch`, `:unbound`, `:deprecated`, `:trusted` (see `docs/type-annotations.md`).
+  `:type-mismatch`, `:unbound`, `:deprecated`, `:trusted`, `:list-truthiness`,
+  `:single-dispatch` (see `docs/type-annotations.md`).
 
 ## Module skeleton (what `nest new` scaffolds)
 
@@ -1448,13 +1518,14 @@ What `nest new greeter` writes, with the module docstrings and comments abridged
 
 `describe` groups tests; `test` defines one. `(assert= actual expected)` checks
 structural equality with a diff on failure; `(is expr)` asserts truthy.
-`(assert-error body…)` asserts a raise. For stochastic code, **property testing**:
-`(check-property n gen pred)` draws `n` values from a `seed -> [value next-seed]`
-generator (over the PRNG) and asserts `pred` on each — deterministic, and on a
-counterexample it fails with the value + seed:
+`(assert-error body…)` asserts a raise. For many inputs, **property testing**:
+`(check-property n gen pred)` draws `n` values from a generator built with `property/…`
+(`property/int`, `property/vector-of`, `property/string`, `property/one-of`, `property/fmap`,
+`property/bind`, …) and asserts `pred` on each — deterministic, and on a failure it reports
+the SHRUNK counterexample (a vector holding 42 fails as `[42]`) and the seed that replays it:
 
 ```clojure fragment
-(check-property 100 (fn (s) (rand/int s 1000)) (fn (x) (and (>= x 0) (< x 1000))))
+(check-property 100 (property/vector-of (property/int 0 1000)) (fn (xs) (= (count (sort xs)) (count xs))))
 ```
 
 Testing processes: **never `proc/sleep` to wait for another process** — a loaded machine
@@ -1476,9 +1547,8 @@ time and exit cleanly.
 
 `std/prelude/*.blsp` is the canonical example of idiomatic Brood — almost
 everything below the kernel is written there in the language itself; read it.
-(Ten files — `core`, `predicates`, `map`, `control`, `match`, `process`, `seq`,
-`string`, `tools`, `contracts` — concatenated in that order; older docs still say
-`std/prelude.blsp`, which no longer exists.)
+(Thirteen files, concatenated in the order `crates/lisp/src/boot.rs` lists, from `core`,
+`predicates`, `map` and `control` to `abilities` and `contracts`.)
 Deep references: `docs/language.md` (full reference), `docs/spec.md` (the
 formal spec), `docs/pattern-matching.md` (the pattern grammar in detail),
 `docs/type-annotations.md` (the `sig` grammar and every `check-allow` category).
