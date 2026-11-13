@@ -2,7 +2,7 @@
 ;; window, so exercise it with `nest run --for 2s` instead. The board is a bitboard
 ;; (`bitboard` module): build one with `make` + `bset`, inspect it with `cells`
 ;; (live `[x y]` list) and `live-count` (population).
-(defmodule life-test (:use life) (:use bitboard) (:use test))
+(defmodule life-test (:use life) (:use bitboard) (:use guns :only [*gosper-gun* *shooters*]) (:use test))
 
 (defn board (coords)
   "A 120×40 bitboard with `coords` (a list of `[x y]`) live."
