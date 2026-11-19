@@ -32,6 +32,8 @@ this RENDERER that draws + handles input."
 
 (defdyn *w* 120)
 (defdyn *h* 40)
+(sig *w* int)
+(sig *h* int)
 ;; FAIR-COMPARISON OVERRIDE (env-driven, off by default). When `LIFE_BOARD=WxH` is set the
 ;; board is PINNED to those dims — `grid-fit`/`[:resize]` stop re-deriving `*w*`/`*h*` from the
 ;; window — and `LIFE_BLOCK=N` seeds a centred solid N×N block (and disables auto-inject), so
@@ -43,6 +45,7 @@ this RENDERER that draws + handles input."
 ;; runs the extra gens as bare steps between draws, so the simulation advances at engine speed
 ;; (gens/sec = steps-per-frame × drawn fps) while the display still paints once per refresh.
 (def *steps-per-frame* 1)
+(sig *steps-per-frame* int)
 ;; FLAT render (LIFE_FLAT=1): always draw the board as ONE native `[:cells]` op in a single
 ;; colour, even when a spawn-colour layer exists — instead of the per-cell `[:text]` ops the
 ;; colour gradient needs. The experimental GPU backend (`gui-gpu`) only paints the bulk ops
@@ -64,6 +67,7 @@ this RENDERER that draws + handles input."
 ;; (a mono screen cell is ~1:2 wide:tall; 2 cols ≈ square). Raise/lower it if cells look
 ;; tall/wide. (So the board is `cols/*cell-aspect*` × `rows` cells.)
 (def *cell-aspect* 2) ; screen columns per board cell (compensates the font's cell aspect)
+(sig *cell-aspect* int)
 (def *cell-face* {:bg :white}) ; a live cell: a solid filled square (the :bg is overridden per cell)
 ;; SPAWN COLOURS. Each spawn — a click/drag drop or an auto-inject — gets a fresh vivid colour,
 ;; and that colour is CARRIED ACROSS generations so you can see where a region came from: a
@@ -83,6 +87,7 @@ this RENDERER that draws + handles input."
 ;; *view-ox*/*view-oy* are the top-left board cell of that window (the pan, kept in range).
 ;; At zoom 1 the whole board shows (pan 0,0). The window font/grid and the bar never change.
 (def *view-zoom* 1) ; view magnification (1 = whole board; higher = zoomed in on the mouse)
+(sig *view-zoom* int)
 (def *view-ox* 0) ; pan: leftmost visible board column
 (def *view-oy* 0) ; pan: topmost visible board row
 (def *zoom-min* 1)
@@ -91,6 +96,7 @@ this RENDERER that draws + handles input."
 ;; The bottom status bar is a FIXED *status-scale* screen-cells tall at the FIXED window
 ;; font, so its pixel height is constant and zoom never touches it (the seamless win).
 (def *status-scale* 4) ; the bar's height in (constant) screen cells / its glyph scale
+(sig *status-scale* int)
 (def *status-face* {:reverse true}) ; the bottom bar: reverse-video, like the brood-edit mode line
 (def *grid-min* 5) ; the sim torus never shrinks below *grid-min* x *grid-min*
 (def *seed-cells* 3000) ; target initial ACTIVE (live) cell count — `seed` sows random
@@ -292,7 +298,7 @@ hands them back as the bit INDICES the colour layer keys on, so no decode is nee
         ; one colour for the whole spawn — compute + pack it once
         [(reduce added colors (fn (c i) (assoc c i packed))) (+ next-id 1)]))))
 
-(defn birth-blend (colors w h i)
+(defn birth-blend (colors: (map int int) w h i)
   "The PACKED colour a NEWBORN at bit index `i` takes: the BLEND (channel average) of its parents'
 colours — its 8 torus neighbours that carry one. A stored colour means the neighbour was live last
 gen, so this is exactly the live parents (a birth has 3); `nil` if none is coloured. Summing the
@@ -419,7 +425,7 @@ of those CURRENTLY live and XOR it out, so only set bits flip. Whole-board-integ
   (cond (< a b) 1 (> a b) -1 else 0))
 
 (defn reaper-tick (rp board ages colors)
-  "Advance the reaper ONE generation. `rp` is `{:rx :ry :tx :ty :move :face :trail :flash}`. It
+  "Advance the reaper ONE generation. `rp` is `{:rx :ry :target :move :face :trail :flash}`. It
 COMMITS to a target — the nearest of the oldest live cells — and marches there DECISIVELY, reaping
 its footprint (board + age + colour layers) each move; it repicks ONLY on ARRIVAL (or when nothing
 is left). Committing to the heading until it arrives — rather than dropping the target the moment
@@ -432,7 +438,7 @@ Returns `[board' ages' colors' rp']`."
         rx0 (get rp :rx)
         ry0 (get rp :ry)
         ;; hold the committed heading; only pick (nearest-oldest) when we have none
-        tgt (if (get rp :tx) [(get rp :tx) (get rp :ty)] (oldest-xy ages w rx0 ry0))
+        tgt (or (get rp :target) (oldest-xy ages w rx0 ry0))
         move? (>= (get rp :move) (- *reaper-step-every* 1))
         ;; step one cell toward the target on a move tick (hold still with no target)
         rx (if (and move? tgt) (+ rx0 (toward rx0 (first tgt))) rx0)
@@ -457,8 +463,7 @@ Returns `[board' ages' colors' rp']`."
       (assoc rp
         :rx rx
         :ry ry
-        :tx (if nt (first nt) nil)
-        :ty (if nt (second nt) nil)
+        :target nt
         :move (if move? 0 (+ (get rp :move) 1))
         :face face
         :trail trail2
@@ -600,24 +605,28 @@ so the scythe leads the way it's heading. Skips transparent (nil) sprite cells."
   (let (rx (get rv :x)
         ry (get rv :y)
         face (or (get rv :face) 1)
-        n *reaper-size*)
-    (mapcat (mapcat (range n) (fn (iy) (map (range n) (fn (ix) [ix iy]))))
-      (fn ([ix iy])
-        (let (src (if (< face 0) (- (- n 1) ix) ix) ; mirror columns when facing left
-              col (nth *reaper-sprite* (+ (* iy n) src)))
-          (if (nil? col)
-            []
-            (overlay-cell (+ rx (nth *reaper-offsets* ix))
-              (+ ry (nth *reaper-offsets* iy))
-              col
-              w
-              h
-              z
-              a
-              ox
-              oy
-              visw
-              vish)))))))
+        n *reaper-size*
+        ;; a sprite index less `half` is that cell's offset from the anchor, as in *reaper-offsets*
+        half (math/quot n 2))
+    (mapcat (range n)
+      (fn (iy)
+        (mapcat (range n)
+          (fn (ix)
+            (let (src (if (< face 0) (- (- n 1) ix) ix) ; mirror columns when facing left
+                  col (nth *reaper-sprite* (+ (* iy n) src)))
+              (if (nil? col)
+                []
+                (overlay-cell (+ rx (- ix half))
+                  (+ ry (- iy half))
+                  col
+                  w
+                  h
+                  z
+                  a
+                  ox
+                  oy
+                  visw
+                  vish)))))))))
 
 (defn reaper-overlay-ops (rv w h z a ox oy visw vish)
   "All reaper overlay ops, bottom→top: fading ash trail, the reap flash, then the facing sprite —
@@ -713,11 +722,11 @@ dip to rising population or memory churn)."
 ;; invariant, now with one fewer process (the old CLOCK and its [:tick]/[:ticked] handshake are
 ;; gone). The RENDERER owns the window + input.
 
-(defn reaper-view (on rp)
+(defn reaper-view (rp)
   "The reaper RENDER BUNDLE `render` needs — position, facing, ash trail, and reap flash — or nil
 when off. What `sim-draw` hands `render` so the reaper (and its trail/flash) rides along in the
-SIM's pre-built ops. `on` is the reaper-on flag, `rp` the reaper state."
-  (if (and on rp)
+SIM's pre-built ops. `rp` is the reaper state, nil while the reaper is off."
+  (if rp
     {:x (get rp :rx)
      :y (get rp :ry)
      :face (get rp :face)
@@ -815,21 +824,21 @@ repeat fires every *spawn-every* gens past *hold-delay* (the initial press/drag 
         ;; but not `board`) that then SURVIVES the step would otherwise count as a survivor and
         ;; keep an age it never had — leaving a live, ageless cell the reaper can't see. Folding it
         ;; into `born` instead stamps it "born now", the age analogue of `color-spawn`.
-        reaping? (get m :reaper-on)
-        ages0 (if (and reaping? (not (= (get ob :w) w)))
+        reaper (get m :reaper) ; nil while the reaper is off
+        ages0 (if (and reaper (not (= (get ob :w) w)))
                 (colors-refit (get m :ages) (get ob :w) w h)
                 (get m :ages))
-        ages1 (if reaping? (age-step ages0 (get board :bits) (get nxt :bits) gen) ages0)
-        [fboard fages fcolors frp] (if reaping?
-                                     (reaper-tick (get m :reaper) nxt ages1 c3)
-                                     [nxt ages1 c3 (get m :reaper)])
-        souls2 (+ (get m :souls) (if reaping? (count (get frp :flash)) 0)) ; lifetime reaped tally
+        ages1 (if reaper (age-step ages0 (get board :bits) (get nxt :bits) gen) ages0)
+        [fboard fages fcolors frp] (if reaper
+                                     (reaper-tick reaper nxt ages1 c3)
+                                     [nxt ages1 c3 nil])
+        souls2 (+ (get m :souls) (if reaper (count (get frp :flash)) 0)) ; lifetime reaped tally
         cells (bb-live-count fboard)
         st2 (status gen cells per souls2))
     (do
       (when (< (math/mod gen *log-every*) sp)
         (perflog/log-line (get m :logger) (log-fmt gen cells per)))
-      (if (= :stop (sim-draw m fboard st2 fcolors (reaper-view reaping? frp)))
+      (if (= :stop (sim-draw m fboard st2 fcolors (reaper-view frp)))
         (perflog/log-stop (get m :logger))
         (sim-loop (assoc m
                     :board fboard
@@ -878,8 +887,7 @@ drag); the just-pasted cell becomes `:held`."
       (after 0
         (if (step-due? (get m :prev))
           (sim-step (assoc m2 :hn newhn))
-          (if (= :stop
-                (sim-draw m b2 (get m :st) c2 (reaper-view (get m :reaper-on) (get m :reaper))))
+          (if (= :stop (sim-draw m b2 (get m :st) c2 (reaper-view (get m :reaper))))
             (perflog/log-stop (get m :logger))
             (sim-loop (assoc m2 :hn newhn))))))))
 
@@ -903,8 +911,8 @@ drag can't preempt it. `[:press]`/`[:drag]` paste; `[:release]` clears the held 
       ;; so they differentiate from here) and drops the reaper at the TOP-LEFT corner with no target
       ;; yet; turning it OFF drops the age layer + reaper. Footer button / `r` key, via the renderer.
       ([:toggle-reaper]
-        (if (get m :reaper-on)
-          (sim-loop (assoc m :reaper-on false :ages {} :reaper nil))
+        (if (get m :reaper)
+          (sim-loop (assoc m :ages {} :reaper nil))
           (let (gen (get m :gen)
                 ages (reduce (bit/positions (get (get m :board) :bits))
                        {}
@@ -912,22 +920,16 @@ drag can't preempt it. `[:press]`/`[:drag]` paste; `[:release]` clears the held 
                 ;; anchor near-centre so the block sits FULLY in the top-left corner (cells 0..size-1)
                 rp {:rx (math/quot *reaper-size* 2)
                     :ry (math/quot *reaper-size* 2)
-                    :tx nil
-                    :ty nil
+                    :target nil
                     :move 0
                     :face 1
                     :trail {}
                     :flash []})
-            (sim-loop (assoc m :reaper-on true :ages ages :reaper rp)))))
+            (sim-loop (assoc m :ages ages :reaper rp)))))
       ;; the clear button: swap in a fresh EMPTY board (at the current dims) and draw it now —
       ;; also empties the age layer + clears the reaper's target (nothing left to reap).
       ([:clear] (let (empty (bb-make *w* *h*))
-                  (if (= :stop
-                        (sim-draw m
-                          empty
-                          (get m :st)
-                          {}
-                          (reaper-view (get m :reaper-on) (get m :reaper))))
+                  (if (= :stop (sim-draw m empty (get m :st) {} (reaper-view (get m :reaper))))
                     (perflog/log-stop (get m :logger))
                     (sim-loop (assoc m
                                 :board empty
@@ -937,7 +939,7 @@ drag can't preempt it. `[:press]`/`[:drag]` paste; `[:release]` clears the held 
                                 :ages {}
                                 :reaper
                                   (if (get m :reaper)
-                                    (assoc (get m :reaper) :tx nil :ty nil)
+                                    (assoc (get m :reaper) :target nil)
                                     nil))))))
       (after 0 (sim-step m)))))
 
@@ -1008,8 +1010,7 @@ a second time alongside the op."
     ([:resize cols rows]
       (do
         (when (not *fixed-board*)
-          (def *w* (math/max *grid-min* (math/quot cols *cell-aspect*)))
-          (def *h* (math/max *grid-min* (math/max 1 (- rows *status-scale*)))))
+          (let ([nw nh] (board-dims cols rows)) (do (def *w* nw) (def *h* nh))))
         ;; the colour keys encode the OLD width; rekey them to the new width so
         ;; they keep matching the refit board (`nl`) on this draw and on input
         ;; redraws, until the sim resends a correctly-keyed frame.
@@ -1034,13 +1035,18 @@ a second time alongside the op."
 ;; screen grid, less the bottom *status-scale* bar rows (the VIEW zoom is a render-only
 ;; magnification, so it does NOT change these). FLOORED at *grid-min*² so a tiny window can't
 ;; collapse the torus. A resize clips/grows via bb-refit. Globals are image-wide.
+(defn board-dims (cols:int rows:int)
+  "The board area `[w h]` for a window grid of `cols`×`rows` screen cells: board cols = screen
+cols ÷ *cell-aspect*, the bar's rows taken off the bottom, both floored at *grid-min*."
+  [(math/max *grid-min* (math/quot cols *cell-aspect*))
+    (math/max *grid-min* (math/max 1 (- rows *status-scale*)))])
+
 (defn grid-fit (w)
   "Re-fit the sim torus to window `w`: set `*w*`/`*h*` to the board area (the window cells,
 less the bar). Only `def`s when a value actually CHANGED — it runs every frame, and rebinding
 a global can invalidate caches, so skip it on the common no-op frame. Returns `[cols rows]`."
   (let ([cols rows] (gui/size w)
-        nw (math/max *grid-min* (math/quot cols *cell-aspect*)) ; board cols = screen cols ÷ cell aspect
-        nh (math/max *grid-min* (math/max 1 (- rows *status-scale*))))
+        [nw nh] (board-dims cols rows))
     (do
       (when (and (not *fixed-board*) (not (= nw *w*))) (def *w* nw))
       (when (and (not *fixed-board*) (not (= nh *h*))) (def *h* nh))
@@ -1152,15 +1158,14 @@ reaper sprite itself is drawn from the SIM's frames)."
   (or (nil? s) (= s "")))
 
 (defn env-board ()
-  "Parse `LIFE_BOARD` (\"WxH\" or a single \"N\" for a square) into `[w h]`, or nil when unset —
-the fair-comparison board pin shared with the .NET port."
-  (let (s (os/env "LIFE_BOARD"))
-    (if (env-blank? s)
-      nil
-      (let (parts (string/split s "x"))
-        (if (= (count parts) 2)
-          [(string/->number (first parts)) (string/->number (second parts))]
-          (let (n (string/->number s)) [n n]))))))
+  "Parse `LIFE_BOARD` (\"WxH\" or a single \"N\" for a square) into `[w h]`, or nil when unset or
+not integers (like `env-int`, unparseable is unset) — the fair-comparison board pin shared with
+the .NET port."
+  (let (text (os/env "LIFE_BOARD")
+        dims (if (env-blank? text) [] (map (string/split text "x") string/->number))
+        width (first dims)
+        height (if (= (count dims) 1) width (second dims)))
+    (if (and (< (count dims) 3) (int? width) (int? height)) [width height] nil)))
 
 (defn env-int (name dflt)
   "Read integer env var `name`, or `dflt` when unset, empty, or not a number."
@@ -1221,9 +1226,10 @@ render-only *view-zoom* camera (the board is unchanged)."
                  :st ""
                  :colors {}
                  :next-id 0
-                 :reaper-on false ; the roving reaper, toggled by the footer / `r`
                  :ages {} ; the cell-age layer (bit index → birth-gen), only while on
-                 :reaper nil ; reaper state {:rx :ry :tx :ty :move :face :trail :flash}
+                 ;; the roving reaper's state {:rx :ry :target :move :face :trail :flash}, toggled
+                 ;; by the footer / `r`; nil while it is off
+                 :reaper nil
                  :souls 0})))
     ; lifetime count of cells the reaper has reaped
     ;; the renderer keeps a LOCAL mirror of inject (for the instant spawn-button label) plus the

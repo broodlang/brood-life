@@ -15,7 +15,11 @@ bignum math was always native — only the per-row *dispatch* was the cost. Need
 kernel's arbitrary-precision integers + unrestricted shifts (the grid is a w*h-bit
 number) and `bit-positions` (so rendering stays O(live), not O(area)).")
 
-(defn make (w h)
+;; The board record. `cells`/`fit`/`refit` read it with `get`, not the accessors, because the
+;; renderer hands them the SLIM `{:w :h :bits}` map the sim sends instead of the whole record.
+(defrecord bitboard ((w int) (h int) (mask int) (board int) (col0 int) (high int) (bits int)))
+
+(defn make (w:int h:int)
   "An empty `w`×`h` whole-board bitboard, with the torus edge-column masks precomputed.
 `:col0` = Σ 2^(y*w) is a closed form of board/mask (the geometric series 1+2^w+2^2w+…)."
   (let (mask (- (bit/shift-left 1 w) 1) ; one row: w low bits
@@ -23,16 +27,16 @@ number) and `bit-positions` (so rendering stays O(live), not O(area)).")
         col0 (math/quot board mask) ; the x=0 bit of every row (each row's low bit)
         high (bit/shift-left col0 (- w 1)))
     ; the x=w−1 bit of every row (each row's top bit)
-    {:w w :h h :mask mask :board board :col0 col0 :high high :bits 0}))
+    (bitboard w h mask board col0 high 0)))
 
 (defn bset (board x y)
   "Set cell `(x,y)` live; returns the new board. Caller wraps `x`/`y` into range."
-  (let (w (get board :w))
+  (let (w (bitboard-w board))
     (assoc board :bits (bit/or (get board :bits) (bit/shift-left 1 (+ x (* y w)))))))
 
-(defn place (board pat x y)
+(defn place (board pat: (seqable (tuple int int)) x:int y:int)
   "Set every cell of pattern `pat` (a list of `[dx dy]`) at origin `(x,y)`, wrapped."
-  (let (w (get board :w) h (get board :h))
+  (let (w (bitboard-w board) h (bitboard-h board))
     (reduce pat board (fn (b [dx dy]) (bset b (math/mod (+ x dx) w) (math/mod (+ y dy) h))))))
 
 (defn live-count (board)
@@ -54,13 +58,13 @@ A cell lives iff it has exactly 3 live neighbours, or 2 and it is already live �
 `s1 & ~s2 & (s0 | cur)` over the low three bits `[s0 s1 s2]` of the neighbour count
 (the only other count with s1 set is 8, which truncates to s1=0 in three bits, so the
 4th plane the sum could carry is never consulted and isn't accumulated)."
-  (let (w (get board :w)
-        h (get board :h)
-        mask (get board :mask)
-        brd (get board :board)
-        col0 (get board :col0)
-        high (get board :high)
-        b (get board :bits)
+  (let (w (bitboard-w board)
+        h (bitboard-h board)
+        mask (bitboard-mask board)
+        brd (bitboard-board board)
+        col0 (bitboard-col0 board)
+        high (bitboard-high board)
+        b (bitboard-bits board)
         wm1 (- w 1)
         hm1w (* (- h 1) w)
         ;; west / east neighbour fields (torus-wrapped within each row)
