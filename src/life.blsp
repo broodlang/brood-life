@@ -928,19 +928,20 @@ drag can't preempt it. `[:press]`/`[:drag]` paste; `[:release]` clears the held 
             (sim-loop (assoc m :ages ages :reaper rp)))))
       ;; the clear button: swap in a fresh EMPTY board (at the current dims) and draw it now —
       ;; also empties the age layer + clears the reaper's target (nothing left to reap).
-      ([:clear] (let (empty (bb-make *w* *h*))
-                  (if (= :stop (sim-draw m empty (get m :st) {} (reaper-view (get m :reaper))))
-                    (perflog/log-stop (get m :logger))
-                    (sim-loop (assoc m
-                                :board empty
-                                :held nil
-                                :colors {}
-                                :next-id 0
-                                :ages {}
-                                :reaper
-                                  (if (get m :reaper)
-                                    (assoc (get m :reaper) :target nil)
-                                    nil))))))
+      ([:clear]
+        (let (empty (bb-make *w* *h*))
+          (if (= :stop (sim-draw m empty (get m :st) {} (reaper-view (get m :reaper))))
+            (perflog/log-stop (get m :logger))
+            (sim-loop (assoc m
+                        :board empty
+                        :held nil
+                        :colors {}
+                        :next-id 0
+                        :ages {}
+                        :reaper
+                          (if (get m :reaper)
+                            (assoc (get m :reaper) :target nil)
+                            nil))))))
       (after 0 (sim-step m)))))
 
 (defn quit-signal? (m)
@@ -1022,14 +1023,16 @@ a second time alongside the op."
     ;; other action is 6 — vector patterns match by EXACT length, so both shapes need a clause
     ;; or presses (and thus every button, which fires on press) silently fall through to keys.
     ([:mouse action button row col _mods] (render-mouse w sim board info ui action button row col))
-    ([:mouse action button row col _mods _n] (render-mouse w
-                                               sim board info ui action button row col))
-    (m (if (quit-signal? m)
-         (render-quit sim w)
-         (let ([ui2 rd] (on-key sim m ui))
-           (do
-             (when rd (draw! w board info ui2))
-             (render-loop w sim board info ui2)))))))
+    ([:mouse action button row col _mods _n]
+      (render-mouse w
+        sim board info ui action button row col))
+    (m
+      (if (quit-signal? m)
+        (render-quit sim w)
+        (let ([ui2 rd] (on-key sim m ui))
+          (do
+            (when rd (draw! w board info ui2))
+            (render-loop w sim board info ui2)))))))
 
 ;; `*w*`/`*h*` — the torus `step` wraps on — are the window's BOARD area in cells: the full
 ;; screen grid, less the bottom *status-scale* bar rows (the VIEW zoom is a render-only
