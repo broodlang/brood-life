@@ -134,3 +134,13 @@
       (is (not (quit-signal? [:status "gen 0"])))
       (is (not (quit-signal? [:mouse :press :left 0 0 []])))
       (is (not (quit-signal? :drawn))))))
+
+(describe "the auto-spawn presets"
+  (test "a value that is not a preset counts as the first one"
+    ;; `seq/index-where` answers -1 for no match; a stray value must step from index 0
+    (assert= 5 (inject-step 7 1))
+    (assert= 5 (inject-cycle 7)))
+  (test "a preset steps to its neighbour"
+    (assert= 30 (inject-step 5 1))
+    (assert= 1 (inject-step 5 -1))
+    (assert= 1 (inject-cycle 0))))
